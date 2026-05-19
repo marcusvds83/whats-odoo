@@ -9,6 +9,17 @@ import type {
   WhatsAppMe,
 } from '@/lib/types'
 
+export interface OdooSyncInfo {
+  jid: string
+  phone: string
+  partnerId: number | null
+  leadId: number | null
+  mailMessageId: number | null
+  activityId: number | null
+  created: { partner: boolean; lead: boolean }
+  errors: string[]
+}
+
 export function useWhatsApp() {
   const socketRef = useRef<Socket | null>(null)
   const [status, setStatus] = useState<WhatsAppStatus>({ connected: false })
@@ -18,6 +29,9 @@ export function useWhatsApp() {
   const [currentMessages, setCurrentMessages] = useState<WhatsAppMessage[]>([])
   const [currentJid, setCurrentJid] = useState<string | null>(null)
   const [isConnected, setIsConnected] = useState(false)
+
+  // Odoo sync state per conversation
+  const [odooSyncMap, setOdooSyncMap] = useState<Map<string, OdooSyncInfo>>(new Map())
 
   useEffect(() => {
     const socket = io('/?XTransformPort=3001', {
@@ -94,6 +108,16 @@ export function useWhatsApp() {
       })
     })
 
+    // Odoo sync events (from WhatsApp service forwarding)
+    socket.on('whatsapp:odoo-sync', (data: OdooSyncInfo) => {
+      console.log('[WhatsApp] Odoo sync:', data)
+      setOdooSyncMap(prev => {
+        const next = new Map(prev)
+        next.set(data.jid, data)
+        return next
+      })
+    })
+
     return () => {
       socket.disconnect()
     }
@@ -139,6 +163,10 @@ export function useWhatsApp() {
     })
   }, [])
 
+  const getOdooSync = useCallback((jid: string): OdooSyncInfo | null => {
+    return odooSyncMap.get(jid) || null
+  }, [odooSyncMap])
+
   return {
     status,
     me,
@@ -147,6 +175,10 @@ export function useWhatsApp() {
     currentMessages,
     currentJid,
     isConnected,
+    // Odoo sync
+    odooSyncMap,
+    getOdooSync,
+    // Actions
     requestQR,
     loadMessages,
     sendMessage,

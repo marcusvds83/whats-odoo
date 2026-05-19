@@ -13,10 +13,43 @@ import type {
   OdooRecord,
 } from '@/lib/types'
 
+// ========== Auto-Sync Types ==========
+export interface AutoSyncSettings {
+  enabled: boolean
+  autoCreateContact: boolean
+  autoCreateLead: boolean
+  autoPostMessages: boolean
+  autoCreateActivity: boolean
+  leadPrefix: string
+  leadTeamId: number | null
+  leadUserId: number | null
+}
+
+export interface AutoSyncResult {
+  phone: string
+  partnerId: number | null
+  leadId: number | null
+  mailMessageId: number | null
+  activityId: number | null
+  created: { partner: boolean; lead: boolean }
+  errors: string[]
+}
+
 export function useOdoo() {
   const socketRef = useRef<Socket | null>(null)
   const [status, setStatus] = useState<OdooStatus>({ connected: false })
   const [isConnected, setIsConnected] = useState(false)
+  const [autoSyncSettings, setAutoSyncSettings] = useState<AutoSyncSettings>({
+    enabled: true,
+    autoCreateContact: true,
+    autoCreateLead: true,
+    autoPostMessages: true,
+    autoCreateActivity: true,
+    leadPrefix: '[WhatsApp] ',
+    leadTeamId: null,
+    leadUserId: null,
+  })
+  const [lastSyncResult, setLastSyncResult] = useState<AutoSyncResult | null>(null)
 
   useEffect(() => {
     const socket = io('/?XTransformPort=3002', {
@@ -53,6 +86,17 @@ export function useOdoo() {
       console.log('[Odoo] Conversation linked:', data)
     })
 
+    // Auto-sync events
+    socket.on('odoo:autosync:settings', (data: AutoSyncSettings) => {
+      console.log('[Odoo] Auto-sync settings:', data)
+      setAutoSyncSettings(data)
+    })
+
+    socket.on('odoo:autosync:result', (data: AutoSyncResult) => {
+      console.log('[Odoo] Auto-sync result:', data)
+      setLastSyncResult(data)
+    })
+
     return () => {
       socket.disconnect()
     }
@@ -69,6 +113,23 @@ export function useOdoo() {
   const disconnect = useCallback((): Promise<{ success: boolean }> => {
     return new Promise((resolve) => {
       socketRef.current?.emit('odoo:disconnect', {}, (response: any) => {
+        resolve(response)
+      })
+    })
+  }, [])
+
+  // ===== Auto-Sync Settings =====
+  const updateAutoSyncSettings = useCallback((settings: Partial<AutoSyncSettings>): Promise<{ success: boolean; settings?: AutoSyncSettings; error?: string }> => {
+    return new Promise((resolve) => {
+      socketRef.current?.emit('odoo:autosync:update-settings', settings, (response: any) => {
+        resolve(response)
+      })
+    })
+  }, [])
+
+  const getAutoSyncSettings = useCallback((): Promise<{ success: boolean; settings?: AutoSyncSettings }> => {
+    return new Promise((resolve) => {
+      socketRef.current?.emit('odoo:autosync:get-settings', (response: any) => {
         resolve(response)
       })
     })
@@ -200,25 +261,56 @@ export function useOdoo() {
     })
   }, [])
 
+  // ===== Teams & Users =====
+  const searchTeams = useCallback((limit?: number): Promise<{ success: boolean; data?: any[]; error?: string }> => {
+    return new Promise((resolve) => {
+      socketRef.current?.emit('odoo:teams:search', { limit }, (response: any) => {
+        resolve(response)
+      })
+    })
+  }, [])
+
+  const searchUsers = useCallback((limit?: number): Promise<{ success: boolean; data?: any[]; error?: string }> => {
+    return new Promise((resolve) => {
+      socketRef.current?.emit('odoo:users:search', { limit }, (response: any) => {
+        resolve(response)
+      })
+    })
+  }, [])
+
   return {
     status,
     isConnected,
     authenticate,
     disconnect,
+    // Auto-sync
+    autoSyncSettings,
+    lastSyncResult,
+    updateAutoSyncSettings,
+    getAutoSyncSettings,
+    // Contacts
     searchContacts,
     createContact,
     searchOrCreateContact,
+    // Leads
     searchLeads,
     createLead,
+    // Sales
     searchSales,
     createSale,
+    // Projects
     searchProjects,
     searchTasks,
     createTask,
+    // Link & Log
     linkConversation,
     logMessage,
+    // Generic
     genericSearch,
     genericRead,
     genericWrite,
+    // Teams & Users
+    searchTeams,
+    searchUsers,
   }
 }

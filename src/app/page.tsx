@@ -8,6 +8,7 @@ import { ConversationList } from '@/components/whatsapp/ConversationList'
 import { ChatView } from '@/components/whatsapp/ChatView'
 import { OdooConfigForm } from '@/components/odoo/OdooConfigForm'
 import { OdooLinkPanel } from '@/components/odoo/OdooLinkPanel'
+import { AutoSyncSettingsPanel } from '@/components/odoo/AutoSyncSettings'
 
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -34,7 +35,6 @@ import {
 
 type Tab = 'dashboard' | 'whatsapp' | 'conversations' | 'settings'
 
-// ========== Dashboard View ==========
 function DashboardView({
   waStatus,
   waMe,
@@ -55,7 +55,7 @@ function DashboardView({
       <div>
         <h1 className="text-2xl font-bold tracking-tight">Dashboard</h1>
         <p className="text-muted-foreground text-sm mt-1">
-          Visão geral da integração WhatsApp ↔ Odoo
+          Visao geral da integracao WhatsApp e Odoo
         </p>
       </div>
 
@@ -71,7 +71,7 @@ function DashboardView({
           <CardContent className="pl-5">
             <div className="text-2xl font-bold">{waStatus.connected ? 'Conectado' : 'Desconectado'}</div>
             <p className="text-xs text-muted-foreground mt-1">
-              {waStatus.connected ? (waMe?.name || waMe?.id?.split('@')[0] || 'Sessão ativa') : 'Escaneie o QR Code para conectar'}
+              {waStatus.connected ? (waMe?.name || waMe?.id?.split('@')[0] || 'Sessao ativa') : 'Escaneie o QR Code para conectar'}
             </p>
           </CardContent>
         </Card>
@@ -102,7 +102,7 @@ function DashboardView({
           </CardHeader>
           <CardContent className="pl-5">
             <div className="text-2xl font-bold">{waConversations.length}</div>
-            <p className="text-xs text-muted-foreground mt-1">{totalUnread} não lidas</p>
+            <p className="text-xs text-muted-foreground mt-1">{totalUnread} nao lidas</p>
           </CardContent>
         </Card>
 
@@ -110,7 +110,7 @@ function DashboardView({
           <div className={cn("absolute top-0 left-0 w-1 h-full", waStatus.connected && odooStatus.connected ? "bg-emerald-500" : "bg-muted")} />
           <CardHeader className="pb-2 pl-5">
             <div className="flex items-center justify-between">
-              <CardTitle className="text-sm font-medium text-muted-foreground">Integração</CardTitle>
+              <CardTitle className="text-sm font-medium text-muted-foreground">Integracao</CardTitle>
               <Link2 className="size-4 text-muted-foreground" />
             </div>
           </CardHeader>
@@ -125,7 +125,7 @@ function DashboardView({
 
       <Card>
         <CardHeader>
-          <CardTitle className="text-base">Ações Rápidas</CardTitle>
+          <CardTitle className="text-base">Acoes Rapidas</CardTitle>
         </CardHeader>
         <CardContent>
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
@@ -186,7 +186,7 @@ function DashboardView({
               <div className="flex size-8 shrink-0 items-center justify-center rounded-full bg-amber-100 text-amber-700 dark:bg-amber-950 dark:text-amber-300 text-sm font-bold">2</div>
               <div>
                 <p className="text-sm font-medium">Configure Odoo</p>
-                <p className="text-xs text-muted-foreground mt-0.5">Insira as credenciais do seu Odoo SaaS (URL, banco, usuário e senha)</p>
+                <p className="text-xs text-muted-foreground mt-0.5">Insira as credenciais do seu Odoo SaaS (URL, banco, usuario e senha)</p>
               </div>
             </div>
             <div className="flex gap-3">
@@ -203,7 +203,6 @@ function DashboardView({
   )
 }
 
-// ========== Conversations View ==========
 function ConversationsView({
   conversations,
   selectedJid,
@@ -320,7 +319,6 @@ function ConversationsView({
   )
 }
 
-// ========== Nav Item ==========
 function NavItem({ icon, label, active, onClick, badge }: {
   icon: React.ReactNode
   label: string
@@ -341,7 +339,7 @@ function NavItem({ icon, label, active, onClick, badge }: {
       <span className="hidden lg:block flex-1 text-left truncate">{label}</span>
       {badge && (
         <Badge className="size-5 p-0 flex items-center justify-center text-[10px] bg-emerald-500 text-white border-0">
-          {badge === 'online' ? '●' : badge}
+          {badge === 'online' ? '\u25CF' : badge}
         </Badge>
       )}
     </button>
@@ -358,7 +356,6 @@ function StatusIndicator({ label, connected }: { label: string; connected: boole
   )
 }
 
-// ========== Main Page ==========
 export default function HomePage() {
   const wa = useWhatsApp()
   const odoo = useOdoo()
@@ -381,7 +378,6 @@ export default function HomePage() {
 
   return (
     <div className="flex h-screen">
-      {/* Sidebar Navigation */}
       <nav className="w-14 lg:w-56 border-r bg-muted/30 flex flex-col shrink-0">
         <div className="h-14 flex items-center px-3 lg:px-4 border-b">
           <div className="flex items-center gap-2">
@@ -389,7 +385,7 @@ export default function HomePage() {
               <MessageCircle className="size-4" />
             </div>
             <div className="hidden lg:block">
-              <p className="text-sm font-bold leading-tight">WA↔Odoo</p>
+              <p className="text-sm font-bold leading-tight">WA-Odoo</p>
               <p className="text-[10px] text-muted-foreground">Middleware</p>
             </div>
           </div>
@@ -402,7 +398,7 @@ export default function HomePage() {
             icon={<MessageCircle className="size-4" />} label="Conversas" active={activeTab === 'conversations'} onClick={() => setActiveTab('conversations')}
             badge={wa.conversations.reduce((s, c) => s + c.unreadCount, 0) > 0 ? String(wa.conversations.reduce((s, c) => s + c.unreadCount, 0)) : undefined}
           />
-          <NavItem icon={<Settings className="size-4" />} label="Configurações" active={activeTab === 'settings'} onClick={() => setActiveTab('settings')} />
+          <NavItem icon={<Settings className="size-4" />} label="Configuracoes" active={activeTab === 'settings'} onClick={() => setActiveTab('settings')} />
         </div>
 
         <div className="p-2 border-t space-y-1">
@@ -411,7 +407,6 @@ export default function HomePage() {
         </div>
       </nav>
 
-      {/* Main Content */}
       <main className="flex-1 overflow-hidden">
         {activeTab === 'dashboard' && (
           <DashboardView
@@ -463,14 +458,19 @@ export default function HomePage() {
         {activeTab === 'settings' && (
           <div className="p-6 max-w-2xl mx-auto space-y-6">
             <div>
-              <h1 className="text-2xl font-bold tracking-tight">Configurações</h1>
-              <p className="text-muted-foreground text-sm mt-1">Configure as conexões do middleware</p>
+              <h1 className="text-2xl font-bold tracking-tight">Configuracoes</h1>
+              <p className="text-muted-foreground text-sm mt-1">Configure as conexoes e a sincronizacao automatica do middleware</p>
             </div>
             <OdooConfigForm
               status={odoo.status}
               onAuthenticate={odoo.authenticate}
               onDisconnect={odoo.disconnect}
               isConnected={odoo.status.connected}
+            />
+            <AutoSyncSettingsPanel
+              odooConnected={odoo.status.connected}
+              settings={odoo.autoSyncSettings}
+              onUpdateSettings={odoo.updateAutoSyncSettings}
             />
             <Card>
               <CardHeader>
@@ -481,7 +481,7 @@ export default function HomePage() {
               </CardHeader>
               <CardContent className="space-y-3">
                 <div className="flex items-center justify-between text-sm">
-                  <span className="text-muted-foreground">Conexão</span>
+                  <span className="text-muted-foreground">Conexao</span>
                   <Badge variant={wa.status.connected ? 'default' : 'outline'} className={wa.status.connected ? 'bg-emerald-100 text-emerald-800 border-emerald-200' : ''}>
                     {wa.status.connected ? 'Conectado' : 'Desconectado'}
                   </Badge>
@@ -489,7 +489,7 @@ export default function HomePage() {
                 {wa.me && (
                   <>
                     <div className="flex items-center justify-between text-sm">
-                      <span className="text-muted-foreground">Número</span>
+                      <span className="text-muted-foreground">Numero</span>
                       <span className="font-mono text-xs">{wa.me.id?.split('@')[0]}</span>
                     </div>
                     <div className="flex items-center justify-between text-sm">

@@ -20,8 +20,34 @@ let odooConfig: {
   uid: null,
 }
 
+// Auto-sync settings
+interface AutoSyncSettings {
+  enabled: boolean
+  autoCreateContact: boolean
+  autoCreateLead: boolean
+  autoPostMessages: boolean
+  autoCreateActivity: boolean
+  leadPrefix: string
+  leadTeamId: number | null
+  leadUserId: number | null
+}
+
+let autoSyncSettings: AutoSyncSettings = {
+  enabled: true,
+  autoCreateContact: true,
+  autoCreateLead: true,
+  autoPostMessages: true,
+  autoCreateActivity: true,
+  leadPrefix: '[WhatsApp] ',
+  leadTeamId: null,
+  leadUserId: null,
+}
+
 // Cache of available fields per model (auto-detected)
 const modelFieldsCache = new Map<string, Set<string>>()
+
+// Cache of phone -> Odoo record IDs (to avoid re-creating contacts/leads)
+const phoneToPartnerCache = new Map<string, { partnerId: number; leadId: number | null; leadCreated: boolean }>()
 
 // ========== HTTP + Socket.io Server ==========
 const httpServer = createServer()
@@ -105,7 +131,6 @@ function odooExecuteKw(
 
 // ========== Smart Field Detection ==========
 
-// Check which fields exist on a model (with cache)
 async function getAvailableFields(model: string): Promise<Set<string>> {
   if (modelFieldsCache.has(model)) {
     return modelFieldsCache.get(model)!
@@ -125,17 +150,14 @@ async function getAvailableFields(model: string): Promise<Set<string>> {
   }
 }
 
-// Filter a list of requested fields to only those that exist on the model
 async function filterExistingFields(model: string, requestedFields: string[]): Promise<string[]> {
   const available = await getAvailableFields(model)
   const existing = requestedFields.filter(f => available.has(f))
-  // Always return at least 'id' and 'name' if they exist
   if (!existing.includes('id') && available.has('id')) existing.unshift('id')
   if (!existing.includes('name') && available.has('name')) existing.push('name')
   return existing
 }
 
-// Build a safe values dict — only include keys that exist on the model
 async function buildSafeValues(model: string, values: Record<string, any>): Promise<Record<string, any>> {
   const available = await getAvailableFields(model)
   const safe: Record<string, any> = {}
@@ -149,12 +171,10 @@ async function buildSafeValues(model: string, values: Record<string, any>): Prom
   return safe
 }
 
-// Smart write — tries custom fields first, falls back to standard fields
 async function smartWriteWhatsAppNumber(model: string, ids: number[], phone: string): Promise<boolean> {
   const available = await getAvailableFields(model)
   const values: Record<string, any> = {}
 
-  // Check for custom WhatsApp fields
   if (available.has('whatsapp')) {
     values.whatsapp = phone
     console.log(`[Odoo] Using custom field "whatsapp" on ${model}`)
@@ -163,8 +183,6 @@ async function smartWriteWhatsAppNumber(model: string, ids: number[], phone: str
     values.whatsapp_number = phone
     console.log(`[Odoo] Using custom field "whatsapp_number" on ${model}`)
   }
-
-  // Always update standard phone/mobile fields as fallback
   if (available.has('phone')) {
     values.phone = phone
   }
@@ -189,7 +207,6 @@ async function odooSearch(
   limit: number = 80,
   offset: number = 0
 ): Promise<any[]> {
-  // Auto-filter to only existing fields
   const safeFields = fields.length > 0
     ? await filterExistingFields(model, fields)
     : []
@@ -251,6 +268,47 @@ async function odooPostMessage(
   })
 }
 
+async function odooCreateActivity(
+  model: string,
+  recordId: number,
+  summary: string,
+  note: string,
+): Promise<number> {
+  try {
+    const activityTypeId = await findWhatsAppActivityType()
+    const values: Record<string, any> = {
+      res_model: model,
+      res_id: recordId,
+      summary,
+      note,
+      activity_type_id: activityTypeId || 1, // fallback to default type
+    }
+
+    if (autoSyncSettings.leadUserId) {
+      values.user_id = autoSyncSettings.leadUserId
+    }
+
+    return await odooExecuteKw('mail.activity', 'create', [values])
+  } catch (error: any) {
+    console.error(`[Odoo] Failed to create activity:`, error.message)
+    return 0
+  }
+}
+
+async function findWhatsAppActivityType(): Promise<number | null> {
+  try {
+    const types = await odooExecuteKw('mail.activity.type', 'search_read', [
+      [['name', 'ilike', 'WhatsApp']],
+    ], { fields: ['id', 'name'], limit: 1 })
+    if (types && types.length > 0) {
+      return types[0].id
+    }
+  } catch {
+    // Activity type might not exist, that's OK
+  }
+  return null
+}
+
 async function odooGetFields(
   model: string,
   attributes: string[] = ['string', 'help', 'type', 'required', 'readonly']
@@ -258,6 +316,193 @@ async function odooGetFields(
   return odooExecuteKw(model, 'fields_get', [], {
     attributes,
   })
+}
+
+// ========== AUTO-SYNC ENGINE ==========
+
+async function autoSyncWhatsAppMessage(data: {
+  jid: string
+  phone: string
+  pushName?: string | null
+  textContent?: string | null
+  mediaType?: string | null
+  fromMe: boolean
+  timestamp: string
+}): Promise<{
+  partnerId: number | null
+  leadId: number | null
+  mailMessageId: number | null
+  activityId: number | null
+  created: { partner: boolean; lead: boolean }
+  errors: string[]
+}> {
+  const result = {
+    partnerId: null as number | null,
+    leadId: null as number | null,
+    mailMessageId: null as number | null,
+    activityId: null as number | null,
+    created: { partner: false, lead: false },
+    errors: [] as string[],
+  }
+
+  if (!autoSyncSettings.enabled || !odooConfig.uid) {
+    return result
+  }
+
+  console.log(`[AutoSync] Processing message from ${data.phone} (${data.pushName || 'unknown'})`)
+
+  try {
+    // Step 1: Create or update contact in res.partner
+    if (autoSyncSettings.autoCreateContact) {
+      const contactName = data.pushName || `WhatsApp ${data.phone}`
+      const domain = ['|', ['phone', 'ilike', data.phone], ['mobile', 'ilike', data.phone]]
+      const contactValues: Record<string, any> = {
+        name: contactName,
+        phone: data.phone,
+        mobile: data.phone,
+      }
+
+      // Try to set whatsapp field if it exists
+      const partnerFields = await getAvailableFields('res.partner')
+      if (partnerFields.has('whatsapp')) {
+        contactValues.whatsapp = data.phone
+      }
+      if (partnerFields.has('whatsapp_number')) {
+        contactValues.whatsapp_number = data.phone
+      }
+
+      const partnerResult = await odooSearchOrCreate('res.partner', domain, contactValues)
+      result.partnerId = partnerResult.id
+      result.created.partner = partnerResult.created
+
+      // Update cache
+      const cached = phoneToPartnerCache.get(data.phone)
+      if (cached) {
+        cached.partnerId = partnerResult.id
+      } else {
+        phoneToPartnerCache.set(data.phone, { partnerId: partnerResult.id, leadId: null, leadCreated: false })
+      }
+
+      console.log(`[AutoSync] Contact ${partnerResult.created ? 'created' : 'updated'}: res.partner#${partnerResult.id}`)
+    }
+
+    // Step 2: Create lead in crm.lead for new conversations (only for incoming messages)
+    if (autoSyncSettings.autoCreateLead && !data.fromMe && result.partnerId) {
+      // Check cache first
+      const cached = phoneToPartnerCache.get(data.phone)
+      if (cached && cached.leadId && cached.leadCreated) {
+        result.leadId = cached.leadId
+      } else {
+        // Check if there's already a lead for this partner with WhatsApp prefix
+        const existingLeads = await odooSearch('crm.lead', [
+          ['partner_id', '=', result.partnerId],
+          ['name', 'like', autoSyncSettings.leadPrefix],
+          ['type', '=', 'lead'],
+        ], ['id', 'name'], 1)
+
+        if (existingLeads && existingLeads.length > 0) {
+          result.leadId = existingLeads[0].id
+          // Update cache
+          if (cached) {
+            cached.leadId = existingLeads[0].id
+            cached.leadCreated = true
+          }
+          console.log(`[AutoSync] Found existing lead: crm.lead#${existingLeads[0].id}`)
+        } else {
+          // Create new lead
+          const leadName = `${autoSyncSettings.leadPrefix}${data.pushName || data.phone}`
+          const leadValues: Record<string, any> = {
+            name: leadName,
+            type: 'lead',
+            partner_id: result.partnerId,
+            phone: data.phone,
+            description: `Conversa iniciada via WhatsApp em ${new Date().toLocaleString('pt-BR')}`,
+          }
+
+          // Try to set custom whatsapp field
+          const leadFields = await getAvailableFields('crm.lead')
+          if (leadFields.has('whatsapp_number')) {
+            leadValues.whatsapp_number = data.phone
+          }
+
+          if (autoSyncSettings.leadTeamId) {
+            leadValues.team_id = autoSyncSettings.leadTeamId
+          }
+          if (autoSyncSettings.leadUserId) {
+            leadValues.user_id = autoSyncSettings.leadUserId
+          }
+
+          result.leadId = await odooCreate('crm.lead', leadValues)
+          result.created.lead = true
+
+          // Update cache
+          if (cached) {
+            cached.leadId = result.leadId
+            cached.leadCreated = true
+          } else {
+            phoneToPartnerCache.set(data.phone, { partnerId: result.partnerId, leadId: result.leadId, leadCreated: true })
+          }
+
+          console.log(`[AutoSync] Lead created: crm.lead#${result.leadId}`)
+        }
+      }
+    }
+
+    // Step 3: Post message as mail.message in Odoo chatter
+    if (autoSyncSettings.autoPostMessages && !data.fromMe) {
+      const targetModel = result.leadId ? 'crm.lead' : (result.partnerId ? 'res.partner' : null)
+      const targetId = result.leadId || result.partnerId
+
+      if (targetModel && targetId) {
+        const direction = data.fromMe ? 'Enviada' : 'Recebida'
+        const mediaLabel = data.mediaType ? ` [${data.mediaType}]` : ''
+        const msgBody = data.textContent
+          ? `<p><strong>📱 WhatsApp ${direction}:</strong>${mediaLabel}</p><p>${escapeHtml(data.textContent)}</p>`
+          : `<p><strong>📱 WhatsApp ${direction}:</strong>${mediaLabel} [Mídia]</p>`
+
+        try {
+          result.mailMessageId = await odooPostMessage(targetModel, targetId, msgBody)
+          console.log(`[AutoSync] Message posted on ${targetModel}#${targetId}: mail.message#${result.mailMessageId}`)
+        } catch (error: any) {
+          result.errors.push(`Failed to post message: ${error.message}`)
+          console.error(`[AutoSync] Failed to post message:`, error.message)
+        }
+      }
+    }
+
+    // Step 4: Create activity notification for the first message of a new lead
+    if (autoSyncSettings.autoCreateActivity && result.created.lead && result.leadId) {
+      const summary = 'Nova mensagem WhatsApp'
+      const note = `Contato ${data.pushName || data.phone} iniciou uma conversa via WhatsApp.\n\nMensagem: ${data.textContent || '[Mídia]'}`
+
+      try {
+        result.activityId = await odooCreateActivity('crm.lead', result.leadId, summary, note)
+        console.log(`[AutoSync] Activity created: mail.activity#${result.activityId}`)
+      } catch (error: any) {
+        result.errors.push(`Failed to create activity: ${error.message}`)
+      }
+    }
+
+  } catch (error: any) {
+    result.errors.push(`Auto-sync error: ${error.message}`)
+    console.error(`[AutoSync] Error:`, error.message)
+  }
+
+  // Emit sync result to all connected clients
+  io.emit('odoo:autosync:result', {
+    phone: data.phone,
+    ...result,
+  })
+
+  return result
+}
+
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/\n/g, '<br/>')
 }
 
 // ========== Socket.io Events ==========
@@ -271,14 +516,17 @@ io.on('connection', (socket) => {
     username: odooConfig.username,
   })
 
+  // Send current auto-sync settings
+  socket.emit('odoo:autosync:settings', autoSyncSettings)
+
   // ===== Authentication =====
   socket.on(
     'odoo:authenticate',
     async (data: { url: string; db: string; username: string; password: string }, callback) => {
       try {
         odooConfig = { ...data, uid: null }
-        // Clear field cache on new connection
         modelFieldsCache.clear()
+        phoneToPartnerCache.clear()
         const uid = await odooAuthenticate()
         odooConfig.uid = uid
         console.log(`[Odoo] Authenticated as ${data.username} (uid: ${uid})`)
@@ -305,9 +553,52 @@ io.on('connection', (socket) => {
   socket.on('odoo:disconnect', (callback) => {
     odooConfig = { url: '', db: '', username: '', password: '', uid: null }
     modelFieldsCache.clear()
+    phoneToPartnerCache.clear()
     io.emit('odoo:status', { connected: false })
     callback({ success: true })
   })
+
+  // ===== Auto-Sync Settings =====
+  socket.on(
+    'odoo:autosync:update-settings',
+    async (data: Partial<AutoSyncSettings>, callback) => {
+      try {
+        autoSyncSettings = { ...autoSyncSettings, ...data }
+        console.log('[Odoo] Auto-sync settings updated:', autoSyncSettings)
+        io.emit('odoo:autosync:settings', autoSyncSettings)
+        callback({ success: true, settings: autoSyncSettings })
+      } catch (error: any) {
+        callback({ success: false, error: error.message })
+      }
+    }
+  )
+
+  socket.on('odoo:autosync:get-settings', (callback) => {
+    callback({ success: true, settings: autoSyncSettings })
+  })
+
+  // ===== Auto-Sync Trigger (called by WhatsApp service) =====
+  socket.on(
+    'odoo:autosync:message',
+    async (data: {
+      jid: string
+      phone: string
+      pushName?: string | null
+      textContent?: string | null
+      mediaType?: string | null
+      fromMe: boolean
+      timestamp: string
+    }, callback) => {
+      console.log(`[Odoo] Auto-sync message received from ${data.phone}`)
+      try {
+        const result = await autoSyncWhatsAppMessage(data)
+        if (callback) callback({ success: true, ...result })
+      } catch (error: any) {
+        console.error('[Odoo] Auto-sync error:', error.message)
+        if (callback) callback({ success: false, error: error.message })
+      }
+    }
+  )
 
   // ===== Contacts (res.partner) =====
   socket.on(
@@ -532,10 +823,8 @@ io.on('connection', (socket) => {
       try {
         const phone = data.phone || data.jid.split('@')[0]
 
-        // Use smart write that auto-detects available fields
         await smartWriteWhatsAppNumber(data.model, [data.recordId], phone)
 
-        // Also log a message in the chatter
         try {
           await odooPostMessage(data.model, data.recordId,
             `<p><strong>[WhatsApp Middleware]</strong> Conversa vinculada — Número: ${phone}</p>`
@@ -635,6 +924,26 @@ io.on('connection', (socket) => {
     }
   })
 
+  // ===== Get teams (for auto-sync settings) =====
+  socket.on('odoo:teams:search', async (data: { limit?: number }, callback) => {
+    try {
+      const records = await odooSearch('crm.team', [], ['name', 'user_id'], data.limit || 20)
+      callback({ success: true, data: records })
+    } catch (error: any) {
+      callback({ success: false, error: error.message })
+    }
+  })
+
+  // ===== Get users (for auto-sync settings) =====
+  socket.on('odoo:users:search', async (data: { limit?: number }, callback) => {
+    try {
+      const records = await odooSearch('res.users', [], ['name', 'login', 'image_128'], data.limit || 20)
+      callback({ success: true, data: records })
+    } catch (error: any) {
+      callback({ success: false, error: error.message })
+    }
+  })
+
   socket.on('disconnect', () => {
     console.log(`[Odoo IO] Client disconnected: ${socket.id}`)
   })
@@ -643,6 +952,7 @@ io.on('connection', (socket) => {
 // ========== Start Server ==========
 httpServer.listen(PORT, () => {
   console.log(`[Odoo Service] Server running on port ${PORT}`)
+  console.log(`[Odoo Service] Auto-sync enabled: ${autoSyncSettings.enabled}`)
 })
 
 process.on('SIGTERM', () => {
