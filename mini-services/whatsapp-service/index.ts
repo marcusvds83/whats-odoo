@@ -16,12 +16,17 @@ import {
 import { Boom } from '@hapi/boom'
 import P from 'pino'
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs'
-import { join } from 'path'
+import { join, dirname } from 'path'
+import { fileURLToPath } from 'url'
 
 // ========== Configuration ==========
 const PORT = 3001
 const ODOO_SERVICE_URL = process.env.ODOO_SERVICE_URL || 'http://localhost:3002'
-const AUTH_FOLDER = join(import.meta.dir, 'auth_store')
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = dirname(__filename)
+// Use DATA_DIR env var for persistent disk (Render), fallback to local auth_store
+const DATA_DIR = process.env.DATA_DIR || join(__dirname, 'auth_store')
+const AUTH_FOLDER = join(DATA_DIR, 'auth_store')
 const logger = P({ level: 'silent' })
 
 // Ensure auth folder exists

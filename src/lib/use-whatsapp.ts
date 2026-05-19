@@ -34,7 +34,7 @@ export function useWhatsApp() {
   const [odooSyncMap, setOdooSyncMap] = useState<Map<string, OdooSyncInfo>>(new Map())
 
   useEffect(() => {
-    const socket = io('/?XTransformPort=3001', {
+    const socket = io('/whatsapp', {
       transports: ['websocket', 'polling'],
       forceNew: true,
       reconnection: true,

@@ -52,7 +52,7 @@ export function useOdoo() {
   const [lastSyncResult, setLastSyncResult] = useState<AutoSyncResult | null>(null)
 
   useEffect(() => {
-    const socket = io('/?XTransformPort=3002', {
+    const socket = io('/odoo', {
       transports: ['websocket', 'polling'],
       forceNew: true,
       reconnection: true,

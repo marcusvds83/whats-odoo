@@ -1,27 +1,36 @@
 services:
   - type: web
-    name: whatsapp-odoo-middleware
+    name: whats-odoo
     runtime: node
     plan: starter
     buildCommand: |
       npm install &&
       cd mini-services/whatsapp-service && npm install && cd ../.. &&
       cd mini-services/odoo-service && npm install && cd ../.. &&
-      npx prisma generate
+      npx prisma generate &&
+      npm run build
     startCommand: |
+      mkdir -p /opt/render/project/src/data/auth_store &&
       npx prisma db push &&
       npx tsx mini-services/whatsapp-service/index.ts &
       npx tsx mini-services/odoo-service/index.ts &
+      sleep 3 &&
       npm run start
     envVars:
       - key: NODE_ENV
         value: production
       - key: DATABASE_URL
-        value: file:./data/whats-odoo.db
+        value: file:/opt/render/project/src/data/whats-odoo.db
       - key: PORT
         value: 10000
+      - key: HOSTNAME
+        value: "0.0.0.0"
+      - key: WHATSAPP_SERVICE_URL
+        value: http://localhost:3001
       - key: ODOO_SERVICE_URL
         value: http://localhost:3002
+      - key: DATA_DIR
+        value: /opt/render/project/src/data
     disk:
       name: whats-odoo-data
       mountPath: /opt/render/project/src/data
