@@ -949,10 +949,54 @@ io.on('connection', (socket) => {
   })
 })
 
+// ========== Auto-Authenticate from Environment Variables ==========
+async function autoAuthenticateFromEnv() {
+  const envUrl = process.env.ODOO_URL
+  const envDb = process.env.ODOO_DB
+  const envUsername = process.env.ODOO_USERNAME
+  const envPassword = process.env.ODOO_PASSWORD
+
+  if (envUrl && envDb && envUsername && envPassword) {
+    console.log(`[Odoo] Auto-authenticating with env vars: ${envUrl} / ${envDb} / ${envUsername}`)
+    try {
+      odooConfig = {
+        url: envUrl,
+        db: envDb,
+        username: envUsername,
+        password: envPassword,
+        uid: null,
+      }
+      modelFieldsCache.clear()
+      phoneToPartnerCache.clear()
+      const uid = await odooAuthenticate()
+      odooConfig.uid = uid
+      console.log(`[Odoo] Auto-authenticated as ${envUsername} (uid: ${uid})`)
+
+      // Pre-cache fields for main models
+      await getAvailableFields('res.partner')
+      await getAvailableFields('crm.lead')
+
+      io.emit('odoo:status', {
+        connected: true,
+        url: odooConfig.url,
+        db: odooConfig.db,
+        username: odooConfig.username,
+      })
+    } catch (error: any) {
+      console.error(`[Odoo] Auto-authentication failed: ${error.message}`)
+      console.error('[Odoo] You can still connect manually via the UI')
+    }
+  } else {
+    console.log('[Odoo] No ODOO_URL/ODOO_DB/ODOO_USERNAME/ODOO_PASSWORD env vars set. Waiting for manual connection via UI.')
+  }
+}
+
 // ========== Start Server ==========
-httpServer.listen(PORT, () => {
+httpServer.listen(PORT, async () => {
   console.log(`[Odoo Service] Server running on port ${PORT}`)
   console.log(`[Odoo Service] Auto-sync enabled: ${autoSyncSettings.enabled}`)
+  // Auto-authenticate if env vars are present
+  await autoAuthenticateFromEnv()
 })
 
 process.on('SIGTERM', () => {
