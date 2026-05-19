@@ -1,5 +1,4 @@
 services:
-  # Main Next.js Web Application
   - type: web
     name: whatsapp-odoo-middleware
     runtime: node
@@ -8,9 +7,9 @@ services:
       npm install &&
       cd mini-services/whatsapp-service && npm install && cd ../.. &&
       cd mini-services/odoo-service && npm install && cd ../.. &&
-      npx prisma generate &&
-      npx prisma db push
+      npx prisma generate
     startCommand: |
+      npx prisma db push &&
       npx tsx mini-services/whatsapp-service/index.ts &
       npx tsx mini-services/odoo-service/index.ts &
       npm run start
@@ -18,16 +17,12 @@ services:
       - key: NODE_ENV
         value: production
       - key: DATABASE_URL
-        fromDatabase:
-          name: whatsapp-odoo-db
-          property: connectionString
+        value: file:./data/whats-odoo.db
       - key: PORT
         value: 10000
       - key: ODOO_SERVICE_URL
         value: http://localhost:3002
-    healthCheckPath: /
-
-databases:
-  - name: whatsapp-odoo-db
-    databaseName: whatsapp_odoo
-    plan: starter
+    disk:
+      name: whats-odoo-data
+      mountPath: /opt/render/project/src/data
+      sizeGB: 1
