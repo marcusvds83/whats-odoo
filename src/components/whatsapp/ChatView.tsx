@@ -1,0 +1,406 @@
+'use client'
+
+import { useState, useRef, useEffect, useCallback } from 'react'
+import { ScrollArea } from '@/components/ui/scroll-area'
+import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Badge } from '@/components/ui/badge'
+import { Separator } from '@/components/ui/separator'
+import { cn } from '@/lib/utils'
+import {
+  Send,
+  Phone,
+  User,
+  ImageIcon,
+  FileText,
+  Video,
+  Music,
+  Paperclip,
+  Check,
+  CheckCheck,
+  Clock,
+  MessageSquare,
+  ArrowDown,
+} from 'lucide-react'
+
+interface ChatViewProps {
+  conversation: {
+    jid: string
+    name: string | null
+    phone: string | null
+    pushName: string | null
+    avatarUrl: string | null
+  } | null
+  messages: Array<{
+    id: string
+    whatsappId: string | null
+    fromMe: boolean
+    textContent: string | null
+    mediaType: string | null
+    timestamp: string
+    status: string
+  }>
+  onSendMessage: (jid: string, text: string) => Promise<boolean>
+  onMarkRead: (jid: string) => void
+}
+
+function formatMessageTime(dateStr: string): string {
+  const date = new Date(dateStr)
+  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+}
+
+function formatMessageDate(dateStr: string): string {
+  const date = new Date(dateStr)
+  const now = new Date()
+  const diffMs = now.getTime() - date.getTime()
+  const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24))
+
+  if (diffDays === 0) return 'Today'
+  if (diffDays === 1) return 'Yesterday'
+  return date.toLocaleDateString([], { month: 'long', day: 'numeric', year: 'numeric' })
+}
+
+function getMediaIcon(mediaType: string | null) {
+  switch (mediaType) {
+    case 'image':
+      return <ImageIcon className="size-4" />
+    case 'video':
+      return <Video className="size-4" />
+    case 'audio':
+    case 'ptt':
+      return <Music className="size-4" />
+    case 'document':
+    case 'pdf':
+      return <FileText className="size-4" />
+    default:
+      return <Paperclip className="size-4" />
+  }
+}
+
+function getMediaLabel(mediaType: string | null): string {
+  switch (mediaType) {
+    case 'image':
+      return 'Photo'
+    case 'video':
+      return 'Video'
+    case 'audio':
+      return 'Audio'
+    case 'ptt':
+      return 'Voice message'
+    case 'document':
+      return 'Document'
+    case 'pdf':
+      return 'PDF Document'
+    case 'sticker':
+      return 'Sticker'
+    default:
+      return 'Media'
+  }
+}
+
+function getMessageStatusIcon(status: string, fromMe: boolean) {
+  if (!fromMe) return null
+
+  switch (status) {
+    case 'pending':
+      return <Clock className="size-3.5 text-muted-foreground" />
+    case 'sent':
+      return <Check className="size-3.5 text-muted-foreground" />
+    case 'delivered':
+      return <CheckCheck className="size-3.5 text-muted-foreground" />
+    case 'read':
+      return <CheckCheck className="size-3.5 text-blue-500" />
+    default:
+      return <Clock className="size-3.5 text-muted-foreground" />
+  }
+}
+
+function shouldShowDateDivider(
+  currentMsg: { timestamp: string },
+  prevMsg: { timestamp: string } | undefined
+): boolean {
+  if (!prevMsg) return true
+  const currentDate = new Date(currentMsg.timestamp).toDateString()
+  const prevDate = new Date(prevMsg.timestamp).toDateString()
+  return currentDate !== prevDate
+}
+
+export function ChatView({
+  conversation,
+  messages,
+  onSendMessage,
+  onMarkRead,
+}: ChatViewProps) {
+  const [inputText, setInputText] = useState('')
+  const [isSending, setIsSending] = useState(false)
+  const [showScrollButton, setShowScrollButton] = useState(false)
+  const messagesEndRef = useRef<HTMLDivElement>(null)
+  const scrollAreaRef = useRef<HTMLDivElement>(null)
+  const inputRef = useRef<HTMLInputElement>(null)
+
+  const scrollToBottom = useCallback((behavior: ScrollBehavior = 'smooth') => {
+    messagesEndRef.current?.scrollIntoView({ behavior })
+  }, [])
+
+  // Auto-scroll on new messages
+  useEffect(() => {
+    scrollToBottom()
+  }, [messages.length, scrollToBottom])
+
+  // Mark as read when selecting a conversation
+  useEffect(() => {
+    if (conversation) {
+      onMarkRead(conversation.jid)
+    }
+  }, [conversation?.jid, onMarkRead])
+
+  // Track scroll position for "scroll to bottom" button
+  useEffect(() => {
+    const viewport = scrollAreaRef.current?.querySelector('[data-slot="scroll-area-viewport"]')
+    if (!viewport) return
+
+    const handleScroll = () => {
+      const { scrollTop, scrollHeight, clientHeight } = viewport as HTMLElement
+      const distanceFromBottom = scrollHeight - scrollTop - clientHeight
+      setShowScrollButton(distanceFromBottom > 150)
+    }
+
+    viewport.addEventListener('scroll', handleScroll)
+    return () => viewport.removeEventListener('scroll', handleScroll)
+  }, [])
+
+  const handleSend = async () => {
+    const text = inputText.trim()
+    if (!text || !conversation || isSending) return
+
+    setIsSending(true)
+    try {
+      const success = await onSendMessage(conversation.jid, text)
+      if (success) {
+        setInputText('')
+      }
+    } finally {
+      setIsSending(false)
+      inputRef.current?.focus()
+    }
+  }
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault()
+      handleSend()
+    }
+  }
+
+  const displayName =
+    conversation?.name || conversation?.pushName || conversation?.phone || conversation?.jid?.split('@')[0] || ''
+
+  // Empty state - no conversation selected
+  if (!conversation) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full bg-muted/20">
+        <div className="flex flex-col items-center gap-3 text-center px-4">
+          <div className="size-20 rounded-full bg-muted/60 flex items-center justify-center">
+            <MessageSquare className="size-8 text-muted-foreground/50" />
+          </div>
+          <h3 className="text-lg font-semibold text-muted-foreground">No conversation selected</h3>
+          <p className="text-sm text-muted-foreground/70 max-w-[280px]">
+            Select a conversation from the list to start viewing messages
+          </p>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex flex-col h-full">
+      {/* Chat Header */}
+      <div className="shrink-0 border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
+        <div className="flex items-center gap-3 px-4 py-3">
+          <Avatar className="size-10">
+            {conversation.avatarUrl && (
+              <AvatarImage src={conversation.avatarUrl} alt={displayName} />
+            )}
+            <AvatarFallback className="bg-primary/10 text-primary text-sm">
+              {displayName
+                .split(' ')
+                .map((w) => w[0])
+                .filter(Boolean)
+                .slice(0, 2)
+                .join('')
+                .toUpperCase() || <User className="size-4" />}
+            </AvatarFallback>
+          </Avatar>
+          <div className="flex-1 min-w-0">
+            <h3 className="font-semibold text-sm truncate">{displayName}</h3>
+            <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+              {conversation.phone ? (
+                <>
+                  <Phone className="size-3" />
+                  <span>{conversation.phone}</span>
+                </>
+              ) : (
+                <span>{conversation.jid.split('@')[0]}</span>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Messages Area */}
+      <div className="flex-1 relative overflow-hidden">
+        <ScrollArea ref={scrollAreaRef} className="h-full">
+          <div className="px-4 py-3 space-y-1">
+            {messages.length === 0 ? (
+              <div className="flex flex-col items-center justify-center py-16">
+                <div className="size-14 rounded-full bg-muted/50 flex items-center justify-center mb-3">
+                  <MessageSquare className="size-6 text-muted-foreground/40" />
+                </div>
+                <p className="text-sm text-muted-foreground">No messages yet</p>
+                <p className="text-xs text-muted-foreground/60 mt-1">
+                  Send a message to start the conversation
+                </p>
+              </div>
+            ) : (
+              messages.map((message, index) => {
+                const prevMessage = index > 0 ? messages[index - 1] : undefined
+                const showDateDivider = shouldShowDateDivider(message, prevMessage)
+                const isConsecutive =
+                  prevMessage &&
+                  prevMessage.fromMe === message.fromMe &&
+                  new Date(message.timestamp).getTime() - new Date(prevMessage.timestamp).getTime() < 60000
+
+                return (
+                  <div key={message.id}>
+                    {/* Date Divider */}
+                    {showDateDivider && (
+                      <div className="flex items-center justify-center py-3">
+                        <Badge
+                          variant="secondary"
+                          className="text-[10px] px-3 py-0.5 font-normal bg-muted/80 text-muted-foreground"
+                        >
+                          {formatMessageDate(message.timestamp)}
+                        </Badge>
+                      </div>
+                    )}
+
+                    {/* Message Bubble */}
+                    <div
+                      className={cn(
+                        'flex',
+                        message.fromMe ? 'justify-end' : 'justify-start',
+                        isConsecutive ? 'mt-0.5' : 'mt-2'
+                      )}
+                    >
+                      <div
+                        className={cn(
+                          'max-w-[75%] sm:max-w-[65%] rounded-2xl px-3 py-1.5 shadow-sm',
+                          message.fromMe
+                            ? 'bg-emerald-600 text-white rounded-br-md'
+                            : 'bg-muted rounded-bl-md',
+                          isConsecutive &&
+                            (message.fromMe ? 'rounded-br-md' : 'rounded-bl-md')
+                        )}
+                      >
+                        {/* Media indicator */}
+                        {message.mediaType && message.mediaType !== '' && (
+                          <div
+                            className={cn(
+                              'flex items-center gap-2 mb-1 px-2 py-1.5 rounded-lg text-xs',
+                              message.fromMe
+                                ? 'bg-emerald-500/50'
+                                : 'bg-background/50'
+                            )}
+                          >
+                            {getMediaIcon(message.mediaType)}
+                            <span className="font-medium">{getMediaLabel(message.mediaType)}</span>
+                          </div>
+                        )}
+
+                        {/* Text content */}
+                        {message.textContent && (
+                          <p className="text-[13px] leading-relaxed whitespace-pre-wrap break-words">
+                            {message.textContent}
+                          </p>
+                        )}
+
+                        {/* Only media, no text */}
+                        {message.mediaType && !message.textContent && (
+                          <p className="text-[13px] leading-relaxed italic opacity-70">
+                            {getMediaLabel(message.mediaType)}
+                          </p>
+                        )}
+
+                        {/* Timestamp & Status */}
+                        <div
+                          className={cn(
+                            'flex items-center gap-1 mt-0.5',
+                            message.fromMe ? 'justify-end' : 'justify-start'
+                          )}
+                        >
+                          <span
+                            className={cn(
+                              'text-[10px]',
+                              message.fromMe
+                                ? 'text-white/60'
+                                : 'text-muted-foreground'
+                            )}
+                          >
+                            {formatMessageTime(message.timestamp)}
+                          </span>
+                          {getMessageStatusIcon(message.status, message.fromMe)}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )
+              })
+            )}
+            <div ref={messagesEndRef} />
+          </div>
+        </ScrollArea>
+
+        {/* Scroll to bottom button */}
+        {showScrollButton && (
+          <Button
+            variant="secondary"
+            size="icon"
+            className="absolute bottom-4 right-4 size-9 rounded-full shadow-lg opacity-80 hover:opacity-100 transition-opacity"
+            onClick={() => scrollToBottom()}
+          >
+            <ArrowDown className="size-4" />
+          </Button>
+        )}
+      </div>
+
+      {/* Message Input */}
+      <Separator />
+      <div className="shrink-0 px-4 py-3 bg-background">
+        <div className="flex items-center gap-2">
+          <Input
+            ref={inputRef}
+            placeholder="Type a message..."
+            className="flex-1 h-10 text-sm"
+            value={inputText}
+            onChange={(e) => setInputText(e.target.value)}
+            onKeyDown={handleKeyDown}
+            disabled={isSending}
+          />
+          <Button
+            size="icon"
+            className="size-10 shrink-0 rounded-full bg-emerald-600 hover:bg-emerald-700 text-white"
+            onClick={handleSend}
+            disabled={!inputText.trim() || isSending}
+          >
+            {isSending ? (
+              <span className="size-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+            ) : (
+              <Send className="size-4" />
+            )}
+          </Button>
+        </div>
+      </div>
+    </div>
+  )
+}

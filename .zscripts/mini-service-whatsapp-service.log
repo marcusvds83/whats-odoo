@@ -1,0 +1,16 @@
+[whatsapp-service] Installing dependencies...
+bun install v1.3.14 (0d9b296a)
+
+Done! Checked 243 packages (no changes) [18.00ms]
+[whatsapp-service] Running bun run dev...
+$ bun index.ts
+[WA Service] Starting WhatsApp service...
+[WA Service] No auth found, waiting for QR scan...
+[bun] Warning: ws.WebSocket 'upgrade' event is not implemented in bun
+[bun] Warning: ws.WebSocket 'unexpected-response' event is not implemented in bun
+[WA] Connection update: connecting
+[WA Service] Server running on port 3001
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
