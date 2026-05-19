@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "next dev -p 3000",
     "build": "next build",
-    "start": "npx prisma generate && npx prisma db push && cd mini-services/whatsapp-service && npm install && cd ../.. && cd mini-services/odoo-service && npm install && cd ../.. && npx next build && npx tsx mini-services/whatsapp-service/index.ts & npx tsx mini-services/odoo-service/index.ts & sleep 3 && node server.js",
+    "start": "mkdir -p /opt/render/project/src/data/auth_store && npx prisma generate && npx prisma db push && cd mini-services/whatsapp-service && npm install && cd ../.. && cd mini-services/odoo-service && npm install && cd ../.. && npx next build && npx tsx mini-services/whatsapp-service/index.ts & sleep 2 && npx tsx mini-services/odoo-service/index.ts & sleep 5 && node server.js",
     "lint": "eslint .",
     "db:push": "prisma db push",
     "db:generate": "prisma generate"

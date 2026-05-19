@@ -1,6 +1,6 @@
 import { createServer } from 'http'
 import { Server } from 'socket.io'
-import { createClient } from 'xmlrpc'
+import { createClient, createSecureClient } from 'xmlrpc'
 
 // ========== Configuration ==========
 const PORT = 3002
@@ -59,23 +59,25 @@ const io = new Server(httpServer, {
 })
 
 // ========== Odoo XML-RPC Client ==========
-function getOdooClient(path: string = '/xmlrpc/2/object') {
+function makeXmlRpcClient(path: string) {
   const url = new URL(odooConfig.url)
-  const client = createClient({
+  const isHttps = url.protocol === 'https:'
+  const options = {
     host: url.hostname,
-    port: parseInt(url.port) || (url.protocol === 'https:' ? 443 : 80),
+    port: parseInt(url.port) || (isHttps ? 443 : 80),
     path,
-  })
-  return client
+  }
+  // CRITICAL: Must use createSecureClient for HTTPS (Odoo SaaS)
+  return isHttps ? createSecureClient(options) : createClient(options)
+}
+
+function getOdooClient(path: string = '/xmlrpc/2/object') {
+  return makeXmlRpcClient(path)
 }
 
 function odooAuthenticate(): Promise<number> {
   return new Promise((resolve, reject) => {
-    const client = createClient({
-      host: new URL(odooConfig.url).hostname,
-      port: parseInt(new URL(odooConfig.url).port) || (new URL(odooConfig.url).protocol === 'https:' ? 443 : 80),
-      path: '/xmlrpc/2/common',
-    })
+    const client = makeXmlRpcClient('/xmlrpc/2/common')
 
     client.methodCall('authenticate', [
       odooConfig.db,
