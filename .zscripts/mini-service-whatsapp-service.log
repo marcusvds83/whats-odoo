@@ -14,3 +14,57 @@ $ bun index.ts
 [WA] QR Code generated, sending to clients
 [WA] Connection update: undefined
 [WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: close
+[WA] Connection closed. Status: 408, Reconnect: true
+[WA] Connection update: connecting
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: close
+[WA] Connection closed. Status: 408, Reconnect: true
+[WA] Connection update: connecting
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[IO] Client connected: Nb4QeQ7gI-2P8-1CAAAB
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[IO] Client connected: suhbe9Ij0q1buWzJAAAD
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[IO] Client disconnected: Nb4QeQ7gI-2P8-1CAAAB
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: close
+[WA] Connection closed. Status: 408, Reconnect: true
+[WA] Connection update: connecting
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients

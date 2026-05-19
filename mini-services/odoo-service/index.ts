@@ -20,6 +20,9 @@ let odooConfig: {
   uid: null,
 }
 
+// Cache of available fields per model (auto-detected)
+const modelFieldsCache = new Map<string, Set<string>>()
+
 // ========== HTTP + Socket.io Server ==========
 const httpServer = createServer()
 const io = new Server(httpServer, {
@@ -100,9 +103,85 @@ function odooExecuteKw(
   })
 }
 
+// ========== Smart Field Detection ==========
+
+// Check which fields exist on a model (with cache)
+async function getAvailableFields(model: string): Promise<Set<string>> {
+  if (modelFieldsCache.has(model)) {
+    return modelFieldsCache.get(model)!
+  }
+
+  try {
+    const fields = await odooExecuteKw(model, 'fields_get', [], {
+      attributes: ['string', 'type'],
+    })
+    const fieldNames = new Set(Object.keys(fields))
+    modelFieldsCache.set(model, fieldNames)
+    console.log(`[Odoo] Model ${model} has ${fieldNames.size} fields. Custom checks: whatsapp=${fieldNames.has('whatsapp')}, whatsapp_number=${fieldNames.has('whatsapp_number')}`)
+    return fieldNames
+  } catch (error: any) {
+    console.error(`[Odoo] Failed to get fields for ${model}:`, error.message)
+    return new Set()
+  }
+}
+
+// Filter a list of requested fields to only those that exist on the model
+async function filterExistingFields(model: string, requestedFields: string[]): Promise<string[]> {
+  const available = await getAvailableFields(model)
+  const existing = requestedFields.filter(f => available.has(f))
+  // Always return at least 'id' and 'name' if they exist
+  if (!existing.includes('id') && available.has('id')) existing.unshift('id')
+  if (!existing.includes('name') && available.has('name')) existing.push('name')
+  return existing
+}
+
+// Build a safe values dict — only include keys that exist on the model
+async function buildSafeValues(model: string, values: Record<string, any>): Promise<Record<string, any>> {
+  const available = await getAvailableFields(model)
+  const safe: Record<string, any> = {}
+  for (const [key, value] of Object.entries(values)) {
+    if (available.has(key)) {
+      safe[key] = value
+    } else {
+      console.log(`[Odoo] Field "${key}" does not exist on ${model}, skipping`)
+    }
+  }
+  return safe
+}
+
+// Smart write — tries custom fields first, falls back to standard fields
+async function smartWriteWhatsAppNumber(model: string, ids: number[], phone: string): Promise<boolean> {
+  const available = await getAvailableFields(model)
+  const values: Record<string, any> = {}
+
+  // Check for custom WhatsApp fields
+  if (available.has('whatsapp')) {
+    values.whatsapp = phone
+    console.log(`[Odoo] Using custom field "whatsapp" on ${model}`)
+  }
+  if (available.has('whatsapp_number')) {
+    values.whatsapp_number = phone
+    console.log(`[Odoo] Using custom field "whatsapp_number" on ${model}`)
+  }
+
+  // Always update standard phone/mobile fields as fallback
+  if (available.has('phone')) {
+    values.phone = phone
+  }
+  if (available.has('mobile') && !values.whatsapp) {
+    values.mobile = phone
+  }
+
+  if (Object.keys(values).length === 0) {
+    console.log(`[Odoo] No phone/whatsapp fields found on ${model}, skipping write`)
+    return false
+  }
+
+  return odooWrite(model, ids, values)
+}
+
 // ========== High-level Odoo Operations ==========
 
-// Search records
 async function odooSearch(
   model: string,
   domain: any[],
@@ -110,68 +189,68 @@ async function odooSearch(
   limit: number = 80,
   offset: number = 0
 ): Promise<any[]> {
+  // Auto-filter to only existing fields
+  const safeFields = fields.length > 0
+    ? await filterExistingFields(model, fields)
+    : []
   return odooExecuteKw(model, 'search_read', [domain], {
-    fields,
+    fields: safeFields.length > 0 ? safeFields : undefined,
     limit,
     offset,
   })
 }
 
-// Read records by IDs
 async function odooRead(
   model: string,
   ids: number[],
   fields: string[] = []
 ): Promise<any[]> {
+  const safeFields = fields.length > 0
+    ? await filterExistingFields(model, fields)
+    : []
   return odooExecuteKw(model, 'read', [ids], {
-    fields,
+    fields: safeFields.length > 0 ? safeFields : undefined,
   })
 }
 
-// Create a record
 async function odooCreate(model: string, values: Record<string, any>): Promise<number> {
-  return odooExecuteKw(model, 'create', [values])
+  const safeValues = await buildSafeValues(model, values)
+  return odooExecuteKw(model, 'create', [safeValues])
 }
 
-// Update a record
 async function odooWrite(model: string, ids: number[], values: Record<string, any>): Promise<boolean> {
-  return odooExecuteKw(model, 'write', [ids, values])
+  const safeValues = await buildSafeValues(model, values)
+  return odooExecuteKw(model, 'write', [ids, safeValues])
 }
 
-// Search or create a record
 async function odooSearchOrCreate(
   model: string,
   domain: any[],
   values: Record<string, any>
 ): Promise<{ id: number; created: boolean }> {
-  // First search
   const existing = await odooExecuteKw(model, 'search', [domain], { limit: 1 })
   if (existing && existing.length > 0) {
-    // Update existing
-    await odooWrite(model, existing, values)
+    const safeValues = await buildSafeValues(model, values)
+    await odooWrite(model, existing, safeValues)
     return { id: existing[0], created: false }
   }
-  // Create new
-  const newId = await odooCreate(model, values)
+  const safeValues = await buildSafeValues(model, values)
+  const newId = await odooCreate(model, safeValues)
   return { id: newId, created: true }
 }
 
-// Add a message to a record (mail.thread)
 async function odooPostMessage(
   model: string,
   recordId: number,
   message: string,
-  subtype: string = 'whatsapp'
 ): Promise<any> {
   return odooExecuteKw(model, 'message_post', [recordId], {
     body: message,
     message_type: 'comment',
     subtype_xmlid: 'mail.mt_comment',
-    // Custom subtype for WhatsApp messages
   })
 }
 
-// Get fields metadata for a model
 async function odooGetFields(
   model: string,
   attributes: string[] = ['string', 'help', 'type', 'required', 'readonly']
@@ -185,7 +264,6 @@ async function odooGetFields(
 io.on('connection', (socket) => {
   console.log(`[Odoo IO] Client connected: ${socket.id}`)
 
-  // Send current Odoo connection status
   socket.emit('odoo:status', {
     connected: !!odooConfig.uid,
     url: odooConfig.url,
@@ -199,9 +277,16 @@ io.on('connection', (socket) => {
     async (data: { url: string; db: string; username: string; password: string }, callback) => {
       try {
         odooConfig = { ...data, uid: null }
+        // Clear field cache on new connection
+        modelFieldsCache.clear()
         const uid = await odooAuthenticate()
         odooConfig.uid = uid
         console.log(`[Odoo] Authenticated as ${data.username} (uid: ${uid})`)
+
+        // Pre-cache fields for main models
+        await getAvailableFields('res.partner')
+        await getAvailableFields('crm.lead')
+
         io.emit('odoo:status', {
           connected: true,
           url: odooConfig.url,
@@ -216,9 +301,10 @@ io.on('connection', (socket) => {
     }
   )
 
-  // ===== Disconnect from Odoo =====
+  // ===== Disconnect =====
   socket.on('odoo:disconnect', (callback) => {
     odooConfig = { url: '', db: '', username: '', password: '', uid: null }
+    modelFieldsCache.clear()
     io.emit('odoo:status', { connected: false })
     callback({ success: true })
   })
@@ -439,32 +525,23 @@ io.on('connection', (socket) => {
     'odoo:link-conversation',
     async (data: {
       jid: string
-      model: string // res.partner, crm.lead, sale.order, project.task
+      model: string
       recordId: number
       phone?: string
     }, callback) => {
       try {
         const phone = data.phone || data.jid.split('@')[0]
 
-        // Add WhatsApp number to the record
-        if (data.model === 'res.partner') {
-          await odooWrite(data.model, [data.recordId], {
-            whatsapp: phone,
-            mobile: phone,
-          })
-        } else if (data.model === 'crm.lead') {
-          await odooWrite(data.model, [data.recordId], {
-            whatsapp_number: phone,
-            phone: phone,
-          })
-        } else if (data.model === 'sale.order') {
-          await odooWrite(data.model, [data.recordId], {
-            whatsapp_number: phone,
-          })
-        } else if (data.model === 'project.task') {
-          await odooWrite(data.model, [data.recordId], {
-            whatsapp_number: phone,
-          })
+        // Use smart write that auto-detects available fields
+        await smartWriteWhatsAppNumber(data.model, [data.recordId], phone)
+
+        // Also log a message in the chatter
+        try {
+          await odooPostMessage(data.model, data.recordId,
+            `<p><strong>[WhatsApp Middleware]</strong> Conversa vinculada — Número: ${phone}</p>`
+          )
+        } catch {
+          // Chatter might not be available on all models, ignore
         }
 
         callback({ success: true })
@@ -513,44 +590,50 @@ io.on('connection', (socket) => {
     }
   )
 
-  // ===== Generic search =====
+  // ===== Check if custom fields exist =====
   socket.on(
-    'odoo:search',
-    async (data: { model: string; domain: any[]; fields?: string[]; limit?: number }, callback) => {
+    'odoo:check-fields',
+    async (data: { model: string; fields: string[] }, callback) => {
       try {
-        const records = await odooSearch(data.model, data.domain, data.fields || [], data.limit || 20)
-        callback({ success: true, data: records })
-      } catch (error: any) {
-        callback({ success: false, error: error.message })
-      }
-    }
-  )
-
-  // ===== Generic read =====
-  socket.on(
-    'odoo:read',
-    async (data: { model: string; ids: number[]; fields?: string[] }, callback) => {
-      try {
-        const records = await odooRead(data.model, data.ids, data.fields || [])
-        callback({ success: true, data: records })
-      } catch (error: any) {
-        callback({ success: false, error: error.message })
-      }
-    }
-  )
-
-  // ===== Generic write =====
-  socket.on(
-    'odoo:write',
-    async (data: { model: string; ids: number[]; values: Record<string, any> }, callback) => {
-      try {
-        const result = await odooWrite(data.model, data.ids, data.values)
+        const available = await getAvailableFields(data.model)
+        const result: Record<string, boolean> = {}
+        for (const field of data.fields) {
+          result[field] = available.has(field)
+        }
         callback({ success: true, data: result })
       } catch (error: any) {
         callback({ success: false, error: error.message })
       }
     }
   )
+
+  // ===== Generic CRUD =====
+  socket.on('odoo:search', async (data: { model: string; domain: any[]; fields?: string[]; limit?: number }, callback) => {
+    try {
+      const records = await odooSearch(data.model, data.domain, data.fields || [], data.limit || 20)
+      callback({ success: true, data: records })
+    } catch (error: any) {
+      callback({ success: false, error: error.message })
+    }
+  })
+
+  socket.on('odoo:read', async (data: { model: string; ids: number[]; fields?: string[] }, callback) => {
+    try {
+      const records = await odooRead(data.model, data.ids, data.fields || [])
+      callback({ success: true, data: records })
+    } catch (error: any) {
+      callback({ success: false, error: error.message })
+    }
+  })
+
+  socket.on('odoo:write', async (data: { model: string; ids: number[]; values: Record<string, any> }, callback) => {
+    try {
+      const result = await odooWrite(data.model, data.ids, data.values)
+      callback({ success: true, data: result })
+    } catch (error: any) {
+      callback({ success: false, error: error.message })
+    }
+  })
 
   socket.on('disconnect', () => {
     console.log(`[Odoo IO] Client disconnected: ${socket.id}`)
@@ -562,7 +645,6 @@ httpServer.listen(PORT, () => {
   console.log(`[Odoo Service] Server running on port ${PORT}`)
 })
 
-// Graceful shutdown
 process.on('SIGTERM', () => {
   console.log('[Odoo Service] SIGTERM received, shutting down...')
   httpServer.close(() => process.exit(0))

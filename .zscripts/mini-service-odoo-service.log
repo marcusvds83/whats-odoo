@@ -5,3 +5,8 @@ Checked 29 installs across 30 packages (no changes) [11.00ms]
 [odoo-service] Running bun run dev...
 $ bun index.ts
 [Odoo Service] Server running on port 3002
+[Odoo IO] Client connected: 8F9hnWLg2xpKfOIzAAAB
+[Odoo IO] Client connected: qoQvJhz4pcvztqHcAAAD
+[Odoo IO] Client disconnected: 8F9hnWLg2xpKfOIzAAAB
+[Odoo] Auth error: Unknown XML-RPC tag 'TITLE'
+error: script "dev" was terminated by signal SIGKILL (Forced quit)
