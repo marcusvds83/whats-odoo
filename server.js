@@ -8,6 +8,8 @@ const next = require('next')
 const { Server } = require('socket.io')
 const { io: ioClient } = require('socket.io-client')
 
+// Ensure production mode on Render
+if (!process.env.NODE_ENV) process.env.NODE_ENV = 'production'
 const dev = process.env.NODE_ENV !== 'production'
 const hostname = process.env.HOSTNAME || '0.0.0.0'
 const port = parseInt(process.env.PORT || '10000', 10)
