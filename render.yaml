@@ -5,14 +5,14 @@ services:
     runtime: node
     plan: starter
     buildCommand: |
-      cd /opt/render/project/src && npm install &&
-      cd mini-services/whatsapp-service && npm install &&
-      cd ../odoo-service && npm install &&
-      cd /opt/render/project/src && npm run db:push
+      npm install &&
+      cd mini-services/whatsapp-service && npm install && cd ../.. &&
+      cd mini-services/odoo-service && npm install && cd ../.. &&
+      npx prisma generate &&
+      npx prisma db push
     startCommand: |
-      cd /opt/render/project/src &&
-      node mini-services/whatsapp-service/index.ts &
-      node mini-services/odoo-service/index.ts &
+      npx tsx mini-services/whatsapp-service/index.ts &
+      npx tsx mini-services/odoo-service/index.ts &
       npm run start
     envVars:
       - key: NODE_ENV
@@ -23,6 +23,8 @@ services:
           property: connectionString
       - key: PORT
         value: 10000
+      - key: ODOO_SERVICE_URL
+        value: http://localhost:3002
     healthCheckPath: /
 
 databases:
