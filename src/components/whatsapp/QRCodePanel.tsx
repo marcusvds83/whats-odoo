@@ -25,11 +25,12 @@ import {
   CheckCircle2,
   XCircle,
   Smartphone,
+  RefreshCcw,
 } from 'lucide-react'
 
 interface QRCodePanelProps {
   qrCode: string | null
-  status: { connected: boolean; reason?: string }
+  status: { connected: boolean; reason?: string; hasSession?: boolean }
   me: { id: string; name?: string; profilePicUrl?: string } | null
   onRequestQR: () => void
   onDisconnect: () => void
@@ -46,6 +47,9 @@ export function QRCodePanel({
 }: QRCodePanelProps) {
   const [isRequesting, setIsRequesting] = useState(false)
   const [isDisconnecting, setIsDisconnecting] = useState(false)
+
+  const hasSession = status.hasSession ?? false
+  const isReconnecting = !isConnected && hasSession && status.reason === 'reconnecting'
 
   const handleRequestQR = async () => {
     setIsRequesting(true)
@@ -70,7 +74,15 @@ export function QRCodePanel({
       return (
         <Badge className="bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border-emerald-500/25 hover:bg-emerald-500/25">
           <CheckCircle2 className="size-3" />
-          Connected
+          Conectado
+        </Badge>
+      )
+    }
+    if (isReconnecting) {
+      return (
+        <Badge className="bg-amber-500/15 text-amber-600 dark:text-amber-400 border-amber-500/25 hover:bg-amber-500/25">
+          <Loader2 className="size-3 animate-spin" />
+          Reconectando...
         </Badge>
       )
     }
@@ -78,14 +90,14 @@ export function QRCodePanel({
       return (
         <Badge className="bg-amber-500/15 text-amber-600 dark:text-amber-400 border-amber-500/25 hover:bg-amber-500/25">
           <Loader2 className="size-3 animate-spin" />
-          Waiting for Scan
+          Aguardando scan
         </Badge>
       )
     }
     return (
       <Badge variant="destructive">
         <XCircle className="size-3" />
-        Disconnected
+        Desconectado
       </Badge>
     )
   }
@@ -93,6 +105,9 @@ export function QRCodePanel({
   const getStatusIcon = () => {
     if (isConnected) {
       return <Wifi className="size-5 text-emerald-500" />
+    }
+    if (isReconnecting) {
+      return <RefreshCcw className="size-5 text-amber-500 animate-spin" />
     }
     if (qrCode) {
       return <Loader2 className="size-5 text-amber-500 animate-spin" />
@@ -106,16 +121,18 @@ export function QRCodePanel({
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
             <Smartphone className="size-5 text-primary" />
-            <CardTitle className="text-lg">WhatsApp Connection</CardTitle>
+            <CardTitle className="text-lg">Conexao WhatsApp</CardTitle>
           </div>
           {getStatusBadge()}
         </div>
         <CardDescription>
           {isConnected
-            ? 'Your WhatsApp account is connected and ready'
-            : qrCode
-              ? 'Scan the QR code with your WhatsApp app'
-              : 'Request a QR code to connect your WhatsApp account'}
+            ? 'Seu WhatsApp esta conectado e pronto para uso'
+            : isReconnecting
+              ? 'Restaurando sessao anterior, aguarde...'
+              : qrCode
+                ? 'Escaneie o QR code com o WhatsApp'
+                : 'Solicite um QR code para conectar seu WhatsApp'}
         </CardDescription>
       </CardHeader>
 
@@ -125,13 +142,31 @@ export function QRCodePanel({
           {getStatusIcon()}
           <div className="flex-1 min-w-0">
             <p className="text-sm font-medium">
-              {isConnected ? 'Connected' : qrCode ? 'Awaiting scan' : 'Not connected'}
+              {isConnected ? 'Conectado' : isReconnecting ? 'Reconectando sessao...' : qrCode ? 'Aguardando scan' : 'Desconectado'}
             </p>
-            {status.reason && (
-              <p className="text-xs text-muted-foreground truncate">{status.reason}</p>
+            {status.reason === 'logged_out' && (
+              <p className="text-xs text-muted-foreground truncate">Sessao encerrada pelo aparelho</p>
+            )}
+            {status.reason === 'reconnecting' && (
+              <p className="text-xs text-muted-foreground truncate">Tentando restaurar sessao salva...</p>
             )}
           </div>
         </div>
+
+        {/* Reconnecting State - Show waiting message instead of QR */}
+        {isReconnecting && !qrCode && (
+          <div className="flex flex-col items-center gap-4 py-8">
+            <div className="size-20 rounded-full bg-amber-50 dark:bg-amber-950/30 flex items-center justify-center">
+              <RefreshCcw className="size-8 text-amber-500 animate-spin" />
+            </div>
+            <div className="text-center space-y-1">
+              <p className="text-sm font-medium">Restaurando sessao...</p>
+              <p className="text-xs text-muted-foreground max-w-[280px]">
+                Sua sessao anterior esta sendo restaurada. Se o aparelho ainda estiver conectado, isso deve levar alguns segundos.
+              </p>
+            </div>
+          </div>
+        )}
 
         {/* QR Code Area or Connected Profile */}
         {isConnected && me ? (
@@ -145,7 +180,7 @@ export function QRCodePanel({
                 </AvatarFallback>
               </Avatar>
               <div className="text-center">
-                <p className="font-semibold text-base">{me.name || 'Unknown'}</p>
+                <p className="font-semibold text-base">{me.name || 'Desconhecido'}</p>
                 <p className="text-sm text-muted-foreground flex items-center justify-center gap-1">
                   <Phone className="size-3" />
                   {me.id.split('@')[0]}
@@ -163,7 +198,11 @@ export function QRCodePanel({
               </div>
               <div className="flex items-center justify-between text-sm">
                 <span className="text-muted-foreground">Status</span>
-                <span className="text-emerald-600 dark:text-emerald-400 font-medium">Active</span>
+                <span className="text-emerald-600 dark:text-emerald-400 font-medium">Ativo</span>
+              </div>
+              <div className="flex items-center justify-between text-sm">
+                <span className="text-muted-foreground">Sessao</span>
+                <span className="text-emerald-600 dark:text-emerald-400 font-medium text-xs">Salva automaticamente</span>
               </div>
             </div>
 
@@ -179,17 +218,17 @@ export function QRCodePanel({
               {isDisconnecting ? (
                 <>
                   <Loader2 className="size-4 animate-spin" />
-                  Disconnecting...
+                  Desconectando...
                 </>
               ) : (
                 <>
                   <LogOut className="size-4" />
-                  Disconnect
+                  Desconectar WhatsApp
                 </>
               )}
             </Button>
           </div>
-        ) : (
+        ) : !isReconnecting ? (
           <div className="space-y-4">
             {/* QR Code Display */}
             {qrCode ? (
@@ -207,9 +246,9 @@ export function QRCodePanel({
                   <div className="absolute inset-0 rounded-xl border-2 border-primary/20 animate-pulse pointer-events-none" />
                 </div>
                 <div className="text-center space-y-1">
-                  <p className="text-sm font-medium">Scan with WhatsApp</p>
+                  <p className="text-sm font-medium">Escaneie com o WhatsApp</p>
                   <p className="text-xs text-muted-foreground max-w-[280px]">
-                    Open WhatsApp &rarr; Linked Devices &rarr; Link a device &rarr; Scan this QR code
+                    Abra o WhatsApp → Aparelhos conectados → Conectar um aparelho → Escaneie este QR code
                   </p>
                 </div>
               </div>
@@ -219,7 +258,7 @@ export function QRCodePanel({
                   <QrCode className="size-16 text-muted-foreground/40" />
                 </div>
                 <p className="text-sm text-muted-foreground text-center">
-                  Click the button below to generate a QR code
+                  Clique no botao abaixo para gerar o QR code
                 </p>
               </div>
             )}
@@ -234,22 +273,22 @@ export function QRCodePanel({
               {isRequesting ? (
                 <>
                   <Loader2 className="size-4 animate-spin" />
-                  Generating QR Code...
+                  Gerando QR Code...
                 </>
               ) : qrCode ? (
                 <>
                   <RefreshCw className="size-4" />
-                  Refresh QR Code
+                  Atualizar QR Code
                 </>
               ) : (
                 <>
                   <QrCode className="size-4" />
-                  Request QR Code
+                  Solicitar QR Code
                 </>
               )}
             </Button>
           </div>
-        )}
+        ) : null}
       </CardContent>
     </Card>
   )

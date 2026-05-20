@@ -67,6 +67,7 @@ app.prepare().then(() => {
     'whatsapp:status', 'whatsapp:qr', 'whatsapp:me',
     'whatsapp:conversations', 'whatsapp:conversation:update',
     'whatsapp:message', 'whatsapp:odoo-sync',
+    'whatsapp:sync-progress',
   ]
 
   waEventsToRelay.forEach((event) => {

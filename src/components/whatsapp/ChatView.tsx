@@ -1,7 +1,6 @@
 'use client'
 
 import { useState, useRef, useEffect, useCallback } from 'react'
-import { ScrollArea } from '@/components/ui/scroll-area'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -56,8 +55,8 @@ function formatMessageDate(dateStr: string): string {
   const diffMs = now.getTime() - date.getTime()
   const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24))
 
-  if (diffDays === 0) return 'Today'
-  if (diffDays === 1) return 'Yesterday'
+  if (diffDays === 0) return 'Hoje'
+  if (diffDays === 1) return 'Ontem'
   return date.toLocaleDateString([], { month: 'long', day: 'numeric', year: 'numeric' })
 }
 
@@ -81,21 +80,21 @@ function getMediaIcon(mediaType: string | null) {
 function getMediaLabel(mediaType: string | null): string {
   switch (mediaType) {
     case 'image':
-      return 'Photo'
+      return 'Foto'
     case 'video':
       return 'Video'
     case 'audio':
       return 'Audio'
     case 'ptt':
-      return 'Voice message'
+      return 'Mensagem de voz'
     case 'document':
-      return 'Document'
+      return 'Documento'
     case 'pdf':
-      return 'PDF Document'
+      return 'Documento PDF'
     case 'sticker':
       return 'Sticker'
     default:
-      return 'Media'
+      return 'Midia'
   }
 }
 
@@ -136,7 +135,7 @@ export function ChatView({
   const [isSending, setIsSending] = useState(false)
   const [showScrollButton, setShowScrollButton] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
-  const scrollAreaRef = useRef<HTMLDivElement>(null)
+  const scrollContainerRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
 
   const scrollToBottom = useCallback((behavior: ScrollBehavior = 'smooth') => {
@@ -157,17 +156,17 @@ export function ChatView({
 
   // Track scroll position for "scroll to bottom" button
   useEffect(() => {
-    const viewport = scrollAreaRef.current?.querySelector('[data-slot="scroll-area-viewport"]')
-    if (!viewport) return
+    const container = scrollContainerRef.current
+    if (!container) return
 
     const handleScroll = () => {
-      const { scrollTop, scrollHeight, clientHeight } = viewport as HTMLElement
+      const { scrollTop, scrollHeight, clientHeight } = container
       const distanceFromBottom = scrollHeight - scrollTop - clientHeight
       setShowScrollButton(distanceFromBottom > 150)
     }
 
-    viewport.addEventListener('scroll', handleScroll)
-    return () => viewport.removeEventListener('scroll', handleScroll)
+    container.addEventListener('scroll', handleScroll)
+    return () => container.removeEventListener('scroll', handleScroll)
   }, [])
 
   const handleSend = async () => {
@@ -204,9 +203,9 @@ export function ChatView({
           <div className="size-20 rounded-full bg-muted/60 flex items-center justify-center">
             <MessageSquare className="size-8 text-muted-foreground/50" />
           </div>
-          <h3 className="text-lg font-semibold text-muted-foreground">No conversation selected</h3>
+          <h3 className="text-lg font-semibold text-muted-foreground">Nenhuma conversa selecionada</h3>
           <p className="text-sm text-muted-foreground/70 max-w-[280px]">
-            Select a conversation from the list to start viewing messages
+            Selecione uma conversa da lista para ver as mensagens
           </p>
         </div>
       </div>
@@ -214,8 +213,8 @@ export function ChatView({
   }
 
   return (
-    <div className="flex flex-col h-full">
-      {/* Chat Header */}
+    <div className="flex flex-col h-full overflow-hidden">
+      {/* Chat Header - fixed */}
       <div className="shrink-0 border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
         <div className="flex items-center gap-3 px-4 py-3">
           <Avatar className="size-10">
@@ -248,18 +247,22 @@ export function ChatView({
         </div>
       </div>
 
-      {/* Messages Area */}
+      {/* Messages Area - SCROLLABLE with native overflow */}
       <div className="flex-1 relative overflow-hidden">
-        <ScrollArea ref={scrollAreaRef} className="h-full">
+        <div
+          ref={scrollContainerRef}
+          className="h-full overflow-y-auto"
+          style={{ WebkitOverflowScrolling: 'touch' }}
+        >
           <div className="px-4 py-3 space-y-1">
             {messages.length === 0 ? (
               <div className="flex flex-col items-center justify-center py-16">
                 <div className="size-14 rounded-full bg-muted/50 flex items-center justify-center mb-3">
                   <MessageSquare className="size-6 text-muted-foreground/40" />
                 </div>
-                <p className="text-sm text-muted-foreground">No messages yet</p>
+                <p className="text-sm text-muted-foreground">Sem mensagens ainda</p>
                 <p className="text-xs text-muted-foreground/60 mt-1">
-                  Send a message to start the conversation
+                  Envie uma mensagem para iniciar a conversa
                 </p>
               </div>
             ) : (
@@ -359,7 +362,7 @@ export function ChatView({
             )}
             <div ref={messagesEndRef} />
           </div>
-        </ScrollArea>
+        </div>
 
         {/* Scroll to bottom button */}
         {showScrollButton && (
@@ -374,13 +377,13 @@ export function ChatView({
         )}
       </div>
 
-      {/* Message Input */}
+      {/* Message Input - fixed */}
       <Separator />
       <div className="shrink-0 px-4 py-3 bg-background">
         <div className="flex items-center gap-2">
           <Input
             ref={inputRef}
-            placeholder="Type a message..."
+            placeholder="Digite uma mensagem..."
             className="flex-1 h-10 text-sm"
             value={inputText}
             onChange={(e) => setInputText(e.target.value)}

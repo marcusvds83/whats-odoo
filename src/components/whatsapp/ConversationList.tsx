@@ -1,17 +1,17 @@
 'use client'
 
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useRef, useCallback } from 'react'
 import { Input } from '@/components/ui/input'
-import { ScrollArea } from '@/components/ui/scroll-area'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
 import { cn } from '@/lib/utils'
 import {
   Search,
   MessageCircle,
-  User,
   Phone,
   Clock,
+  RefreshCw,
+  Loader2,
 } from 'lucide-react'
 
 interface ConversationListProps {
@@ -27,6 +27,8 @@ interface ConversationListProps {
   }>
   selectedJid: string | null
   onSelect: (jid: string) => void
+  isSyncing?: boolean
+  syncProgress?: number
 }
 
 function formatTime(dateStr: string | null): string {
@@ -39,7 +41,7 @@ function formatTime(dateStr: string | null): string {
   if (diffDays === 0) {
     return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
   } else if (diffDays === 1) {
-    return 'Yesterday'
+    return 'Ontem'
   } else if (diffDays < 7) {
     return date.toLocaleDateString([], { weekday: 'short' })
   } else {
@@ -71,8 +73,11 @@ export function ConversationList({
   conversations,
   selectedJid,
   onSelect,
+  isSyncing,
+  syncProgress,
 }: ConversationListProps) {
   const [searchQuery, setSearchQuery] = useState('')
+  const scrollRef = useRef<HTMLDivElement>(null)
 
   const filteredConversations = useMemo(() => {
     if (!searchQuery.trim()) return conversations
@@ -89,27 +94,46 @@ export function ConversationList({
   const totalUnread = conversations.reduce((sum, c) => sum + c.unreadCount, 0)
 
   return (
-    <div className="flex flex-col h-full">
-      {/* Header */}
-      <div className="px-4 pt-4 pb-2">
+    <div className="flex flex-col h-full overflow-hidden">
+      {/* Header - fixed */}
+      <div className="shrink-0 px-4 pt-4 pb-2">
         <div className="flex items-center justify-between mb-3">
           <div className="flex items-center gap-2">
             <MessageCircle className="size-5 text-primary" />
-            <h2 className="font-semibold text-base">Chats</h2>
+            <h2 className="font-semibold text-base">Conversas</h2>
             {totalUnread > 0 && (
               <Badge className="bg-primary text-primary-foreground text-[10px] px-1.5 min-w-[20px] h-5 flex items-center justify-center">
                 {totalUnread > 99 ? '99+' : totalUnread}
               </Badge>
             )}
           </div>
-          <span className="text-xs text-muted-foreground">{conversations.length} conversations</span>
+          <span className="text-xs text-muted-foreground">{conversations.length} contatos</span>
         </div>
+
+        {/* Sync progress indicator */}
+        {isSyncing && (
+          <div className="flex items-center gap-2 mb-2 px-2 py-1.5 bg-primary/5 rounded-lg border border-primary/10">
+            <Loader2 className="size-3.5 text-primary animate-spin" />
+            <div className="flex-1">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-medium text-primary">Sincronizando conversas...</span>
+                <span className="text-[10px] text-muted-foreground">{syncProgress || 0}%</span>
+              </div>
+              <div className="w-full h-1 bg-primary/10 rounded-full mt-1">
+                <div
+                  className="h-full bg-primary rounded-full transition-all duration-300"
+                  style={{ width: `${syncProgress || 0}%` }}
+                />
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Search */}
         <div className="relative">
           <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 size-4 text-muted-foreground" />
           <Input
-            placeholder="Search conversations..."
+            placeholder="Buscar conversas..."
             className="pl-9 h-9 text-sm bg-muted/50 border-transparent focus:border-border focus:bg-background"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
@@ -117,24 +141,36 @@ export function ConversationList({
         </div>
       </div>
 
-      {/* Conversation List */}
-      <ScrollArea className="flex-1">
+      {/* Conversation List - SCROLLABLE */}
+      <div
+        ref={scrollRef}
+        className="flex-1 overflow-y-auto min-h-0"
+        style={{ WebkitOverflowScrolling: 'touch' }}
+      >
         {filteredConversations.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-16 px-4">
             {searchQuery ? (
               <>
                 <Search className="size-10 text-muted-foreground/40 mb-3" />
-                <p className="text-sm font-medium text-muted-foreground">No results found</p>
+                <p className="text-sm font-medium text-muted-foreground">Nenhum resultado encontrado</p>
                 <p className="text-xs text-muted-foreground/70 mt-1">
-                  Try a different search term
+                  Tente outro termo de busca
+                </p>
+              </>
+            ) : isSyncing ? (
+              <>
+                <Loader2 className="size-10 text-primary/40 mb-3 animate-spin" />
+                <p className="text-sm font-medium text-muted-foreground">Sincronizando...</p>
+                <p className="text-xs text-muted-foreground/70 mt-1">
+                  Aguarde enquanto as conversas são carregadas
                 </p>
               </>
             ) : (
               <>
                 <MessageCircle className="size-10 text-muted-foreground/40 mb-3" />
-                <p className="text-sm font-medium text-muted-foreground">No conversations yet</p>
+                <p className="text-sm font-medium text-muted-foreground">Nenhuma conversa ainda</p>
                 <p className="text-xs text-muted-foreground/70 mt-1">
-                  Conversations will appear here when you receive messages
+                  As conversas aparecerão aqui quando receber mensagens
                 </p>
               </>
             )}
@@ -176,7 +212,6 @@ export function ConversationList({
                         {getInitials(displayName)}
                       </AvatarFallback>
                     </Avatar>
-                    {/* Online indicator could go here */}
                   </div>
 
                   {/* Content */}
@@ -223,7 +258,7 @@ export function ConversationList({
                         ) : (
                           <p className="text-xs text-muted-foreground/60 italic flex items-center gap-1">
                             <Clock className="size-3" />
-                            No messages
+                            Sem mensagens
                           </p>
                         )}
                       </div>
@@ -240,7 +275,7 @@ export function ConversationList({
             })}
           </div>
         )}
-      </ScrollArea>
+      </div>
     </div>
   )
 }

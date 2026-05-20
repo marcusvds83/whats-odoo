@@ -20,15 +20,36 @@ export interface OdooSyncInfo {
   errors: string[]
 }
 
+export interface SyncProgress {
+  isSyncing: boolean
+  progress: number
+  phase: string
+  chatsCount?: number
+  contactsCount?: number
+  messagesCount?: number
+}
+
+/**
+ * Sort conversations by date (most recent first)
+ */
+function sortConversations(convs: WhatsAppConversation[]): WhatsAppConversation[] {
+  return [...convs].sort((a, b) => {
+    const tA = a.lastMessageAt ? new Date(a.lastMessageAt).getTime() : 0
+    const tB = b.lastMessageAt ? new Date(b.lastMessageAt).getTime() : 0
+    return tB - tA
+  })
+}
+
 export function useWhatsApp() {
   const socketRef = useRef<Socket | null>(null)
-  const [status, setStatus] = useState<WhatsAppStatus>({ connected: false })
+  const [status, setStatus] = useState<WhatsAppStatus & { hasSession?: boolean }>({ connected: false })
   const [me, setMe] = useState<WhatsAppMe | null>(null)
   const [qrCode, setQrCode] = useState<string | null>(null)
   const [conversations, setConversations] = useState<WhatsAppConversation[]>([])
   const [currentMessages, setCurrentMessages] = useState<WhatsAppMessage[]>([])
   const [currentJid, setCurrentJid] = useState<string | null>(null)
   const [isConnected, setIsConnected] = useState(false)
+  const [syncProgress, setSyncProgress] = useState<SyncProgress | null>(null)
 
   // Odoo sync state per conversation
   const [odooSyncMap, setOdooSyncMap] = useState<Map<string, OdooSyncInfo>>(new Map())
@@ -38,8 +59,9 @@ export function useWhatsApp() {
       transports: ['websocket', 'polling'],
       forceNew: true,
       reconnection: true,
-      reconnectionAttempts: 10,
+      reconnectionAttempts: Infinity,
       reconnectionDelay: 2000,
+      reconnectionDelayMax: 10000,
       timeout: 15000,
     })
 
@@ -55,7 +77,7 @@ export function useWhatsApp() {
       setIsConnected(false)
     })
 
-    socket.on('whatsapp:status', (data: WhatsAppStatus) => {
+    socket.on('whatsapp:status', (data: WhatsAppStatus & { hasSession?: boolean }) => {
       console.log('[WhatsApp] Status:', data)
       setStatus(data)
       if (data.connected) {
@@ -73,22 +95,26 @@ export function useWhatsApp() {
     })
 
     socket.on('whatsapp:conversations', (data: WhatsAppConversation[]) => {
-      setConversations(data)
+      // Sort conversations by date (most recent first) and filter out any invalid ones
+      const filtered = data.filter(c => {
+        // Only accept contacts with phone numbers
+        return c.phone && /^\d{7,}$/.test(c.phone)
+      })
+      setConversations(sortConversations(filtered))
     })
 
     socket.on('whatsapp:conversation:update', (data: WhatsAppConversation) => {
+      // Filter out invalid JIDs
+      if (!data.phone || !/^\d{7,}$/.test(data.phone)) return
+
       setConversations(prev => {
         const idx = prev.findIndex(c => c.jid === data.jid)
         if (idx >= 0) {
           const next = [...prev]
           next[idx] = data
-          return next.sort((a, b) => {
-            const tA = a.lastMessageAt ? new Date(a.lastMessageAt).getTime() : 0
-            const tB = b.lastMessageAt ? new Date(b.lastMessageAt).getTime() : 0
-            return tB - tA
-          })
+          return sortConversations(next)
         }
-        return [data, ...prev]
+        return sortConversations([data, ...prev])
       })
     })
 
@@ -97,15 +123,27 @@ export function useWhatsApp() {
         setCurrentMessages(prev => [...prev, data.message])
       }
       // Update conversation in list
-      setConversations(prev => {
-        const idx = prev.findIndex(c => c.jid === data.conversationJid)
-        if (idx >= 0) {
-          const next = [...prev]
-          next[idx] = data.conversation
-          return next
-        }
-        return [data.conversation, ...prev]
-      })
+      if (data.conversation && data.conversation.phone && /^\d{7,}$/.test(data.conversation.phone)) {
+        setConversations(prev => {
+          const idx = prev.findIndex(c => c.jid === data.conversationJid)
+          if (idx >= 0) {
+            const next = [...prev]
+            next[idx] = data.conversation
+            return sortConversations(next)
+          }
+          return sortConversations([data.conversation, ...prev])
+        })
+      }
+    })
+
+    // Sync progress events
+    socket.on('whatsapp:sync-progress', (data: SyncProgress) => {
+      console.log('[WhatsApp] Sync progress:', data)
+      setSyncProgress(data)
+      if (!data.isSyncing) {
+        // Clear sync progress after a delay
+        setTimeout(() => setSyncProgress(null), 3000)
+      }
     })
 
     // Odoo sync events (from WhatsApp service forwarding)
@@ -121,7 +159,7 @@ export function useWhatsApp() {
     return () => {
       socket.disconnect()
     }
-  }, [currentJid])
+  }, []) // Remove currentJid from deps to avoid re-creating socket
 
   const requestQR = useCallback(() => {
     socketRef.current?.emit('whatsapp:request-qr')
@@ -175,6 +213,7 @@ export function useWhatsApp() {
     currentMessages,
     currentJid,
     isConnected,
+    syncProgress,
     // Odoo sync
     odooSyncMap,
     getOdooSync,

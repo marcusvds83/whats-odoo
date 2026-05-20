@@ -31,6 +31,7 @@ import {
   PanelRightOpen,
   PanelRightClose,
   Zap,
+  Loader2,
 } from 'lucide-react'
 
 type Tab = 'dashboard' | 'whatsapp' | 'conversations' | 'settings'
@@ -42,7 +43,7 @@ function DashboardView({
   odooStatus,
   onNavigate,
 }: {
-  waStatus: { connected: boolean; reason?: string }
+  waStatus: { connected: boolean; reason?: string; hasSession?: boolean }
   waMe: { id: string; name?: string; profilePicUrl?: string } | null
   waConversations: Array<{ jid: string; unreadCount: number }>
   odooStatus: { connected: boolean; url?: string; db?: string; username?: string }
@@ -61,17 +62,17 @@ function DashboardView({
 
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
         <Card className="relative overflow-hidden">
-          <div className={cn("absolute top-0 left-0 w-1 h-full", waStatus.connected ? "bg-emerald-500" : "bg-red-400")} />
+          <div className={cn("absolute top-0 left-0 w-1 h-full", waStatus.connected ? "bg-emerald-500" : waStatus.hasSession ? "bg-amber-400" : "bg-red-400")} />
           <CardHeader className="pb-2 pl-5">
             <div className="flex items-center justify-between">
               <CardTitle className="text-sm font-medium text-muted-foreground">WhatsApp</CardTitle>
-              {waStatus.connected ? <Wifi className="size-4 text-emerald-500" /> : <WifiOff className="size-4 text-red-400" />}
+              {waStatus.connected ? <Wifi className="size-4 text-emerald-500" /> : waStatus.hasSession ? <Loader2 className="size-4 text-amber-400 animate-spin" /> : <WifiOff className="size-4 text-red-400" />}
             </div>
           </CardHeader>
           <CardContent className="pl-5">
-            <div className="text-2xl font-bold">{waStatus.connected ? 'Conectado' : 'Desconectado'}</div>
+            <div className="text-2xl font-bold">{waStatus.connected ? 'Conectado' : waStatus.hasSession ? 'Reconectando...' : 'Desconectado'}</div>
             <p className="text-xs text-muted-foreground mt-1">
-              {waStatus.connected ? (waMe?.name || waMe?.id?.split('@')[0] || 'Sessao ativa') : 'Escaneie o QR Code para conectar'}
+              {waStatus.connected ? (waMe?.name || waMe?.id?.split('@')[0] || 'Sessao ativa') : waStatus.hasSession ? 'Restaurando sessao salva' : 'Escaneie o QR Code para conectar'}
             </p>
           </CardContent>
         </Card>
@@ -129,7 +130,7 @@ function DashboardView({
         </CardHeader>
         <CardContent>
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-            {!waStatus.connected && (
+            {!waStatus.connected && !waStatus.hasSession && (
               <Button variant="outline" className="justify-start gap-2 h-auto py-3" onClick={() => onNavigate('whatsapp')}>
                 <Smartphone className="size-4 text-emerald-500" />
                 <div className="text-left">
@@ -179,7 +180,7 @@ function DashboardView({
               <div className="flex size-8 shrink-0 items-center justify-center rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300 text-sm font-bold">1</div>
               <div>
                 <p className="text-sm font-medium">Conecte WhatsApp</p>
-                <p className="text-xs text-muted-foreground mt-0.5">Escaneie o QR Code com o WhatsApp Business no celular para vincular sua conta</p>
+                <p className="text-xs text-muted-foreground mt-0.5">Escaneie o QR Code com o WhatsApp Business no celular para vincular sua conta. A sessao fica salva automaticamente!</p>
               </div>
             </div>
             <div className="flex gap-3">
@@ -223,6 +224,8 @@ function ConversationsView({
   onCreateContact,
   onCreateTask,
   onLogMessage,
+  isSyncing,
+  syncProgress,
 }: {
   conversations: any[]
   selectedJid: string | null
@@ -243,9 +246,11 @@ function ConversationsView({
   onCreateContact: any
   onCreateTask: any
   onLogMessage: any
+  isSyncing?: boolean
+  syncProgress?: number
 }) {
   return (
-    <div className="flex h-full">
+    <div className="flex h-full overflow-hidden">
       <div className={cn(
         "border-r bg-background transition-all duration-200",
         selectedJid ? "w-80 lg:w-96" : "w-full max-w-lg mx-auto"
@@ -254,12 +259,14 @@ function ConversationsView({
           conversations={conversations}
           selectedJid={selectedJid}
           onSelect={onSelectConversation}
+          isSyncing={isSyncing}
+          syncProgress={syncProgress}
         />
       </div>
 
       {selectedJid && (
-        <div className="flex-1 flex">
-          <div className={cn("flex-1 transition-all duration-200", showOdooPanel && "hidden lg:block")}>
+        <div className="flex-1 flex min-w-0">
+          <div className={cn("flex-1 min-w-0 transition-all duration-200", showOdooPanel && "hidden lg:block")}>
             <ChatView
               conversation={selectedConversation}
               messages={currentMessages}
@@ -377,7 +384,7 @@ export default function HomePage() {
   }
 
   return (
-    <div className="flex h-screen">
+    <div className="flex h-screen overflow-hidden">
       <nav className="w-14 lg:w-56 border-r bg-muted/30 flex flex-col shrink-0">
         <div className="h-14 flex items-center px-3 lg:px-4 border-b">
           <div className="flex items-center gap-2">
@@ -386,7 +393,7 @@ export default function HomePage() {
             </div>
             <div className="hidden lg:block">
               <p className="text-sm font-bold leading-tight">WA-Odoo</p>
-              <p className="text-[10px] text-muted-foreground">Middleware</p>
+              <p className="text-[10px] text-muted-foreground">v4.7 Middleware</p>
             </div>
           </div>
         </div>
@@ -452,6 +459,8 @@ export default function HomePage() {
             onCreateContact={odoo.createContact}
             onCreateTask={odoo.createTask}
             onLogMessage={odoo.logMessage}
+            isSyncing={wa.syncProgress?.isSyncing}
+            syncProgress={wa.syncProgress?.progress}
           />
         )}
 
@@ -483,9 +492,15 @@ export default function HomePage() {
                 <div className="flex items-center justify-between text-sm">
                   <span className="text-muted-foreground">Conexao</span>
                   <Badge variant={wa.status.connected ? 'default' : 'outline'} className={wa.status.connected ? 'bg-emerald-100 text-emerald-800 border-emerald-200' : ''}>
-                    {wa.status.connected ? 'Conectado' : 'Desconectado'}
+                    {wa.status.connected ? 'Conectado' : wa.status.hasSession ? 'Reconectando...' : 'Desconectado'}
                   </Badge>
                 </div>
+                {wa.status.hasSession && (
+                  <div className="flex items-center justify-between text-sm">
+                    <span className="text-muted-foreground">Sessao salva</span>
+                    <span className="text-emerald-600 dark:text-emerald-400 font-medium text-xs">Sim - reconexao automatica</span>
+                  </div>
+                )}
                 {wa.me && (
                   <>
                     <div className="flex items-center justify-between text-sm">
