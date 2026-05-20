@@ -1,7 +1,8 @@
 'use client'
 
-import { useState, useMemo, useRef, useCallback } from 'react'
+import { useState, useMemo } from 'react'
 import { Input } from '@/components/ui/input'
+import { ScrollArea } from '@/components/ui/scroll-area'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
 import { cn } from '@/lib/utils'
@@ -10,7 +11,6 @@ import {
   MessageCircle,
   Phone,
   Clock,
-  RefreshCw,
   Loader2,
 } from 'lucide-react'
 
@@ -77,7 +77,6 @@ export function ConversationList({
   syncProgress,
 }: ConversationListProps) {
   const [searchQuery, setSearchQuery] = useState('')
-  const scrollRef = useRef<HTMLDivElement>(null)
 
   const filteredConversations = useMemo(() => {
     if (!searchQuery.trim()) return conversations
@@ -94,8 +93,8 @@ export function ConversationList({
   const totalUnread = conversations.reduce((sum, c) => sum + c.unreadCount, 0)
 
   return (
-    <div className="flex flex-col h-full overflow-hidden">
-      {/* Header - fixed */}
+    <div className="flex flex-col h-full min-h-0">
+      {/* Header — fixed, never scrolls */}
       <div className="shrink-0 px-4 pt-4 pb-2">
         <div className="flex items-center justify-between mb-3">
           <div className="flex items-center gap-2">
@@ -110,20 +109,17 @@ export function ConversationList({
           <span className="text-xs text-muted-foreground">{conversations.length} contatos</span>
         </div>
 
-        {/* Sync progress indicator */}
+        {/* Sync progress */}
         {isSyncing && (
           <div className="flex items-center gap-2 mb-2 px-2 py-1.5 bg-primary/5 rounded-lg border border-primary/10">
             <Loader2 className="size-3.5 text-primary animate-spin" />
             <div className="flex-1">
               <div className="flex items-center justify-between">
-                <span className="text-xs font-medium text-primary">Sincronizando conversas...</span>
+                <span className="text-xs font-medium text-primary">Sincronizando...</span>
                 <span className="text-[10px] text-muted-foreground">{syncProgress || 0}%</span>
               </div>
               <div className="w-full h-1 bg-primary/10 rounded-full mt-1">
-                <div
-                  className="h-full bg-primary rounded-full transition-all duration-300"
-                  style={{ width: `${syncProgress || 0}%` }}
-                />
+                <div className="h-full bg-primary rounded-full transition-all duration-300" style={{ width: `${syncProgress || 0}%` }} />
               </div>
             </div>
           </div>
@@ -141,37 +137,26 @@ export function ConversationList({
         </div>
       </div>
 
-      {/* Conversation List - SCROLLABLE */}
-      <div
-        ref={scrollRef}
-        className="flex-1 overflow-y-auto min-h-0"
-        style={{ WebkitOverflowScrolling: 'touch' }}
-      >
+      {/* Scrollable conversation list */}
+      <ScrollArea className="flex-1 min-h-0">
         {filteredConversations.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-16 px-4">
             {searchQuery ? (
               <>
                 <Search className="size-10 text-muted-foreground/40 mb-3" />
-                <p className="text-sm font-medium text-muted-foreground">Nenhum resultado encontrado</p>
-                <p className="text-xs text-muted-foreground/70 mt-1">
-                  Tente outro termo de busca
-                </p>
+                <p className="text-sm font-medium text-muted-foreground">Nenhum resultado</p>
               </>
             ) : isSyncing ? (
               <>
                 <Loader2 className="size-10 text-primary/40 mb-3 animate-spin" />
-                <p className="text-sm font-medium text-muted-foreground">Sincronizando...</p>
-                <p className="text-xs text-muted-foreground/70 mt-1">
-                  Aguarde enquanto as conversas são carregadas
-                </p>
+                <p className="text-sm font-medium text-muted-foreground">Sincronizando conversas...</p>
+                <p className="text-xs text-muted-foreground/70 mt-1">Aguarde enquanto carrega</p>
               </>
             ) : (
               <>
                 <MessageCircle className="size-10 text-muted-foreground/40 mb-3" />
                 <p className="text-sm font-medium text-muted-foreground">Nenhuma conversa ainda</p>
-                <p className="text-xs text-muted-foreground/70 mt-1">
-                  As conversas aparecerão aqui quando receber mensagens
-                </p>
+                <p className="text-xs text-muted-foreground/70 mt-1">Conecte o WhatsApp para ver conversas</p>
               </>
             )}
           </div>
@@ -189,51 +174,26 @@ export function ConversationList({
                   className={cn(
                     'w-full flex items-center gap-3 px-4 py-3 text-left transition-colors duration-150',
                     'hover:bg-muted/60 focus-visible:bg-muted/60 focus-visible:outline-none',
-                    isSelected
-                      ? 'bg-primary/8 border-l-2 border-l-primary'
-                      : 'border-l-2 border-l-transparent',
+                    isSelected ? 'bg-primary/8 border-l-2 border-l-primary' : 'border-l-2 border-l-transparent',
                     hasUnread && !isSelected && 'bg-muted/30'
                   )}
                 >
-                  {/* Avatar */}
                   <div className="relative shrink-0">
                     <Avatar className="size-12">
-                      {conversation.avatarUrl && (
-                        <AvatarImage src={conversation.avatarUrl} alt={displayName} />
-                      )}
-                      <AvatarFallback
-                        className={cn(
-                          'text-sm font-medium',
-                          isSelected
-                            ? 'bg-primary/15 text-primary'
-                            : 'bg-muted text-muted-foreground'
-                        )}
-                      >
+                      {conversation.avatarUrl && <AvatarImage src={conversation.avatarUrl} alt={displayName} />}
+                      <AvatarFallback className={cn('text-sm font-medium', isSelected ? 'bg-primary/15 text-primary' : 'bg-muted text-muted-foreground')}>
                         {getInitials(displayName)}
                       </AvatarFallback>
                     </Avatar>
                   </div>
 
-                  {/* Content */}
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center justify-between gap-2">
-                      <span
-                        className={cn(
-                          'text-sm truncate',
-                          hasUnread ? 'font-semibold' : 'font-medium'
-                        )}
-                      >
+                      <span className={cn('text-sm truncate', hasUnread ? 'font-semibold' : 'font-medium')}>
                         {displayName}
                       </span>
                       {conversation.lastMessageAt && (
-                        <span
-                          className={cn(
-                            'text-[11px] shrink-0',
-                            hasUnread
-                              ? 'text-primary font-medium'
-                              : 'text-muted-foreground'
-                          )}
-                        >
+                        <span className={cn('text-[11px] shrink-0', hasUnread ? 'text-primary font-medium' : 'text-muted-foreground')}>
                           {formatTime(conversation.lastMessageAt)}
                         </span>
                       )}
@@ -241,28 +201,17 @@ export function ConversationList({
 
                     <div className="flex items-center justify-between gap-2 mt-0.5">
                       <div className="flex items-center gap-1 min-w-0">
-                        {conversation.phone && !conversation.name && (
-                          <Phone className="size-3 text-muted-foreground/60 shrink-0" />
-                        )}
+                        {conversation.phone && !conversation.name && <Phone className="size-3 text-muted-foreground/60 shrink-0" />}
                         {conversation.lastMessage ? (
-                          <p
-                            className={cn(
-                              'text-xs truncate',
-                              hasUnread
-                                ? 'text-foreground/80 font-medium'
-                                : 'text-muted-foreground'
-                            )}
-                          >
+                          <p className={cn('text-xs truncate', hasUnread ? 'text-foreground/80 font-medium' : 'text-muted-foreground')}>
                             {truncateMessage(conversation.lastMessage)}
                           </p>
                         ) : (
                           <p className="text-xs text-muted-foreground/60 italic flex items-center gap-1">
-                            <Clock className="size-3" />
-                            Sem mensagens
+                            <Clock className="size-3" /> Sem mensagens
                           </p>
                         )}
                       </div>
-
                       {hasUnread && (
                         <Badge className="bg-primary text-primary-foreground text-[10px] px-1.5 min-w-[18px] h-[18px] flex items-center justify-center shrink-0">
                           {conversation.unreadCount > 99 ? '99+' : conversation.unreadCount}
@@ -275,7 +224,7 @@ export function ConversationList({
             })}
           </div>
         )}
-      </div>
+      </ScrollArea>
     </div>
   )
 }

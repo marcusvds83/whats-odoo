@@ -250,9 +250,9 @@ function ConversationsView({
   syncProgress?: number
 }) {
   return (
-    <div className="flex h-full overflow-hidden">
+    <div className="flex h-full min-h-0 overflow-hidden">
       <div className={cn(
-        "border-r bg-background transition-all duration-200",
+        "border-r bg-background transition-all duration-200 h-full",
         selectedJid ? "w-80 lg:w-96" : "w-full max-w-lg mx-auto"
       )}>
         <ConversationList
@@ -414,7 +414,7 @@ export default function HomePage() {
         </div>
       </nav>
 
-      <main className="flex-1 overflow-hidden">
+      <main className="flex-1 flex flex-col overflow-hidden min-h-0">
         {activeTab === 'dashboard' && (
           <DashboardView
             waStatus={wa.status}
@@ -439,7 +439,8 @@ export default function HomePage() {
         )}
 
         {activeTab === 'conversations' && (
-          <ConversationsView
+          <div className="flex-1 min-h-0">
+            <ConversationsView
             conversations={wa.conversations}
             selectedJid={selectedJid}
             selectedConversation={selectedConversation}
@@ -462,6 +463,7 @@ export default function HomePage() {
             isSyncing={wa.syncProgress?.isSyncing}
             syncProgress={wa.syncProgress?.progress}
           />
+          </div>
         )}
 
         {activeTab === 'settings' && (
