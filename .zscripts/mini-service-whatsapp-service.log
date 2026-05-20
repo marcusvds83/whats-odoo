@@ -352,3 +352,5 @@ $ bun x tsx index.ts
 [WA] Connection update: connecting
 [WA] Connection update: undefined
 [WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
