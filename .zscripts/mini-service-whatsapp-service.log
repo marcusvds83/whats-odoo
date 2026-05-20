@@ -1,13 +1,25 @@
 [whatsapp-service] Installing dependencies...
 bun install v1.3.14 (0d9b296a)
+Resolving dependencies
+Resolved, downloaded and extracted [342]
+Saved lockfile
 
-Done! Checked 243 packages (no changes) [18.00ms]
++ typescript@5.9.3 (v6.0.3 available)
++ @hapi/boom@9.1.4 (v10.0.1 available)
++ @whiskeysockets/baileys@6.17.16 (v7.0.0-rc12 available)
++ pino@9.14.0 (v10.3.1 available)
++ qrcode-terminal@0.12.0
++ socket.io@4.8.3
++ socket.io-client@4.8.3
+
+243 packages installed [1.85s]
+
+Blocked 1 postinstall. Run `bun pm untrusted` for details.
 [whatsapp-service] Running bun run dev...
-$ bun index.ts
+$ bun x tsx index.ts
 [WA Service] Starting WhatsApp service...
 [WA Service] No auth found, waiting for QR scan...
-[bun] Warning: ws.WebSocket 'upgrade' event is not implemented in bun
-[bun] Warning: ws.WebSocket 'unexpected-response' event is not implemented in bun
+[WA→Odoo] Connected to Odoo service
 [WA] Connection update: connecting
 [WA Service] Server running on port 3001
 [WA] Connection update: undefined
@@ -42,90 +54,6 @@ $ bun index.ts
 [WA] Connection update: connecting
 [WA] Connection update: undefined
 [WA] QR Code generated, sending to clients
-[IO] Client connected: Nb4QeQ7gI-2P8-1CAAAB
-[WA] Connection update: undefined
-[WA] QR Code generated, sending to clients
-[WA] Connection update: undefined
-[WA] QR Code generated, sending to clients
-[WA] Connection update: undefined
-[WA] QR Code generated, sending to clients
-[IO] Client connected: suhbe9Ij0q1buWzJAAAD
-[WA] Connection update: undefined
-[WA] QR Code generated, sending to clients
-[IO] Client disconnected: Nb4QeQ7gI-2P8-1CAAAB
-[WA] Connection update: undefined
-[WA] QR Code generated, sending to clients
-[WA] Connection update: close
-[WA] Connection closed. Status: 408, Reconnect: true
-[WA] Connection update: connecting
-[WA] Connection update: undefined
-[WA] QR Code generated, sending to clients
-[WA] Connection update: undefined
-[WA] QR Code generated, sending to clients
-[WA] Connection update: undefined
-[WA] QR Code generated, sending to clients
-[WA] Connection update: undefined
-[WA] QR Code generated, sending to clients
-[WA] Connection update: undefined
-[WA] QR Code generated, sending to clients
-[WA] Connection update: undefined
-[WA] QR Code generated, sending to clients
-[WA] Connection update: close
-[WA] Connection closed. Status: 408, Reconnect: true
-[IO] Client disconnected: suhbe9Ij0q1buWzJAAAD
-[IO] Client connected: BhnWhplbvOP2UWNmAAAF
-[WA] Connection update: connecting
-[WA] Connection update: undefined
-[WA] QR Code generated, sending to clients
-[IO] Client disconnected: BhnWhplbvOP2UWNmAAAF
-[IO] Client connected: SPFeQ2raM-As1uhNAAAH
-[WA] Connection update: undefined
-[WA] QR Code generated, sending to clients
-[WA] Connection update: undefined
-[WA] QR Code generated, sending to clients
-[WA] Connection update: undefined
-[WA] QR Code generated, sending to clients
-[WA] Connection update: undefined
-[WA] QR Code generated, sending to clients
-[WA] Connection update: undefined
-[WA] QR Code generated, sending to clients
-[WA] Connection update: close
-[WA] Connection closed. Status: 408, Reconnect: true
-[WA] Connection update: connecting
-[WA] Connection update: undefined
-[WA] QR Code generated, sending to clients
-[WA] Connection update: undefined
-[WA] QR Code generated, sending to clients
-[WA] Connection update: undefined
-[WA] QR Code generated, sending to clients
-[WA] Connection update: undefined
-[WA] QR Code generated, sending to clients
-[WA] Connection update: undefined
-[WA] QR Code generated, sending to clients
-[IO] Client disconnected: SPFeQ2raM-As1uhNAAAH
-[WA] Connection update: undefined
-[WA] QR Code generated, sending to clients
-[IO] Client connected: usE3VnTX9wmxnSyNAAAJ
-[IO] Client disconnected: usE3VnTX9wmxnSyNAAAJ
-[IO] Client connected: IJDaXkmAmONz0tgqAAAL
-[WA] Connection update: close
-[WA] Connection closed. Status: 408, Reconnect: true
-[WA] Connection update: connecting
-[WA] Connection update: undefined
-[WA] QR Code generated, sending to clients
-[WA] Connection update: undefined
-[WA] QR Code generated, sending to clients
-[WA] Connection update: undefined
-[WA] QR Code generated, sending to clients
-[WA] Connection update: undefined
-[WA] QR Code generated, sending to clients
-[WA] Connection update: undefined
-[WA] QR Code generated, sending to clients
-[WA] Connection update: undefined
-[WA] QR Code generated, sending to clients
-[WA] Connection update: close
-[WA] Connection closed. Status: 408, Reconnect: true
-[WA] Connection update: connecting
 [WA] Connection update: undefined
 [WA] QR Code generated, sending to clients
 [WA] Connection update: undefined
