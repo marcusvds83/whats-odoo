@@ -1,7 +1,6 @@
 'use client'
 
 import { useState, useRef, useEffect, useCallback } from 'react'
-import { ScrollArea } from '@/components/ui/scroll-area'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -193,21 +192,23 @@ export function ChatView({
   const [chatterLinkOpen, setChatterLinkOpen] = useState(false)
 
   const scrollToBottom = useCallback((behavior: ScrollBehavior = 'smooth') => {
-    messagesEndRef.current?.scrollIntoView({ behavior })
+    if (scrollAreaRef.current) {
+      scrollAreaRef.current.scrollTo({ top: scrollAreaRef.current.scrollHeight, behavior })
+    }
   }, [])
 
   useEffect(() => { scrollToBottom() }, [messages.length, scrollToBottom])
   useEffect(() => { if (conversation) onMarkRead(conversation.jid) }, [conversation?.jid, onMarkRead])
 
   useEffect(() => {
-    const viewport = scrollAreaRef.current?.querySelector('[data-slot="scroll-area-viewport"]')
-    if (!viewport) return
+    const el = scrollAreaRef.current
+    if (!el) return
     const handleScroll = () => {
-      const { scrollTop, scrollHeight, clientHeight } = viewport as HTMLElement
+      const { scrollTop, scrollHeight, clientHeight } = el
       setShowScrollButton(scrollHeight - scrollTop - clientHeight > 150)
     }
-    viewport.addEventListener('scroll', handleScroll)
-    return () => viewport.removeEventListener('scroll', handleScroll)
+    el.addEventListener('scroll', handleScroll)
+    return () => el.removeEventListener('scroll', handleScroll)
   }, [])
 
   useEffect(() => {
@@ -374,7 +375,7 @@ export function ChatView({
 
       {/* Messages Area */}
       <div className="flex-1 relative overflow-hidden">
-        <ScrollArea ref={scrollAreaRef} className="h-full">
+        <div ref={scrollAreaRef} className="h-full overflow-y-auto">
           <div className="px-4 py-3 space-y-1">
             {messages.length === 0 ? (
               <div className="flex flex-col items-center justify-center py-16">
@@ -450,7 +451,7 @@ export function ChatView({
             )}
             <div ref={messagesEndRef} />
           </div>
-        </ScrollArea>
+        </div>
         {showScrollButton && (
           <Button variant="secondary" size="icon" className="absolute bottom-4 right-4 size-9 rounded-full shadow-lg opacity-80 hover:opacity-100" onClick={() => scrollToBottom()}>
             <ArrowDown className="size-4" />

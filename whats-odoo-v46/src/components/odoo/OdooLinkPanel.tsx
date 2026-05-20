@@ -25,7 +25,6 @@ import { Label } from '@/components/ui/label'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Separator } from '@/components/ui/separator'
-import { ScrollArea } from '@/components/ui/scroll-area'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Dialog,
@@ -447,7 +446,7 @@ export function OdooLinkPanel({
         {/* Results */}
         {(Object.entries(TAB_CONFIG) as [ModelKey, typeof TAB_CONFIG[ModelKey]][]).map(([key, cfg]) => (
           <TabsContent key={key} value={key} className="flex-1 overflow-hidden mt-0">
-            <ScrollArea className="h-full">
+            <div className="h-full overflow-y-auto">
               <div className="space-y-2 p-3">
                 {/* Loading skeleton */}
                 {searchLoading[key] && (
@@ -506,7 +505,7 @@ export function OdooLinkPanel({
                     )
                   })}
               </div>
-            </ScrollArea>
+            </div>
           </TabsContent>
         ))}
       </Tabs>

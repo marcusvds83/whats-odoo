@@ -18,7 +18,6 @@ import {
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { ScrollArea } from '@/components/ui/scroll-area'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Dialog,
@@ -300,7 +299,7 @@ export function ChatterLinkDialog({
           </div>
 
           {/* Results */}
-          <ScrollArea className="flex-1 max-h-[400px]">
+          <div className="flex-1 overflow-y-auto max-h-[400px]">
             <div className="space-y-2 p-1">
               {searchLoading && (
                 <div className="space-y-2">
@@ -349,7 +348,7 @@ export function ChatterLinkDialog({
                 )
               })}
             </div>
-          </ScrollArea>
+          </div>
 
           <DialogFooter>
             <Button variant="outline" onClick={() => onOpenChange(false)}>Fechar</Button>

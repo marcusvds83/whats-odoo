@@ -1,5 +1,5 @@
 // =============================================================================
-// Whats-Odoo v4.5 — Single-Process Server
+// Whats-Odoo v4.7 — Single-Process Server
 // =============================================================================
 // Merges Next.js frontend + WhatsApp Baileys + Odoo XML-RPC into ONE process.
 // Previous architecture: 3 processes (server.js + tsx whatsapp + tsx odoo) = OOM
@@ -387,7 +387,15 @@ function deduplicateConversations() {
 // Emit deduplicated conversations to a single socket
 function emitDedupedConversationsToSocket(socket) {
   deduplicateConversations()
-  const convList = Array.from(conversations.values()).map(serializeConversation)
+  // v4.7: Sort by lastMessageAt descending and filter out @lid
+  const convList = Array.from(conversations.values())
+    .filter(c => !c.jid.includes('@lid'))
+    .sort((a, b) => {
+      const tA = a.lastMessageAt ? new Date(a.lastMessageAt).getTime() : 0
+      const tB = b.lastMessageAt ? new Date(b.lastMessageAt).getTime() : 0
+      return tB - tA
+    })
+    .map(serializeConversation)
   socket.emit('whatsapp:conversations', convList)
 }
 
@@ -819,12 +827,21 @@ async function connectWhatsApp() {
         deduplicateConversations()
         if (waNamespace && conversations.size > 0) {
           console.log(`[WA] Emitting ${conversations.size} existing conversations to clients`)
-          const convList = Array.from(conversations.values()).map(serializeConversation)
+          // v4.7: Sort by lastMessageAt descending and filter out @lid
+          const convList = Array.from(conversations.values())
+            .filter(c => !c.jid.includes('@lid'))
+            .sort((a, b) => {
+              const tA = a.lastMessageAt ? new Date(a.lastMessageAt).getTime() : 0
+              const tB = b.lastMessageAt ? new Date(b.lastMessageAt).getTime() : 0
+              return tB - tA
+            })
+            .map(serializeConversation)
           waNamespace.emit('whatsapp:conversations', convList)
         }
         if (waNamespace && waContacts.size > 0) {
           console.log(`[WA] Emitting ${waContacts.size} existing contacts to clients`)
-          const contactList = Array.from(waContacts.values())
+          // v4.7: Filter out @lid contacts when emitting
+          const contactList = Array.from(waContacts.values()).filter(c => !c.jid.includes('@lid'))
           waNamespace.emit('whatsapp:contacts', contactList)
         }
       }
@@ -853,12 +870,8 @@ async function connectWhatsApp() {
       if (contact.id.includes('@g.us') || contact.id === 'status@broadcast') continue
 
       // Register LID mappings if this contact has both lid and phone-based JID
-      // Baileys contact objects may have: id (phone@s.whatsapp.net) OR id (@lid)
-      // Some contacts have both — register the mapping
       if (contact.id.includes('@lid')) {
-        // For @lid contacts, try to find the phone from the contact's name/notify or from other contacts
         const lidNorm = contact.id.replace(/:(\d+)@/, '@')
-        // Check if we can derive phone from the JID or if another contact with same name has a phone JID
         const phoneFromOther = Array.from(waContacts.values()).find(c =>
           c.name === (contact.name || contact.notify) && c.phone && !c.jid.includes('@lid')
         )
@@ -868,8 +881,23 @@ async function connectWhatsApp() {
       }
 
       const normalizedId = normalizeJid(contact.id)
+      // v4.7: Skip contacts where normalizedId still has @lid (can't resolve to real phone)
+      if (normalizedId.includes('@lid')) continue
       const phone = extractPhone(normalizedId)
       if (!phone) continue
+
+      // v4.7: Dedup by phone number — if a contact with same phone exists, update name only
+      const existingByPhone = Array.from(waContacts.values()).find(c => c.phone === phone)
+      if (existingByPhone) {
+        // Update name if the new one is better
+        const newName = contact.name || contact.notify || null
+        if (newName && (!existingByPhone.name || existingByPhone.name.length < newName.length)) {
+          existingByPhone.name = newName
+        }
+        if (contact.notify && !existingByPhone.notify) existingByPhone.notify = contact.notify
+        continue // Don't add duplicate
+      }
+
       waContacts.set(normalizedId, {
         jid: normalizedId,
         name: contact.name || contact.notify || null,
@@ -890,9 +918,9 @@ async function connectWhatsApp() {
         if (waContact?.name) conv.pushName = waContact.name
       }
     }
-    // Emit to clients
+    // Emit to clients — filter out any remaining @lid entries
     if (waNamespace) {
-      const contactList = Array.from(waContacts.values())
+      const contactList = Array.from(waContacts.values()).filter(c => !c.jid.includes('@lid'))
       waNamespace.emit('whatsapp:contacts', contactList)
     }
   })
@@ -901,6 +929,8 @@ async function connectWhatsApp() {
     for (const update of updates) {
       if (!update.id) continue
       const normalizedId = normalizeJid(update.id)
+      // v4.7: Skip @lid contacts that couldn't be resolved
+      if (normalizedId.includes('@lid')) continue
       const existing = waContacts.get(normalizedId)
       if (existing) {
         if (update.name) existing.name = update.name
@@ -908,7 +938,7 @@ async function connectWhatsApp() {
       }
     }
     if (waNamespace) {
-      const contactList = Array.from(waContacts.values())
+      const contactList = Array.from(waContacts.values()).filter(c => !c.jid.includes('@lid'))
       waNamespace.emit('whatsapp:contacts', contactList)
     }
   })
@@ -918,7 +948,15 @@ async function connectWhatsApp() {
   function emitDedupedConversations() {
     if (!waNamespace) return
     deduplicateConversations()
-    const convList = Array.from(conversations.values()).map(serializeConversation)
+    // v4.7: Sort by lastMessageAt descending (most recent first) and filter out @lid
+    const convList = Array.from(conversations.values())
+      .filter(c => !c.jid.includes('@lid'))
+      .sort((a, b) => {
+        const tA = a.lastMessageAt ? new Date(a.lastMessageAt).getTime() : 0
+        const tB = b.lastMessageAt ? new Date(b.lastMessageAt).getTime() : 0
+        return tB - tA
+      })
+      .map(serializeConversation)
     waNamespace.emit('whatsapp:conversations', convList)
   }
 
@@ -930,6 +968,13 @@ async function connectWhatsApp() {
       const conv = getOrCreateConversation(chat.id)
       if (chat.name) conv.name = chat.name
       conv.unreadCount = chat.unreadCount || 0
+      // v4.7: Use conversationTimestamp for lastMessageAt
+      if (chat.conversationTimestamp) {
+        const ts = new Date(chat.conversationTimestamp * 1000)
+        if (!conv.lastMessageAt || ts > conv.lastMessageAt) {
+          conv.lastMessageAt = ts
+        }
+      }
     }
     emitDedupedConversations()
   })
@@ -983,8 +1028,22 @@ async function connectWhatsApp() {
         }
 
         const normalizedId = normalizeJid(contact.id)
+        // v4.7: Skip contacts where normalizedId still has @lid (can't resolve to real phone)
+        if (normalizedId.includes('@lid')) continue
         const phone = extractPhone(normalizedId)
         if (!phone) continue
+
+        // v4.7: Dedup by phone number — if a contact with same phone exists, update name only
+        const existingByPhone = Array.from(waContacts.values()).find(c => c.phone === phone)
+        if (existingByPhone) {
+          const newName = contact.name || contact.notify || null
+          if (newName && (!existingByPhone.name || existingByPhone.name.length < newName.length)) {
+            existingByPhone.name = newName
+          }
+          if (contact.notify && !existingByPhone.notify) existingByPhone.notify = contact.notify
+          continue
+        }
+
         waContacts.set(normalizedId, {
           jid: normalizedId,
           name: contact.name || contact.notify || null,

@@ -286,7 +286,7 @@ export default function HomePage() {
             </div>
             <div className="hidden lg:block">
               <p className="text-sm font-bold leading-tight">WA-Odoo</p>
-              <p className="text-[10px] text-muted-foreground">Middleware v4.6</p>
+              <p className="text-[10px] text-muted-foreground">Middleware v4.7</p>
             </div>
           </div>
         </div>
@@ -320,7 +320,7 @@ export default function HomePage() {
 
         {activeTab === 'conversations' && (
           <div className="flex h-full">
-            <div className="w-80 lg:w-96 border-r bg-background shrink-0">
+            <div className="w-80 lg:w-96 border-r bg-background shrink-0 h-full">
               <ConversationList
                 conversations={wa.conversations}
                 selectedJid={selectedJid}

@@ -1,0 +1,14 @@
+node_modules/
+.next/
+data/
+.env
+.env.local
+*.db
+skills/
+examples/
+worklog.md
+agent-ctx/
+upload/
+download/
+*.zip
+tsconfig.tsbuildinfo

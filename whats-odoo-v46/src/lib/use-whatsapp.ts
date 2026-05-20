@@ -107,11 +107,13 @@ export function useWhatsApp() {
     socket.on('whatsapp:conversations', (data: WhatsAppConversation[]) => {
       // Normalize all JIDs to prevent duplicates from device variants
       const normalized = data.map(c => ({ ...c, jid: normalizeJid(c.jid) }))
+      // v4.7: Filter out @lid conversations (no real phone)
+      const filtered = normalized.filter(c => !c.jid.includes('@lid'))
       // Deduplicate by normalized JID
       const seen = new Map<string, WhatsAppConversation>()
       // Also deduplicate by phone number in case JIDs differ for same contact
       const phoneSeen = new Map<string, WhatsAppConversation>()
-      for (const c of normalized) {
+      for (const c of filtered) {
         const existing = seen.get(c.jid)
         if (!existing || (c.lastMessageAt && existing.lastMessageAt && new Date(c.lastMessageAt) > new Date(existing.lastMessageAt))) {
           seen.set(c.jid, c)
@@ -142,7 +144,13 @@ export function useWhatsApp() {
           final.set(c.jid, c)
         }
       }
-      setConversations(Array.from(final.values()))
+      // v4.7: Sort by lastMessageAt descending (most recent first)
+      const sorted = Array.from(final.values()).sort((a, b) => {
+        const tA = a.lastMessageAt ? new Date(a.lastMessageAt).getTime() : 0
+        const tB = b.lastMessageAt ? new Date(b.lastMessageAt).getTime() : 0
+        return tB - tA
+      })
+      setConversations(sorted)
     })
 
     socket.on('whatsapp:conversation:update', (data: WhatsAppConversation) => {
@@ -193,6 +201,19 @@ export function useWhatsApp() {
       const seen = new Map<string, WhatsAppContact>()
       for (const c of data) {
         const nj = normalizeJid(c.jid)
+        // v4.7: Skip @lid contacts that couldn't be resolved
+        if (nj.includes('@lid')) continue
+        // Dedup by phone: keep the one with better name
+        if (c.phone) {
+          const existingByPhone = Array.from(seen.values()).find(e => e.phone === c.phone)
+          if (existingByPhone) {
+            const newName = c.name || c.notify || null
+            if (newName && (!existingByPhone.name || existingByPhone.name.length < newName.length)) {
+              existingByPhone.name = newName
+            }
+            continue
+          }
+        }
         seen.set(nj, { ...c, jid: nj })
       }
       setContacts(Array.from(seen.values()))

@@ -1,7 +1,6 @@
 'use client'
 
 import { useState, useMemo } from 'react'
-import { ScrollArea } from '@/components/ui/scroll-area'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
@@ -286,7 +285,7 @@ export function ConversationList({
       </div>
 
       {/* List */}
-      <ScrollArea className="flex-1">
+      <div className="flex-1 overflow-y-auto">
         {activeTab === 'conversations' && (
           <div className="space-y-0.5 p-1">
             {filteredConversations.length === 0 && (
@@ -381,7 +380,7 @@ export function ConversationList({
             })}
           </div>
         )}
-      </ScrollArea>
+      </div>
     </div>
   )
 }
