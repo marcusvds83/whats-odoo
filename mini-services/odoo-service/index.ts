@@ -52,7 +52,7 @@ const phoneToPartnerCache = new Map<string, { partnerId: number; leadId: number 
 // ========== HTTP + Socket.io Server ==========
 const httpServer = createServer()
 const io = new Server(httpServer, {
-  path: '/',
+  path: '/socket.io',
   cors: { origin: '*', methods: ['GET', 'POST'] },
   pingTimeout: 60000,
   pingInterval: 25000,

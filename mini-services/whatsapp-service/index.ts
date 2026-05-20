@@ -62,7 +62,7 @@ const conversations = new Map<string, {
 // ========== HTTP + Socket.io Server ==========
 const httpServer = createServer()
 const io = new Server(httpServer, {
-  path: '/',
+  path: '/socket.io',
   cors: { origin: '*', methods: ['GET', 'POST'] },
   pingTimeout: 60000,
   pingInterval: 25000,
@@ -76,6 +76,7 @@ function connectToOdooService() {
   if (odooServiceSocket?.connected) return
 
   odooServiceSocket = ioClient(ODOO_SERVICE_URL, {
+    path: '/socket.io',
     transports: ['websocket', 'polling'],
     reconnection: true,
     reconnectionAttempts: Infinity,

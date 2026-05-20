@@ -21,9 +21,9 @@ services:
       - key: DATA_DIR
         value: /opt/render/project/src/data
       - key: ODOO_URL
-        sync: false
+        value: https://3code-nexus.odoo.com
       - key: ODOO_DB
-        sync: false
+        value: 3code-nexus
       - key: ODOO_USERNAME
         sync: false
       - key: ODOO_PASSWORD

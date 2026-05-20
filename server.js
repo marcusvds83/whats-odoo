@@ -42,6 +42,7 @@ app.prepare().then(() => {
   // ========== Connect to WhatsApp Service (internal) ==========
   console.log(`[Bridge] Connecting to WhatsApp service at ${WHATSAPP_SERVICE_URL}`)
   const waServiceClient = ioClient(WHATSAPP_SERVICE_URL, {
+    path: '/socket.io',
     transports: ['websocket', 'polling'],
     reconnection: true,
     reconnectionAttempts: Infinity,
@@ -104,6 +105,7 @@ app.prepare().then(() => {
   // ========== Connect to Odoo Service (internal) ==========
   console.log(`[Bridge] Connecting to Odoo service at ${ODOO_SERVICE_URL}`)
   const odooServiceClient = ioClient(ODOO_SERVICE_URL, {
+    path: '/socket.io',
     transports: ['websocket', 'polling'],
     reconnection: true,
     reconnectionAttempts: Infinity,
