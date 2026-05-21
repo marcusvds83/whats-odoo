@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: whats-odoo
+    runtime: node
+    plan: starter
+    buildCommand: npm install && npm run build
+    startCommand: npm run start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: HOSTNAME
+        value: "0.0.0.0"
+      - key: DATABASE_URL
+        value: file:/opt/render/project/src/data/whats-odoo.db
+      - key: DATA_DIR
+        value: /opt/render/project/src/data
+      - key: ODOO_URL
+        value: https://3code-nexus.odoo.com
+      - key: ODOO_DB
+        value: 3code-nexus
+      - key: ODOO_USERNAME
+        sync: false
+      - key: ODOO_PASSWORD
+        sync: false
+    disk:
+      name: whats-odoo-data
+      mountPath: /opt/render/project/src/data
+      sizeGB: 1
