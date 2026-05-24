@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "next dev -p 3000",
     "build": "next build",
-    "start": "npx prisma generate && npx prisma db push && npx next build && npx tsx server.ts",
+    "start": "npx prisma db push && npx tsx server.ts",
     "lint": "eslint .",
     "db:push": "prisma db push",
     "db:generate": "prisma generate"
