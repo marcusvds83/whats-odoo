@@ -45,7 +45,7 @@ import {
   Phone,
   Search,
   Download,
-  AddressBook,
+  BookUser,
 } from 'lucide-react'
 
 type Tab = 'dashboard' | 'whatsapp' | 'conversations' | 'contacts' | 'settings'
@@ -93,7 +93,7 @@ function ContactsView({
       <div className="shrink-0 px-4 pt-4 pb-2">
         <div className="flex items-center justify-between mb-3">
           <div className="flex items-center gap-2">
-            <AddressBook className="size-5 text-primary" />
+            <BookUser className="size-5 text-primary" />
             <h2 className="font-semibold text-base">Contatos</h2>
             {contacts.length > 0 && (
               <Badge variant="outline" className="text-[10px]">{contacts.length}</Badge>
@@ -127,7 +127,7 @@ function ContactsView({
       <ScrollArea className="flex-1 min-h-0">
         {contacts.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-16 px-4">
-            <AddressBook className="size-10 text-muted-foreground/40 mb-3" />
+            <BookUser className="size-10 text-muted-foreground/40 mb-3" />
             {isLoading ? (
               <>
                 <Loader2 className="size-6 text-primary animate-spin mb-2" />
@@ -313,7 +313,7 @@ function DashboardView({
             )}
             {waStatus.connected && (
               <Button variant="outline" className="justify-start gap-2 h-auto py-3" onClick={() => onNavigate('contacts')}>
-                <AddressBook className="size-4 text-blue-500" />
+                <BookUser className="size-4 text-blue-500" />
                 <div className="text-left">
                   <div className="text-sm font-medium">Contatos do Aparelho</div>
                   <div className="text-xs text-muted-foreground">Ver e iniciar conversas</div>
@@ -562,7 +562,7 @@ function UserManual() {
 
         <div className="space-y-3">
           <h3 className="text-sm font-semibold flex items-center gap-2">
-            <AddressBook className="size-4 text-blue-500" />
+            <BookUser className="size-4 text-blue-500" />
             Contatos (v7.3)
           </h3>
           <div className="text-xs text-muted-foreground space-y-2 pl-6">
@@ -714,7 +714,7 @@ export default function HomePage() {
             icon={<MessageCircle className="size-4" />} label="Conversas" active={activeTab === 'conversations'} onClick={() => setActiveTab('conversations')}
             badge={wa.conversations.reduce((s, c) => s + c.unreadCount, 0) > 0 ? String(wa.conversations.reduce((s, c) => s + c.unreadCount, 0)) : undefined}
           />
-          <NavItem icon={<AddressBook className="size-4" />} label="Contatos" active={activeTab === 'contacts'} onClick={handleContactsTab} badge={wa.contacts.length > 0 ? String(wa.contacts.length) : undefined} />
+          <NavItem icon={<BookUser className="size-4" />} label="Contatos" active={activeTab === 'contacts'} onClick={handleContactsTab} badge={wa.contacts.length > 0 ? String(wa.contacts.length) : undefined} />
           <NavItem icon={<Settings className="size-4" />} label="Configuracoes" active={activeTab === 'settings'} onClick={() => setActiveTab('settings')} />
         </div>
 
