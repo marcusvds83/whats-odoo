@@ -53,6 +53,9 @@ export function useWhatsApp() {
   // Odoo sync state per conversation
   const [odooSyncMap, setOdooSyncMap] = useState<Map<string, OdooSyncInfo>>(new Map())
 
+  // Contacts map (jid -> name) from WhatsApp device
+  const [contactNames, setContactNames] = useState<Map<string, string>>(new Map())
+
   useEffect(() => {
     const socket = io('/whatsapp', {
       transports: ['websocket', 'polling'],
@@ -155,6 +158,18 @@ export function useWhatsApp() {
       })
     })
 
+    // Contacts list event (full contacts from device)
+    socket.on('whatsapp:contacts-list', (data: Array<{ jid: string; name: string | null; phone: string | null }>) => {
+      console.log('[WhatsApp] Contacts list received:', data.length)
+      const newMap = new Map<string, string>()
+      for (const c of data) {
+        if (c.name && c.jid) {
+          newMap.set(c.jid, c.name)
+        }
+      }
+      setContactNames(newMap)
+    })
+
     return () => {
       socket.disconnect()
     }
@@ -210,6 +225,39 @@ export function useWhatsApp() {
     })
   }, [])
 
+  // Refresh conversations from device — triggers Baileys re-sync
+  const refreshConversations = useCallback(() => {
+    socketRef.current?.emit('whatsapp:refresh-conversations')
+  }, [])
+
+  // Get contacts list from device
+  const getContacts = useCallback(() => {
+    socketRef.current?.emit('whatsapp:get-contacts')
+  }, [])
+
+  // Start a new conversation by phone number
+  const startConversation = useCallback((phone: string): Promise<{ success: boolean; jid?: string; error?: string }> => {
+    return new Promise((resolve) => {
+      socketRef.current?.emit('whatsapp:start-conversation', { phone }, (response: { success: boolean; jid?: string; error?: string }) => {
+        resolve(response)
+      })
+    })
+  }, [])
+
+  // Fetch conversation messages from device (bring current conversation)
+  const fetchConversationMessages = useCallback((jid: string) => {
+    socketRef.current?.emit('whatsapp:fetch-conversation-messages', { jid }, (response: { success: boolean; count?: number }) => {
+      if (response.success && response.count) {
+        // Reload messages after fetching
+        if (jid === currentJid) {
+          socketRef.current?.emit('whatsapp:get-messages', { jid }, (msgResponse: { messages: WhatsAppMessage[] }) => {
+            setCurrentMessages(msgResponse.messages)
+          })
+        }
+      }
+    })
+  }, [currentJid])
+
   const getOdooSync = useCallback((jid: string): OdooSyncInfo | null => {
     return odooSyncMap.get(jid) || null
   }, [odooSyncMap])
@@ -223,6 +271,8 @@ export function useWhatsApp() {
     currentJid,
     isConnected,
     syncProgress,
+    // Contacts
+    contactNames,
     // Odoo sync
     odooSyncMap,
     getOdooSync,
@@ -234,5 +284,10 @@ export function useWhatsApp() {
     disconnect,
     logout,
     getProfilePic,
+    // New actions
+    refreshConversations,
+    getContacts,
+    startConversation,
+    fetchConversationMessages,
   }
 }

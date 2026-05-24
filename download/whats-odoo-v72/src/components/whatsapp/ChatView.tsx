@@ -23,6 +23,7 @@ import {
   MessageSquare,
   ArrowDown,
   Users,
+  ArrowDownToLine,
 } from 'lucide-react'
 
 interface ChatViewProps {
@@ -47,6 +48,8 @@ interface ChatViewProps {
   }>
   onSendMessage: (jid: string, text: string) => Promise<boolean>
   onMarkRead: (jid: string) => void
+  onFetchMessages?: () => void
+  waConnected?: boolean
 }
 
 function formatMessageTime(dateStr: string): string {
@@ -110,9 +113,12 @@ export function ChatView({
   messages,
   onSendMessage,
   onMarkRead,
+  onFetchMessages,
+  waConnected,
 }: ChatViewProps) {
   const [inputText, setInputText] = useState('')
   const [isSending, setIsSending] = useState(false)
+  const [isFetching, setIsFetching] = useState(false)
   const [showScrollButton, setShowScrollButton] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const scrollViewportRef = useRef<HTMLDivElement>(null)
@@ -149,6 +155,16 @@ export function ChatView({
     } finally {
       setIsSending(false)
       inputRef.current?.focus()
+    }
+  }
+
+  const handleFetchMessages = async () => {
+    if (!onFetchMessages || isFetching) return
+    setIsFetching(true)
+    try {
+      onFetchMessages()
+    } finally {
+      setTimeout(() => setIsFetching(false), 3000)
     }
   }
 
@@ -208,6 +224,20 @@ export function ChatView({
               )}
             </div>
           </div>
+          {/* Bring conversation from device button */}
+          {waConnected && onFetchMessages && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={handleFetchMessages}
+              disabled={isFetching}
+              className="gap-1.5 text-xs shrink-0"
+              title="Trazer conversa atual do aparelho"
+            >
+              <ArrowDownToLine className={cn("size-3.5", isFetching && "animate-bounce")} />
+              <span className="hidden sm:inline">Trazer</span>
+            </Button>
+          )}
         </div>
       </div>
 
@@ -222,6 +252,18 @@ export function ChatView({
                 </div>
                 <p className="text-sm text-muted-foreground">Sem mensagens</p>
                 <p className="text-xs text-muted-foreground/60 mt-1">Envie uma mensagem para iniciar</p>
+                {waConnected && onFetchMessages && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={handleFetchMessages}
+                    disabled={isFetching}
+                    className="mt-3 gap-1.5"
+                  >
+                    <ArrowDownToLine className={cn("size-3.5", isFetching && "animate-bounce")} />
+                    Trazer conversa do aparelho
+                  </Button>
+                )}
               </div>
             ) : (
               messages.map((message, index) => {

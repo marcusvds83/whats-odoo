@@ -4,11 +4,11 @@
   "private": true,
   "scripts": {
     "dev": "next dev -p 3000",
-    "build": "npx prisma generate && npx next build",
-    "start": "npx tsx server.ts",
+    "build": "next build",
+    "start": "npx prisma db push && npx tsx server.ts",
     "lint": "eslint .",
-    "db:push": "npx prisma db push",
-    "db:generate": "npx prisma generate"
+    "db:push": "prisma db push",
+    "db:generate": "prisma generate"
   },
   "dependencies": {
     "@hapi/boom": "^9.1.4",

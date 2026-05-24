@@ -1,5 +1,5 @@
 // ============================================================
-// Whats-Odoo v7.2 — SINGLE PROCESS SERVER
+// Whats-Odoo v7.1 — SINGLE PROCESS SERVER
 // Consolidates WhatsApp + Odoo + Next.js into ONE process
 // Eliminates inter-process websocket errors on Render
 // ============================================================
@@ -8,7 +8,6 @@ import { createServer } from 'http'
 import { parse } from 'url'
 import next from 'next'
 import { Server as SocketIOServer } from 'socket.io'
-import { execSync } from 'child_process'
 import {
   makeWASocket,
   useMultiFileAuthState,
@@ -140,16 +139,6 @@ const phoneToPartnerCache = new Map<string, { partnerId: number; leadId: number 
 // ============================================================
 // SOCKET.IO SERVER (single instance, no bridge)
 // ============================================================
-
-// Initialize DB schema before starting
-try {
-  console.log('[Server] Initializing database...')
-  execSync('npx prisma db push --skip-generate', { stdio: 'inherit' })
-  console.log('[Server] Database ready')
-} catch (err: any) {
-  console.log('[Server] DB init warning:', err.message)
-}
-
 const app = next({ dev, hostname, port })
 const handle = app.getRequestHandler()
 
@@ -270,6 +259,19 @@ function initWhatsApp(waNs: ReturnType<import('socket.io')['Server']['of']>, odo
 
   function emitConversationsList() {
     waNs.emit('whatsapp:conversations', getSortedConversations())
+  }
+
+  function emitContactsList() {
+    const contactsList = Array.from(contactNames.entries())
+      .filter(([jid]) => isValidPhoneJid(jid))
+      .map(([jid, name]) => ({
+        jid,
+        name,
+        phone: extractPhone(jid),
+      }))
+      .filter(c => c.phone)
+      .sort((a, b) => (a.name || '').localeCompare(b.name || ''))
+    waNs.emit('whatsapp:contacts-list', contactsList)
   }
 
   // Auto-sync to Odoo — DIRECT call, no socket.io relay
@@ -547,6 +549,7 @@ function initWhatsApp(waNs: ReturnType<import('socket.io')['Server']['of']>, odo
       }
 
       emitConversationsList()
+      emitContactsList()
     })
 
     // ========== REAL-TIME MESSAGES ==========
@@ -650,6 +653,7 @@ function initWhatsApp(waNs: ReturnType<import('socket.io')['Server']['of']>, odo
         }
       }
       emitConversationsList()
+      emitContactsList()
     })
 
     waSocket.ev.on('contacts.update', async (updates) => {
@@ -664,6 +668,7 @@ function initWhatsApp(waNs: ReturnType<import('socket.io')['Server']['of']>, odo
         }
       }
       emitConversationsList()
+      emitContactsList()
     })
 
     // ========== CHAT EVENTS ==========
@@ -771,6 +776,13 @@ function initWhatsApp(waNs: ReturnType<import('socket.io')['Server']['of']>, odo
     }
 
     socket.emit('whatsapp:conversations', getSortedConversations())
+
+    // Send current contacts list to new client
+    const currentContacts = Array.from(contactNames.entries())
+      .filter(([jid]) => isValidPhoneJid(jid))
+      .map(([jid, name]) => ({ jid, name, phone: extractPhone(jid) }))
+      .filter(c => c.phone)
+    socket.emit('whatsapp:contacts-list', currentContacts)
 
     if (syncState.isSyncing) {
       socket.emit('whatsapp:sync-progress', {
@@ -918,6 +930,237 @@ function initWhatsApp(waNs: ReturnType<import('socket.io')['Server']['of']>, odo
         if (conv && url) conv.avatarUrl = url
         callback({ success: true, url })
       } catch { callback({ success: false, url: null }) }
+    })
+
+    // ========== REFRESH CONVERSATIONS FROM DEVICE ==========
+    socket.on('whatsapp:refresh-conversations', async (callback) => {
+      try {
+        if (!waSocket || connectionState.connection !== 'open') {
+          if (callback) callback({ success: false, error: 'WhatsApp not connected' })
+          return
+        }
+        console.log('[WA IO] Refresh conversations requested')
+
+        // Request re-fetch of chats from device using Baileys chat fetch
+        try {
+          const chats = await waSocket.fetchChats()
+          console.log(`[WA] Fetched ${chats.length} chats from device`)
+
+          for (const chat of chats) {
+            if (!isValidConversationJid(chat.id)) continue
+            if (isJidBroadcast(chat.id)) continue
+
+            const isGrp = isValidGroupJid(chat.id)
+            const contactName = contactNames.get(jidNormalizedUser(chat.id)) || null
+            const chatTimestamp = chat.conversationTimestamp
+              ? new Date(Number(chat.conversationTimestamp) * 1000)
+              : null
+
+            if (!conversations.has(chat.id)) {
+              conversations.set(chat.id, {
+                jid: chat.id,
+                name: isGrp ? null : (contactName || null),
+                phone: extractPhone(chat.id),
+                pushName: null,
+                avatarUrl: null,
+                lastMessage: null,
+                lastMessageAt: chatTimestamp,
+                unreadCount: chat.unreadCount || 0,
+                isGroup: isGrp,
+                groupName: isGrp ? (contactName || null) : null,
+                messages: [],
+              })
+            } else {
+              const conv = conversations.get(chat.id)!
+              if (!conv.isGroup && contactName && !conv.name) conv.name = contactName
+              if (isGrp && contactName && !conv.groupName) conv.groupName = contactName
+              if (chatTimestamp && (!conv.lastMessageAt || chatTimestamp > conv.lastMessageAt)) {
+                conv.lastMessageAt = chatTimestamp
+              }
+              if (chat.unreadCount !== undefined) conv.unreadCount = chat.unreadCount
+            }
+
+            // Fetch group metadata for groups
+            if (isGrp) {
+              try {
+                const metadata = await waSocket.groupMetadata(chat.id)
+                groupMetadataCache.set(chat.id, metadata)
+                const conv = conversations.get(chat.id)
+                if (conv && metadata) {
+                  conv.groupName = metadata.subject || conv.groupName
+                  conv.name = metadata.subject || conv.name
+                }
+              } catch {}
+            }
+          }
+
+          emitConversationsList()
+          // Also emit updated contacts list
+          emitContactsList()
+        } catch (err: any) {
+          console.error('[WA] Failed to fetch chats:', err.message)
+        }
+
+        if (callback) callback({ success: true })
+      } catch (error: any) {
+        if (callback) callback({ success: false, error: error.message })
+      }
+    })
+
+    // ========== GET CONTACTS LIST ==========
+    socket.on('whatsapp:get-contacts', (callback) => {
+      try {
+        const contactsList = Array.from(contactNames.entries())
+          .filter(([jid]) => isValidPhoneJid(jid))
+          .map(([jid, name]) => ({
+            jid,
+            name,
+            phone: extractPhone(jid),
+          }))
+          .filter(c => c.phone)
+          .sort((a, b) => (a.name || '').localeCompare(b.name || ''))
+
+        if (callback) callback({ success: true, contacts: contactsList })
+
+        // Also emit to all clients
+        waNs.emit('whatsapp:contacts-list', contactsList)
+      } catch (error: any) {
+        if (callback) callback({ success: false, error: error.message })
+      }
+    })
+
+    // ========== START NEW CONVERSATION BY PHONE ==========
+    socket.on('whatsapp:start-conversation', async (data: { phone: string }, callback) => {
+      try {
+        if (!waSocket || connectionState.connection !== 'open') {
+          callback({ success: false, error: 'WhatsApp not connected' })
+          return
+        }
+
+        let phone = data.phone.replace(/\D/g, '')
+        if (phone.length < 7) {
+          callback({ success: false, error: 'Numero de telefone invalido (minimo 7 digitos)' })
+          return
+        }
+
+        // Construct JID from phone number
+        const jid = `${phone}@s.whatsapp.net`
+
+        // Verify the number exists on WhatsApp
+        const [result] = await waSocket.onWhatsApp(jid)
+        if (!result || !result.exists) {
+          callback({ success: false, error: 'Este numero nao esta registrado no WhatsApp' })
+          return
+        }
+
+        // Use the actual JID returned by onWhatsApp (may have different format)
+        const actualJid = result.jid || jid
+
+        // Create or get conversation
+        const conv = getOrCreateConversation(actualJid)
+        if (!conv) {
+          callback({ success: false, error: 'Could not create conversation' })
+          return
+        }
+
+        // Try to get profile picture
+        try {
+          const picUrl = await waSocket.profilePictureUrl(actualJid, 'image')
+          if (picUrl) conv.avatarUrl = picUrl
+        } catch {}
+
+        emitConversationsList()
+        callback({ success: true, jid: actualJid })
+      } catch (error: any) {
+        console.error('[WA] Start conversation error:', error.message)
+        callback({ success: false, error: error.message })
+      }
+    })
+
+    // ========== FETCH CONVERSATION MESSAGES FROM DEVICE ==========
+    socket.on('whatsapp:fetch-conversation-messages', async (data: { jid: string }, callback) => {
+      try {
+        if (!waSocket || connectionState.connection !== 'open') {
+          callback({ success: false, error: 'WhatsApp not connected' })
+          return
+        }
+
+        if (!isValidConversationJid(data.jid)) {
+          callback({ success: false, error: 'Invalid JID' })
+          return
+        }
+
+        console.log(`[WA IO] Fetch messages for: ${data.jid}`)
+
+        // Use Baileys fetchMessages to get recent messages from device
+        const fetchedMessages = await waSocket.fetchMessages(data.jid, 50)
+        let count = 0
+
+        const conv = conversations.get(data.jid) || getOrCreateConversation(data.jid)
+        if (!conv) {
+          callback({ success: false, error: 'Could not get conversation' })
+          return
+        }
+
+        for (const msg of fetchedMessages) {
+          if (!msg.key) continue
+          const fromMe = msg.key.fromMe || false
+          const textContent =
+            msg.message?.conversation ||
+            msg.message?.extendedTextMessage?.text ||
+            msg.message?.imageMessage?.caption ||
+            msg.message?.videoMessage?.caption ||
+            msg.message?.documentMessage?.caption || null
+
+          let mediaType: string | null = null
+          if (msg.message?.imageMessage) mediaType = 'image'
+          else if (msg.message?.videoMessage) mediaType = 'video'
+          else if (msg.message?.audioMessage) mediaType = 'audio'
+          else if (msg.message?.documentMessage) mediaType = 'document'
+          else if (msg.message?.stickerMessage) mediaType = 'sticker'
+
+          if (!textContent && !mediaType) continue
+
+          const msgId = msg.key.id
+          if (msgId && conv.messages.some(m => m.whatsappId === msgId)) continue
+
+          const messageTimestamp = new Date((msg.messageTimestamp as number) * 1000 || Date.now())
+
+          let senderName: string | null = null
+          if (conv.isGroup && !fromMe) {
+            const participant = msg.key.participant || (msg as any).participant
+            if (participant) {
+              senderName = contactNames.get(jidNormalizedUser(participant)) || participant.split('@')[0]
+            }
+          }
+
+          conv.messages.push({
+            id: msgId || Math.random().toString(36).substr(2, 9),
+            whatsappId: msgId || null,
+            fromMe,
+            textContent,
+            mediaType,
+            timestamp: messageTimestamp,
+            status: fromMe ? 'delivered' : 'received',
+            senderName,
+          })
+
+          if (textContent) conv.lastMessage = textContent
+          else if (mediaType) conv.lastMessage = `[${mediaType}]`
+
+          if (!conv.lastMessageAt || messageTimestamp > conv.lastMessageAt) {
+            conv.lastMessageAt = messageTimestamp
+          }
+          count++
+        }
+
+        emitConversationsList()
+        console.log(`[WA] Fetched ${count} messages for ${data.jid}`)
+        callback({ success: true, count })
+      } catch (error: any) {
+        console.error('[WA] Fetch messages error:', error.message)
+        callback({ success: false, error: error.message })
+      }
     })
 
     socket.on('disconnect', () => console.log(`[WA IO] Client disconnected: ${socket.id}`))

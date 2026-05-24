@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useCallback } from 'react'
 import { useWhatsApp } from '@/lib/use-whatsapp'
 import { useOdoo } from '@/lib/use-odoo'
 import { QRCodePanel } from '@/components/whatsapp/QRCodePanel'
@@ -14,8 +14,18 @@ import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Input } from '@/components/ui/input'
 import { Separator } from '@/components/ui/separator'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { ScrollArea } from '@/components/ui/scroll-area'
+import { Avatar, AvatarFallback } from '@/components/ui/avatar'
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from '@/components/ui/dialog'
 import {
   MessageCircle,
   Settings,
@@ -38,10 +48,233 @@ import {
   RefreshCcw,
   Power,
   LogOut,
+  Phone,
+  Search,
+  Download,
+  Contact2,
+  Plus,
+  ArrowDownToLine,
 } from 'lucide-react'
 
-type Tab = 'dashboard' | 'whatsapp' | 'conversations' | 'settings'
+type Tab = 'dashboard' | 'whatsapp' | 'conversations' | 'contacts' | 'settings'
 
+// ============================================================
+// CONTACTS VIEW
+// ============================================================
+function ContactsView({
+  contacts,
+  conversations,
+  waConnected,
+  onRefresh,
+  onStartConversation,
+  onSelectConversation,
+  isRefreshing,
+}: {
+  contacts: Array<{ jid: string; name: string | null; phone: string | null }>
+  conversations: any[]
+  waConnected: boolean
+  onRefresh: () => void
+  onStartConversation: (phone: string) => void
+  onSelectConversation: (jid: string) => void
+  isRefreshing: boolean
+}) {
+  const [searchQuery, setSearchQuery] = useState('')
+
+  const filteredContacts = useMemo(() => {
+    if (!searchQuery.trim()) return contacts
+    const q = searchQuery.toLowerCase()
+    return contacts.filter(c =>
+      (c.name && c.name.toLowerCase().includes(q)) ||
+      (c.phone && c.phone.includes(q))
+    )
+  }, [contacts, searchQuery])
+
+  const individualConvs = conversations.filter(c => !c.isGroup)
+  const groupConvs = conversations.filter(c => c.isGroup)
+
+  return (
+    <div className="flex flex-col h-full">
+      <div className="shrink-0 px-4 pt-4 pb-2 space-y-3">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Contact2 className="size-5 text-primary" />
+            <h2 className="font-semibold text-base">Contatos</h2>
+            <span className="text-xs text-muted-foreground">{contacts.length} contatos</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={onRefresh}
+              disabled={!waConnected || isRefreshing}
+              className="gap-1.5"
+            >
+              <RefreshCcw className={cn("size-3.5", isRefreshing && "animate-spin")} />
+              Atualizar
+            </Button>
+            <NewConversationDialog
+              onStartConversation={onStartConversation}
+              disabled={!waConnected}
+            />
+          </div>
+        </div>
+
+        {/* Stats */}
+        <div className="flex gap-3">
+          <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-muted/60 text-xs">
+            <Phone className="size-3 text-primary" />
+            <span className="font-medium">{individualConvs.length}</span>
+            <span className="text-muted-foreground">conversas</span>
+          </div>
+          <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-muted/60 text-xs">
+            <Users className="size-3 text-emerald-500" />
+            <span className="font-medium">{groupConvs.length}</span>
+            <span className="text-muted-foreground">grupos</span>
+          </div>
+        </div>
+
+        {/* Search */}
+        <div className="relative">
+          <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 size-4 text-muted-foreground" />
+          <Input
+            placeholder="Buscar contatos por nome ou numero..."
+            className="pl-9 h-9 text-sm bg-muted/50 border-transparent focus:border-border focus:bg-background"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+          />
+        </div>
+      </div>
+
+      {/* Contact list */}
+      <ScrollArea className="flex-1 min-h-0">
+        {filteredContacts.length === 0 ? (
+          <div className="flex flex-col items-center justify-center py-16 px-4">
+            <Contact2 className="size-10 text-muted-foreground/40 mb-3" />
+            <p className="text-sm font-medium text-muted-foreground">
+              {searchQuery ? 'Nenhum contato encontrado' : 'Nenhum contato carregado'}
+            </p>
+            {!searchQuery && !waConnected && (
+              <p className="text-xs text-muted-foreground/70 mt-1">Conecte o WhatsApp para ver contatos</p>
+            )}
+            {!searchQuery && waConnected && (
+              <Button variant="outline" size="sm" onClick={onRefresh} className="mt-3 gap-1.5">
+                <RefreshCcw className="size-3.5" />
+                Atualizar contatos
+              </Button>
+            )}
+          </div>
+        ) : (
+          <div className="py-1">
+            {filteredContacts.map(contact => {
+              const conv = conversations.find(c => c.phone === contact.phone || c.jid === contact.jid)
+              return (
+                <button
+                  key={contact.jid}
+                  onClick={() => {
+                    if (conv) onSelectConversation(conv.jid)
+                  }}
+                  className={cn(
+                    'w-full flex items-center gap-3 px-4 py-2.5 text-left transition-colors duration-150',
+                    'hover:bg-muted/60 focus-visible:bg-muted/60 focus-visible:outline-none',
+                    !conv && 'opacity-60'
+                  )}
+                >
+                  <Avatar className="size-10 shrink-0">
+                    <AvatarFallback className="text-xs font-medium bg-muted text-muted-foreground">
+                      {contact.name ? contact.name.split(' ').map(w => w[0]).filter(Boolean).slice(0, 2).join('').toUpperCase() : <Phone className="size-4" />}
+                    </AvatarFallback>
+                  </Avatar>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium truncate">{contact.name || 'Sem nome'}</p>
+                    <p className="text-xs text-muted-foreground">{contact.phone || contact.jid.split('@')[0]}</p>
+                  </div>
+                  {conv ? (
+                    <Badge variant="outline" className="text-[10px] shrink-0">Conversa</Badge>
+                  ) : (
+                    <Badge variant="secondary" className="text-[10px] shrink-0">Contato</Badge>
+                  )}
+                </button>
+              )
+            })}
+          </div>
+        )}
+      </ScrollArea>
+    </div>
+  )
+}
+
+// ============================================================
+// NEW CONVERSATION DIALOG
+// ============================================================
+function NewConversationDialog({
+  onStartConversation,
+  disabled,
+}: {
+  onStartConversation: (phone: string) => void
+  disabled: boolean
+}) {
+  const [open, setOpen] = useState(false)
+  const [phone, setPhone] = useState('')
+  const [isCreating, setIsCreating] = useState(false)
+
+  const handleCreate = async () => {
+    if (!phone.trim()) return
+    setIsCreating(true)
+    try {
+      await onStartConversation(phone.trim())
+      setPhone('')
+      setOpen(false)
+    } finally {
+      setIsCreating(false)
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DialogTrigger asChild>
+        <Button variant="outline" size="sm" disabled={disabled} className="gap-1.5">
+          <Plus className="size-3.5" />
+          Nova Conversa
+        </Button>
+      </DialogTrigger>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <Phone className="size-4 text-primary" />
+            Nova Conversa
+          </DialogTitle>
+        </DialogHeader>
+        <div className="space-y-4 py-2">
+          <div className="space-y-2">
+            <label className="text-sm font-medium">Numero de telefone</label>
+            <Input
+              placeholder="Ex: 5511999999999 (somente numeros)"
+              value={phone}
+              onChange={(e) => setPhone(e.target.value.replace(/\D/g, ''))}
+              onKeyDown={(e) => { if (e.key === 'Enter') handleCreate() }}
+              className="text-sm"
+            />
+            <p className="text-xs text-muted-foreground">
+              Insira o numero completo com codigo do pais, sem espacos ou caracteres especiais.
+            </p>
+          </div>
+          <Button
+            onClick={handleCreate}
+            disabled={!phone.trim() || phone.length < 7 || isCreating}
+            className="w-full gap-2 bg-emerald-600 hover:bg-emerald-700 text-white"
+          >
+            {isCreating ? <Loader2 className="size-4 animate-spin" /> : <MessageCircle className="size-4" />}
+            {isCreating ? 'Criando...' : 'Iniciar Conversa'}
+          </Button>
+        </div>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+// ============================================================
+// DASHBOARD VIEW
+// ============================================================
 function DashboardView({
   waStatus,
   waMe,
@@ -165,6 +398,15 @@ function DashboardView({
                 </div>
               </Button>
             )}
+            {waStatus.connected && (
+              <Button variant="outline" className="justify-start gap-2 h-auto py-3" onClick={() => onNavigate('contacts')}>
+                <Contact2 className="size-4 text-blue-500" />
+                <div className="text-left">
+                  <div className="text-sm font-medium">Contatos</div>
+                  <div className="text-xs text-muted-foreground">Ver e gerenciar contatos</div>
+                </div>
+              </Button>
+            )}
             {waStatus.connected && odooStatus.connected && (
               <Button variant="outline" className="justify-start gap-2 h-auto py-3" onClick={() => onNavigate('conversations')}>
                 <Zap className="size-4 text-yellow-500" />
@@ -212,6 +454,9 @@ function DashboardView({
   )
 }
 
+// ============================================================
+// CONVERSATIONS VIEW
+// ============================================================
 function ConversationsView({
   conversations,
   selectedJid,
@@ -234,6 +479,11 @@ function ConversationsView({
   onLogMessage,
   isSyncing,
   syncProgress,
+  waConnected,
+  onRefreshConversations,
+  onFetchConversationMessages,
+  onStartConversation,
+  isRefreshing,
 }: {
   conversations: any[]
   selectedJid: string | null
@@ -256,6 +506,11 @@ function ConversationsView({
   onLogMessage: any
   isSyncing?: boolean
   syncProgress?: number
+  waConnected: boolean
+  onRefreshConversations: () => void
+  onFetchConversationMessages: (jid: string) => void
+  onStartConversation: (phone: string) => void
+  isRefreshing: boolean
 }) {
   return (
     <div className="flex h-full min-h-0 overflow-hidden">
@@ -269,6 +524,10 @@ function ConversationsView({
           onSelect={onSelectConversation}
           isSyncing={isSyncing}
           syncProgress={syncProgress}
+          waConnected={waConnected}
+          onRefresh={onRefreshConversations}
+          onStartConversation={onStartConversation}
+          isRefreshing={isRefreshing}
         />
       </div>
 
@@ -280,6 +539,8 @@ function ConversationsView({
               messages={currentMessages}
               onSendMessage={onSendMessage}
               onMarkRead={onMarkRead}
+              onFetchMessages={() => onFetchConversationMessages(selectedJid)}
+              waConnected={waConnected}
             />
           </div>
 
@@ -342,6 +603,9 @@ function ConversationsView({
   )
 }
 
+// ============================================================
+// USER MANUAL
+// ============================================================
 function UserManual() {
   return (
     <Card>
@@ -379,7 +643,22 @@ function UserManual() {
             <p>As conversas sao exibidas na ordem de mais recente para mais antiga, igual ao WhatsApp Web.</p>
             <p><strong>Contatos individuais</strong> aparecem com nome e numero de telefone. Voce pode enviar mensagens e vincular ao Odoo.</p>
             <p><strong>Grupos</strong> aparecem com o icone de grupo e nome do grupo. Voce pode ver e enviar mensagens, mas grupos <strong>nao geram leads automaticamente</strong> no Odoo.</p>
-            <p>Use a barra de busca para encontrar conversas por nome, numero ou nome do grupo.</p>
+            <p>Use o botao <strong>Atualizar</strong> para sincronizar as conversas do aparelho.</p>
+            <p>Use o botao <strong>Trazer conversa</strong> para carregar mensagens recentes de uma conversa.</p>
+          </div>
+        </div>
+
+        <Separator />
+
+        <div className="space-y-3">
+          <h3 className="text-sm font-semibold flex items-center gap-2">
+            <Contact2 className="size-4 text-blue-500" />
+            Contatos e Nova Conversa
+          </h3>
+          <div className="text-xs text-muted-foreground space-y-2 pl-6">
+            <p>Na aba <strong>Contatos</strong>, voce ve todos os contatos do seu aparelho com nome e numero.</p>
+            <p>Clique em <strong>Atualizar</strong> para sincronizar contatos e conversas do aparelho.</p>
+            <p>Clique em <strong>Nova Conversa</strong> e insira um numero de telefone para iniciar uma conversa nova.</p>
           </div>
         </div>
 
@@ -446,6 +725,9 @@ function UserManual() {
   )
 }
 
+// ============================================================
+// NAV ITEM
+// ============================================================
 function NavItem({ icon, label, active, onClick, badge }: {
   icon: React.ReactNode
   label: string
@@ -483,6 +765,9 @@ function StatusIndicator({ label, connected }: { label: string; connected: boole
   )
 }
 
+// ============================================================
+// MAIN PAGE
+// ============================================================
 export default function HomePage() {
   const wa = useWhatsApp()
   const odoo = useOdoo()
@@ -490,18 +775,50 @@ export default function HomePage() {
   const [activeTab, setActiveTab] = useState<Tab>('dashboard')
   const [selectedJid, setSelectedJid] = useState<string | null>(null)
   const [showOdooPanel, setShowOdooPanel] = useState(false)
+  const [isRefreshing, setIsRefreshing] = useState(false)
 
   const selectedConversation = useMemo(() => {
     if (!selectedJid) return null
     return wa.conversations.find(c => c.jid === selectedJid) || null
   }, [selectedJid, wa.conversations])
 
-  const handleSelectConversation = (jid: string) => {
+  // Build contacts list from contactNames map
+  const contacts = useMemo(() => {
+    return Array.from(wa.contactNames.entries())
+      .map(([jid, name]) => ({
+        jid,
+        name,
+        phone: jid.endsWith('@s.whatsapp.net') ? jid.split('@')[0] : null,
+      }))
+      .filter(c => c.phone && /^\d{7,}$/.test(c.phone))
+      .sort((a, b) => (a.name || '').localeCompare(b.name || ''))
+  }, [wa.contactNames])
+
+  const handleSelectConversation = useCallback((jid: string) => {
     setSelectedJid(jid)
     wa.loadMessages(jid)
     wa.markRead(jid)
     setActiveTab('conversations')
-  }
+  }, [wa])
+
+  const handleRefreshConversations = useCallback(() => {
+    setIsRefreshing(true)
+    wa.refreshConversations()
+    // Give time for refresh to complete
+    setTimeout(() => setIsRefreshing(false), 5000)
+  }, [wa])
+
+  const handleStartConversation = useCallback(async (phone: string) => {
+    const result = await wa.startConversation(phone)
+    if (result.success && result.jid) {
+      setSelectedJid(result.jid)
+      setActiveTab('conversations')
+    }
+  }, [wa])
+
+  const handleFetchConversationMessages = useCallback((jid: string) => {
+    wa.fetchConversationMessages(jid)
+  }, [wa])
 
   return (
     <div className="flex h-screen overflow-hidden">
@@ -525,6 +842,7 @@ export default function HomePage() {
             icon={<MessageCircle className="size-4" />} label="Conversas" active={activeTab === 'conversations'} onClick={() => setActiveTab('conversations')}
             badge={wa.conversations.reduce((s, c) => s + c.unreadCount, 0) > 0 ? String(wa.conversations.reduce((s, c) => s + c.unreadCount, 0)) : undefined}
           />
+          <NavItem icon={<Contact2 className="size-4" />} label="Contatos" active={activeTab === 'contacts'} onClick={() => setActiveTab('contacts')} />
           <NavItem icon={<Settings className="size-4" />} label="Configuracoes" active={activeTab === 'settings'} onClick={() => setActiveTab('settings')} />
         </div>
 
@@ -583,7 +901,26 @@ export default function HomePage() {
             onLogMessage={odoo.logMessage}
             isSyncing={wa.syncProgress?.isSyncing}
             syncProgress={wa.syncProgress?.progress}
+            waConnected={wa.status.connected}
+            onRefreshConversations={handleRefreshConversations}
+            onFetchConversationMessages={handleFetchConversationMessages}
+            onStartConversation={handleStartConversation}
+            isRefreshing={isRefreshing}
           />
+          </div>
+        )}
+
+        {activeTab === 'contacts' && (
+          <div className="flex-1 min-h-0 max-w-2xl mx-auto w-full">
+            <ContactsView
+              contacts={contacts}
+              conversations={wa.conversations}
+              waConnected={wa.status.connected}
+              onRefresh={handleRefreshConversations}
+              onStartConversation={handleStartConversation}
+              onSelectConversation={handleSelectConversation}
+              isRefreshing={isRefreshing}
+            />
           </div>
         )}
 

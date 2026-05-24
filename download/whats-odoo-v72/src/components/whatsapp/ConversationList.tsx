@@ -5,6 +5,14 @@ import { Input } from '@/components/ui/input'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from '@/components/ui/dialog'
 import { cn } from '@/lib/utils'
 import {
   Search,
@@ -13,6 +21,8 @@ import {
   Clock,
   Loader2,
   Users,
+  RefreshCcw,
+  Plus,
 } from 'lucide-react'
 
 interface ConversationListProps {
@@ -32,6 +42,10 @@ interface ConversationListProps {
   onSelect: (jid: string) => void
   isSyncing?: boolean
   syncProgress?: number
+  waConnected?: boolean
+  onRefresh?: () => void
+  onStartConversation?: (phone: string) => void
+  isRefreshing?: boolean
 }
 
 function formatTime(dateStr: string | null): string {
@@ -76,12 +90,81 @@ function truncateMessage(msg: string | null, maxLen = 45): string {
   return msg.slice(0, maxLen) + '...'
 }
 
+function NewConversationInlineDialog({
+  onStartConversation,
+  disabled,
+}: {
+  onStartConversation: (phone: string) => void
+  disabled: boolean
+}) {
+  const [open, setOpen] = useState(false)
+  const [phone, setPhone] = useState('')
+  const [isCreating, setIsCreating] = useState(false)
+
+  const handleCreate = async () => {
+    if (!phone.trim()) return
+    setIsCreating(true)
+    try {
+      await onStartConversation(phone.trim())
+      setPhone('')
+      setOpen(false)
+    } finally {
+      setIsCreating(false)
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DialogTrigger asChild>
+        <Button variant="ghost" size="icon" className="size-7 shrink-0" disabled={disabled} title="Nova conversa">
+          <Plus className="size-3.5" />
+        </Button>
+      </DialogTrigger>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <Phone className="size-4 text-primary" />
+            Nova Conversa
+          </DialogTitle>
+        </DialogHeader>
+        <div className="space-y-4 py-2">
+          <div className="space-y-2">
+            <label className="text-sm font-medium">Numero de telefone</label>
+            <Input
+              placeholder="Ex: 5511999999999 (somente numeros)"
+              value={phone}
+              onChange={(e) => setPhone(e.target.value.replace(/\D/g, ''))}
+              onKeyDown={(e) => { if (e.key === 'Enter') handleCreate() }}
+              className="text-sm"
+            />
+            <p className="text-xs text-muted-foreground">
+              Insira o numero completo com codigo do pais, sem espacos ou caracteres especiais.
+            </p>
+          </div>
+          <Button
+            onClick={handleCreate}
+            disabled={!phone.trim() || phone.length < 7 || isCreating}
+            className="w-full gap-2 bg-emerald-600 hover:bg-emerald-700 text-white"
+          >
+            {isCreating ? <Loader2 className="size-4 animate-spin" /> : <MessageCircle className="size-4" />}
+            {isCreating ? 'Criando...' : 'Iniciar Conversa'}
+          </Button>
+        </div>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 export function ConversationList({
   conversations,
   selectedJid,
   onSelect,
   isSyncing,
   syncProgress,
+  waConnected,
+  onRefresh,
+  onStartConversation,
+  isRefreshing,
 }: ConversationListProps) {
   const [searchQuery, setSearchQuery] = useState('')
 
@@ -116,9 +199,29 @@ export function ConversationList({
               </Badge>
             )}
           </div>
-          <span className="text-xs text-muted-foreground">
-            {contactCount} contatos{groupCount > 0 ? ` · ${groupCount} grupos` : ''}
-          </span>
+          <div className="flex items-center gap-1.5">
+            <span className="text-xs text-muted-foreground mr-1">
+              {contactCount} contatos{groupCount > 0 ? ` · ${groupCount} grupos` : ''}
+            </span>
+            {onRefresh && (
+              <Button
+                variant="ghost"
+                size="icon"
+                className="size-7 shrink-0"
+                onClick={onRefresh}
+                disabled={!waConnected || isRefreshing}
+                title="Atualizar conversas do aparelho"
+              >
+                <RefreshCcw className={cn("size-3.5", isRefreshing && "animate-spin")} />
+              </Button>
+            )}
+            {onStartConversation && (
+              <NewConversationInlineDialog
+                onStartConversation={onStartConversation}
+                disabled={!waConnected}
+              />
+            )}
+          </div>
         </div>
 
         {/* Sync progress */}
