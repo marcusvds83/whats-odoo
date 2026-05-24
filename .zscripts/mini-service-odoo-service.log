@@ -12,4 +12,4 @@ $ bun x tsx index.ts
 [Odoo Service] Server running on port 3002
 [Odoo Service] Auto-sync enabled: true
 [Odoo] No ODOO_URL/ODOO_DB/ODOO_USERNAME/ODOO_PASSWORD env vars set. Waiting for manual connection via UI.
-[Odoo IO] Client connected: AHM-26V-9ajI2IYJAAAB
+[Odoo IO] Client connected: O3XiFhloL8jr-S02AAAB

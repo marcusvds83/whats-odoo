@@ -1,0 +1,17 @@
+{
+  "name": "whatsapp-service",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "npx tsx index.ts"
+  },
+  "dependencies": {
+    "@hapi/boom": "^9.1.4",
+    "@whiskeysockets/baileys": "^6.7.8",
+    "node-cache": "^5.1.2",
+    "pino": "^9.5.0",
+    "socket.io": "^4.8.3",
+    "socket.io-client": "^4.8.3",
+    "tsx": "^4.19.0"
+  }
+}

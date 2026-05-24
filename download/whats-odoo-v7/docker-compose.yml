@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  # Next.js Frontend
+  web:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - DATABASE_URL=file:./dev.db
+      - NODE_ENV=development
+    depends_on:
+      - whatsapp-service
+      - odoo-service
+    volumes:
+      - .:/app
+      - /app/node_modules
+
+  # WhatsApp Baileys Service
+  whatsapp-service:
+    build:
+      context: ./mini-services/whatsapp-service
+      dockerfile: Dockerfile
+    ports:
+      - "3001:3001"
+    volumes:
+      - whatsapp-auth:/app/auth_store
+
+  # Odoo XML-RPC Service
+  odoo-service:
+    build:
+      context: ./mini-services/odoo-service
+      dockerfile: Dockerfile
+    ports:
+      - "3002:3002"
+
+volumes:
+  whatsapp-auth:
