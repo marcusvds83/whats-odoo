@@ -1,0 +1,28 @@
+{
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+        "content": "Esta tela é a **Dashboard** (painel principal) de uma aplicação web chamada **WA-Odoo** (v7.3 Middleware), que integra o WhatsApp com o Odoo. A interface é organizada da seguinte forma:  \n\n\n### 1. **Barra de Navegação (Topo)**  \n- **URL**: `whats-odoo.onrender.com` (indica que a aplicação está hospedada na plataforma Render).  \n- **Navegador**: Abas e controles padrão (voltar, atualizar, favoritos, etc.).  \n\n\n### 2. **Menu Lateral (Esquerda)**  \nContém opções de navegação:  \n- **Dashboard** (selecionado, em destaque).  \n- **WhatsApp**.  \n- **Conversas**.  \n- **Contatos**.  \n- **Configurações**.  \n\n\n### 3. **Conteúdo Principal (Centro)**  \n#### **Título e Descrição**  \n- **Título**: *Dashboard*  \n- **Subtítulo**: *Visão geral da integração WhatsApp e Odoo*  \n\n\n#### **Cards de Status (4 cards)**  \n- **WhatsApp**: *Reconectando...* (com subtítulo *Restaurando sessão salva*).  \n- **Odoo**: *Conectado* (com URL `https://3code-nexus.odoo.com`).  \n- **Conversas**: *1* (com subtítulo *0 não lidas · 0 grupos*).  \n- **Integração**: *Inativa* (com subtítulo *Conecte ambos para ativar*).  \n\n\n#### **Seções Adicionais**  \n- **Ações Rápidas**: Área vazia (provavelmente para ações rápidas futuras).  \n- **Como Funciona**: Passos para configurar a integração:  \n  1. *Conecte WhatsApp*: Escanear QR Code do WhatsApp Business (sessão salva automaticamente).  \n  2. *Configure Odoo*: Inserir credenciais do Odoo SaaS (URL, banco, usuário, senha).  \n  3. *Integre Conversas*: Vincular conversas a Contatos/Leads/Vendas/Projetos do Odoo (grupos para visualização, mas sem leads automáticos).  \n\n\n### 4. **Status de Conexão (Rodapé Lateral)**  \n- **WhatsApp**: *OFF* (desconectado).  \n- **Odoo**: *ON* (conectado).  \n\n\n### 5. **Barra de Tarefas (Rodapé do Sistema)**  \nMostra o horário (*15:26*), data (*24/05/2026*) e ícones de aplicativos do Windows.  \n\n\n### Resumo  \nA tela exibe o estado atual da integração (WhatsApp reconectando, Odoo conectado, conversas ativas, integração inativa) e fornece instruções para configurar a integração entre WhatsApp e Odoo. A interface é limpa, com cards informativos e um menu lateral para navegação.",
+        "role": "assistant"
+      }
+    }
+  ],
+  "created": 1779647623,
+  "id": "20260525023327d9bd6b18d2594875",
+  "model": "glm-4.6v",
+  "object": "chat.completion",
+  "request_id": "20260525023327d9bd6b18d2594875",
+  "usage": {
+    "completion_tokens": 673,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens": 1340,
+    "prompt_tokens_details": {
+      "cached_tokens": 4
+    },
+    "total_tokens": 2013
+  }
+}

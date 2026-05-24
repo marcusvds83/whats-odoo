@@ -1,0 +1,28 @@
+{
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+        "content": "O painel Odoo à direita da interface do WA-Odoo é uma seção de **gerenciamento de contatos e leads**, projetada para integrar e organizar informações de clientes ou prospects dentro do sistema Odoo. Abaixo, descrevo seus componentes detalhadamente:\n\n\n### **1. Barra de Navegação Superior (Top Bar)**\n- **Ícone e Nome do Módulo**: À esquerda, há um ícone verde com o texto \"Odoo\", indicando o módulo ativo (gerenciamento de contatos/leads do Odoo).  \n- **Status de Conexão**: Ao lado, o texto \"Conectado\" (em verde) confirma que a integração com o Odoo está ativa e funcionando.  \n- **Botão de Configurações**: À direita, um ícone de engrenagem (⚙️) abre um menu de configurações para ajustar preferências do módulo Odoo (ex: sincronização, campos personalizados).  \n\n\n### **2. Menu de Módulos (Tabs)**\nAbaixo da barra superior, há uma linha de **botões de navegação** que permitem alternar entre diferentes módulos do Odoo:  \n- **Contatos**: Ícone de pessoa (👤) + texto \"Contatos\" (destaque visual, indicando que este é o módulo ativo).  \n- **Leads**: Ícone de seta (➡️) + texto \"Leads\" (para acessar a lista de leads, prospects não qualificados).  \n- **Vendas**: Ícone de carrinho (🛒) + texto \"Vendas\" (para gerenciar o pipeline de vendas).  \n- **Projetos**: Ícone de projeto (📋) + texto \"Projetos\" (para acessar projetos relacionados aos contatos).  \n\n\n### **3. Barra de Busca**\n- **Placeholder**: \"Buscar contato por nome, telefone...\" (campo de texto para filtrar contatos/leads rapidamente).  \n- **Botão de Adição**: Um ícone de \"+\" à direita da barra de busca, que **permite criar novos contatos ou leads** (funcionalidade confirmada pela pergunta: \"Criar Contato\" e \"Criar Lead\" estão disponíveis aqui).  \n\n\n### **4. Lista de Contatos/Leads**\nA seção principal exibe uma lista de registros (contatos ou leads) com as seguintes informações para cada item:  \n- **Nome do Contato/Lead**: Ex: \"Admin 3Code Nexus\", \"CREDMAK INTERMEDIACOES LTDA\", \"Luiz Guiherme\", \"Marcus Vinicius\".  \n- **Tipo de Registro**: Rótulo \"Contato\" (em verde) para indicar que são contatos (não leads).  \n- **ID**: Número único (ex: \"ID: 3\", \"ID: 1\") para identificação interna.  \n- **Detalhes de Contato**:  \n  - Telefone (ex: \"55428883762\", \"+554196576109\").  \n  - E-mail (ex: \"credimak@gmail.com\", \"contato@3codexus.com.br\").  \n  - Outros campos (ex: \"luiaguiherme@3codexus.com.br\").  \n\n\n### **5. Botões de Ação (Criar Contato/Lead)**\n- **Botão \"Criar Contato\"**: Disponível via clique no ícone \"+\" da barra de busca ou, potencialmente, em um menu suspenso ao clicar no botão. Cria um novo registro de contato no Odoo.  \n- **Botão \"Criar Lead\"**: Disponível via clique no ícone \"+\" da barra de busca (se o módulo \"Leads\" estiver ativo) ou em um menu suspenso. Cria um novo lead (prospect) no Odoo.  \n\n\n### **Resumo dos Botões Existentes**\n- **Navegação**: Contatos, Leads, Vendas, Projetos.  \n- **Busca**: Barra de busca + botão de adição (\"+\").  \n- **Configurações**: Ícone de engrenagem.  \n- **Criação**: Botões \"Criar Contato\" e \"Criar Lead\" (via ícone \"+\").  \n\n\nEste painel serve como uma **interface de integração** entre o WhatsApp (esquerda) e o Odoo (direita), permitindo que usuários gerenciem contatos/leads diretamente a partir das conversas do WhatsApp, com acesso rápido a criação, busca e navegação entre módulos do Odoo.",
+        "role": "assistant"
+      }
+    }
+  ],
+  "created": 1779647948,
+  "id": "202605250238412bcb2bf5551f473e",
+  "model": "glm-4.6v",
+  "object": "chat.completion",
+  "request_id": "202605250238412bcb2bf5551f473e",
+  "usage": {
+    "completion_tokens": 1019,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens": 1376,
+    "prompt_tokens_details": {
+      "cached_tokens": 7
+    },
+    "total_tokens": 2395
+  }
+}

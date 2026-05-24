@@ -1,0 +1,28 @@
+{
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+        "content": "A lista de conversas à esquerda exibe a seção \"Conversas\" do aplicativo WA-Odoo.  \n\n### Conversas e grupos:  \n- Apenas **uma conversa** aparece, com o número de telefone `554196578109` (e um avatar de perfil).  \n- Não há grupos visíveis na lista.  \n\n\n### Botões no topo da lista:  \nNo topo da lista de conversas, existem dois botões:  \n- **\"Atualizar\"** (ícone de seta circular, para recarregar as conversas).  \n- **\"Trazer do Aparelho\"** (ícone de download, para sincronizar conversas do dispositivo).  \n\n\nResumindo: A lista mostra uma única conversa (sem grupos), e os botões \"Atualizar\" e \"Trazer do Aparelho\" estão presentes no topo.",
+        "role": "assistant"
+      }
+    }
+  ],
+  "created": 1779647961,
+  "id": "20260525023914130d47bbd3044af7",
+  "model": "glm-4.6v",
+  "object": "chat.completion",
+  "request_id": "20260525023914130d47bbd3044af7",
+  "usage": {
+    "completion_tokens": 193,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens": 1386,
+    "prompt_tokens_details": {
+      "cached_tokens": 7
+    },
+    "total_tokens": 1579
+  }
+}

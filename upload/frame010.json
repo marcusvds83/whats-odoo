@@ -1,0 +1,28 @@
+{
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+        "content": "### Descrição da Tela e Estado Atual  \nA tela exibe o **painel de gerenciamento do middleware WhatsApp-Odoo**, com o seguinte estado:  \n\n- **Conexão WhatsApp**: Indica que o WhatsApp está **conectado e pronto para uso** (mensagem verde \"Conectado\" e ícone de Wi-Fi).  \n- **Usuário**: Exibe o perfil de \"Marcus Kako\" (com foto de perfil e número `554196578109:77`).  \n- **Status**: \"Ativo\" (verde).  \n- **Sessão**: \"Salva automaticamente\" (verde).  \n- **Auto-reconectar**: \"Sim - ao reiniciar o middleware\" (verde).  \n- **Botões de ação**:  \n  - \"Desconectar (manter sessão)\": Permite desconectar o middleware sem apagar a sessão (sessão é mantida).  \n  - \"Sair do WhatsApp (apagar sessão)\": Permite sair do WhatsApp e apagar a sessão atual.  \n\n\n### Problemas Visíveis  \nNenhum problema **visível** é apresentado na interface:  \n- A conexão está ativa (ícones e mensagens em verde confirmam funcionamento).  \n- As configurações de sessão (salva automaticamente, auto-reconectar) estão corretas.  \n- Botões de ação estão disponíveis e funcionais.  \n\n\n**Conclusão**: A tela está em um estado **saudável e operacional**, sem indicativos de erros ou falhas visíveis. O middleware está conectado e pronto para uso.",
+        "role": "assistant"
+      }
+    }
+  ],
+  "created": 1779647641,
+  "id": "20260525023349ae5dca5966054824",
+  "model": "glm-4.6v",
+  "object": "chat.completion",
+  "request_id": "20260525023349ae5dca5966054824",
+  "usage": {
+    "completion_tokens": 351,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens": 1357,
+    "prompt_tokens_details": {
+      "cached_tokens": 4
+    },
+    "total_tokens": 1708
+  }
+}
