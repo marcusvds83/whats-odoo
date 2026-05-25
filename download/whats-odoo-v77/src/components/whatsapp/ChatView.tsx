@@ -22,7 +22,6 @@ import {
   Clock,
   MessageSquare,
   ArrowDown,
-  Users,
 } from 'lucide-react'
 
 interface ChatViewProps {
@@ -32,8 +31,6 @@ interface ChatViewProps {
     phone: string | null
     pushName: string | null
     avatarUrl: string | null
-    isGroup?: boolean
-    groupName?: string | null
   } | null
   messages: Array<{
     id: string
@@ -43,7 +40,6 @@ interface ChatViewProps {
     mediaType: string | null
     timestamp: string
     status: string
-    senderName?: string | null
   }>
   onSendMessage: (jid: string, text: string) => Promise<boolean>
   onMarkRead: (jid: string) => void
@@ -55,7 +51,6 @@ function formatMessageTime(dateStr: string): string {
 
 function formatMessageDate(dateStr: string): string {
   const date = new Date(dateStr)
-  if (isNaN(date.getTime())) return ''
   const now = new Date()
   const diffDays = Math.floor((now.getTime() - date.getTime()) / (1000 * 60 * 60 * 24))
   if (diffDays === 0) return 'Hoje'
@@ -99,10 +94,7 @@ function getMessageStatusIcon(status: string, fromMe: boolean) {
 
 function shouldShowDateDivider(currentMsg: { timestamp: string }, prevMsg: { timestamp: string } | undefined): boolean {
   if (!prevMsg) return true
-  const currDate = new Date(currentMsg.timestamp)
-  const prevDate = new Date(prevMsg.timestamp)
-  if (isNaN(currDate.getTime()) || isNaN(prevDate.getTime())) return false
-  return currDate.toDateString() !== prevDate.toDateString()
+  return new Date(currentMsg.timestamp).toDateString() !== new Date(prevMsg.timestamp).toDateString()
 }
 
 export function ChatView({
@@ -128,9 +120,12 @@ export function ChatView({
     if (conversation) onMarkRead(conversation.jid)
   }, [conversation?.jid, onMarkRead])
 
+  // Track scroll position for scroll-to-bottom button
   useEffect(() => {
+    // The ScrollArea viewport is the element with data-slot="scroll-area-viewport"
     const viewport = scrollViewportRef.current?.querySelector('[data-slot="scroll-area-viewport"]') as HTMLElement | null
     if (!viewport) return
+
     const handleScroll = () => {
       const { scrollTop, scrollHeight, clientHeight } = viewport
       setShowScrollButton(scrollHeight - scrollTop - clientHeight > 150)
@@ -156,10 +151,7 @@ export function ChatView({
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() }
   }
 
-  const isGroup = conversation?.isGroup || false
-  const displayName = isGroup
-    ? (conversation?.groupName || conversation?.name || 'Grupo')
-    : (conversation?.name || conversation?.pushName || conversation?.phone || conversation?.jid?.split('@')[0] || '')
+  const displayName = conversation?.name || conversation?.pushName || conversation?.phone || conversation?.jid?.split('@')[0] || ''
 
   if (!conversation) {
     return (
@@ -182,26 +174,16 @@ export function ChatView({
       {/* Header — fixed */}
       <div className="shrink-0 border-b bg-background/95 backdrop-blur">
         <div className="flex items-center gap-3 px-4 py-3">
-          <Avatar className={cn('size-10', isGroup && 'rounded-lg')}>
+          <Avatar className="size-10">
             {conversation.avatarUrl && <AvatarImage src={conversation.avatarUrl} alt={displayName} />}
-            <AvatarFallback className={cn(
-              'text-sm font-medium',
-              isGroup
-                ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300 rounded-lg'
-                : 'bg-primary/10 text-primary'
-            )}>
-              {isGroup ? <Users className="size-5" /> : (displayName.split(' ').map(w => w[0]).filter(Boolean).slice(0, 2).join('').toUpperCase() || <User className="size-4" />)}
+            <AvatarFallback className="bg-primary/10 text-primary text-sm">
+              {displayName.split(' ').map(w => w[0]).filter(Boolean).slice(0, 2).join('').toUpperCase() || <User className="size-4" />}
             </AvatarFallback>
           </Avatar>
           <div className="flex-1 min-w-0">
-            <div className="flex items-center gap-1.5">
-              {isGroup && <Users className="size-3.5 text-emerald-500 shrink-0" />}
-              <h3 className="font-semibold text-sm truncate">{displayName}</h3>
-            </div>
+            <h3 className="font-semibold text-sm truncate">{displayName}</h3>
             <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-              {isGroup ? (
-                <span className="text-emerald-600 dark:text-emerald-400">Grupo</span>
-              ) : conversation.phone ? (
+              {conversation.phone ? (
                 <><Phone className="size-3" /><span>{conversation.phone}</span></>
               ) : (
                 <span>{conversation.jid.split('@')[0]}</span>
@@ -245,12 +227,6 @@ export function ChatView({
                         message.fromMe ? 'bg-emerald-600 text-white rounded-br-md' : 'bg-muted rounded-bl-md',
                         isConsecutive && (message.fromMe ? 'rounded-br-md' : 'rounded-bl-md')
                       )}>
-                        {/* Group sender name */}
-                        {isGroup && !message.fromMe && message.senderName && !isConsecutive && (
-                          <p className="text-[11px] font-semibold text-emerald-600 dark:text-emerald-400 mb-0.5">
-                            {message.senderName}
-                          </p>
-                        )}
                         {message.mediaType && message.mediaType !== '' && (
                           <div className={cn('flex items-center gap-2 mb-1 px-2 py-1.5 rounded-lg text-xs', message.fromMe ? 'bg-emerald-500/50' : 'bg-background/50')}>
                             {getMediaIcon(message.mediaType)}
@@ -290,7 +266,7 @@ export function ChatView({
       <Separator />
       <div className="shrink-0 px-4 py-3 bg-background">
         <div className="flex items-center gap-2">
-          <Input ref={inputRef} placeholder={isGroup ? "Mensagem para o grupo..." : "Digite uma mensagem..."} className="flex-1 h-10 text-sm" value={inputText} onChange={(e) => setInputText(e.target.value)} onKeyDown={handleKeyDown} disabled={isSending} />
+          <Input ref={inputRef} placeholder="Digite uma mensagem..." className="flex-1 h-10 text-sm" value={inputText} onChange={(e) => setInputText(e.target.value)} onKeyDown={handleKeyDown} disabled={isSending} />
           <Button size="icon" className="size-10 shrink-0 rounded-full bg-emerald-600 hover:bg-emerald-700 text-white" onClick={handleSend} disabled={!inputText.trim() || isSending}>
             {isSending ? <span className="size-4 border-2 border-white/30 border-t-white rounded-full animate-spin" /> : <Send className="size-4" />}
           </Button>

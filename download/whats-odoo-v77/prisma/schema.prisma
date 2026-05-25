@@ -9,10 +9,10 @@ datasource db {
 
 model OdooConfig {
   id        String   @id @default(cuid())
-  url       String
-  db        String
-  username  String
-  password  String
+  url       String   // Odoo instance URL
+  db        String   // Database name
+  username  String   // Odoo username
+  password  String   // Odoo password/API key
   active    Boolean  @default(true)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -20,11 +20,11 @@ model OdooConfig {
 
 model WhatsAppSession {
   id        String   @id @default(cuid())
-  sessionId String   @unique
-  phone     String?
-  name      String?
-  pushName  String?
-  avatarUrl String?
+  sessionId String   @unique // WhatsApp session ID (jid)
+  phone     String?  // Phone number
+  name      String?  // Contact name
+  pushName  String?  // WhatsApp display name
+  avatarUrl String?  // Profile picture URL
   isActive  Boolean  @default(true)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -32,19 +32,20 @@ model WhatsAppSession {
 
 model Conversation {
   id             String   @id @default(cuid())
-  jid            String   @unique
-  contactName    String?
-  contactPhone   String?
-  pushName       String?
-  avatarUrl      String?
-  lastMessage    String?
-  lastMessageAt  DateTime?
+  jid            String   @unique // WhatsApp JID (e.g., 5511999@s.whatsapp.net)
+  contactName    String?  // Contact name from WhatsApp
+  contactPhone   String?  // Phone number extracted from JID
+  pushName       String?  // WhatsApp push name
+  avatarUrl      String?  // Profile picture
+  lastMessage    String?  // Preview of last message
+  lastMessageAt  DateTime?// Timestamp of last message
   unreadCount    Int      @default(0)
-  odooPartnerId  Int?
-  odooLeadId     Int?
-  odooSaleId     Int?
-  odooProjectId  Int?
-  odooTaskId     Int?
+  // Odoo integration
+  odooPartnerId  Int?     // Linked res.partner ID
+  odooLeadId     Int?     // Linked crm.lead ID
+  odooSaleId     Int?     // Linked sale.order ID
+  odooProjectId  Int?     // Linked project.project ID
+  odooTaskId     Int?     // Linked project.task ID
   isActive       Boolean  @default(true)
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
@@ -53,19 +54,20 @@ model Conversation {
 
 model Message {
   id             String   @id @default(cuid())
-  conversationId String
-  whatsappId     String?
-  fromMe         Boolean
-  textContent    String?
-  mediaType      String?
-  mediaUrl       String?
-  mediaBase64    String?
-  fileName       String?
-  mimeType       String?
-  timestamp      DateTime
-  status         String   @default("delivered")
-  syncedToOdoo   Boolean  @default(false)
-  odooMailId     Int?
+  conversationId String   // FK to Conversation
+  whatsappId     String?  // WhatsApp message ID
+  fromMe         Boolean  // true = sent by us, false = received
+  textContent    String?  // Text content of the message
+  mediaType      String?  // image, video, audio, document, sticker
+  mediaUrl       String?  // URL to media file if any
+  mediaBase64    String?  // Base64 of media (for small files)
+  fileName       String?  // Original filename for documents
+  mimeType       String?  // MIME type
+  timestamp      DateTime // Message timestamp from WhatsApp
+  status         String   @default("delivered") // sent, delivered, read, failed
+  // Odoo integration
+  syncedToOdoo   Boolean  @default(false) // Whether message was logged in Odoo
+  odooMailId     Int?     // mail.message ID in Odoo
   createdAt      DateTime @default(now())
   conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
 
@@ -75,12 +77,12 @@ model Message {
 
 model OdooSyncLog {
   id          String   @id @default(cuid())
-  model       String
-  recordId    Int
-  action      String
-  status      String
-  message     String?
-  payload     String?
+  model       String   // res.partner, crm.lead, sale.order, project.task
+  recordId    Int      // Odoo record ID
+  action      String   // create, write, link
+  status      String   // success, error
+  message     String?  // Error message or description
+  payload     String?  // JSON of sent data
   createdAt   DateTime @default(now())
 
   @@index([model])

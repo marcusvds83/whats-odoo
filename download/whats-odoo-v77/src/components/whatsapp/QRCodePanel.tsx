@@ -26,7 +26,6 @@ import {
   XCircle,
   Smartphone,
   RefreshCcw,
-  Power,
 } from 'lucide-react'
 
 interface QRCodePanelProps {
@@ -35,7 +34,6 @@ interface QRCodePanelProps {
   me: { id: string; name?: string; profilePicUrl?: string } | null
   onRequestQR: () => void
   onDisconnect: () => void
-  onLogout: () => void
   isConnected: boolean
 }
 
@@ -45,13 +43,10 @@ export function QRCodePanel({
   me,
   onRequestQR,
   onDisconnect,
-  onLogout,
   isConnected,
 }: QRCodePanelProps) {
   const [isRequesting, setIsRequesting] = useState(false)
   const [isDisconnecting, setIsDisconnecting] = useState(false)
-  const [isLoggingOut, setIsLoggingOut] = useState(false)
-  const [showLogoutConfirm, setShowLogoutConfirm] = useState(false)
 
   const hasSession = status.hasSession ?? false
   const isReconnecting = !isConnected && hasSession && status.reason === 'reconnecting'
@@ -71,16 +66,6 @@ export function QRCodePanel({
       await onDisconnect()
     } finally {
       setIsDisconnecting(false)
-    }
-  }
-
-  const handleLogout = async () => {
-    setIsLoggingOut(true)
-    try {
-      await onLogout()
-      setShowLogoutConfirm(false)
-    } finally {
-      setIsLoggingOut(false)
     }
   }
 
@@ -118,9 +103,15 @@ export function QRCodePanel({
   }
 
   const getStatusIcon = () => {
-    if (isConnected) return <Wifi className="size-5 text-emerald-500" />
-    if (isReconnecting) return <RefreshCcw className="size-5 text-amber-500 animate-spin" />
-    if (qrCode) return <Loader2 className="size-5 text-amber-500 animate-spin" />
+    if (isConnected) {
+      return <Wifi className="size-5 text-emerald-500" />
+    }
+    if (isReconnecting) {
+      return <RefreshCcw className="size-5 text-amber-500 animate-spin" />
+    }
+    if (qrCode) {
+      return <Loader2 className="size-5 text-amber-500 animate-spin" />
+    }
     return <WifiOff className="size-5 text-muted-foreground" />
   }
 
@@ -159,13 +150,10 @@ export function QRCodePanel({
             {status.reason === 'reconnecting' && (
               <p className="text-xs text-muted-foreground truncate">Tentando restaurar sessao salva...</p>
             )}
-            {status.reason === 'disconnected_by_user' && (
-              <p className="text-xs text-muted-foreground truncate">Desconectado por voce. Sessao preservada.</p>
-            )}
           </div>
         </div>
 
-        {/* Reconnecting State */}
+        {/* Reconnecting State - Show waiting message instead of QR */}
         {isReconnecting && !qrCode && (
           <div className="flex flex-col items-center gap-4 py-8">
             <div className="size-20 rounded-full bg-amber-50 dark:bg-amber-950/30 flex items-center justify-center">
@@ -174,7 +162,7 @@ export function QRCodePanel({
             <div className="text-center space-y-1">
               <p className="text-sm font-medium">Restaurando sessao...</p>
               <p className="text-xs text-muted-foreground max-w-[280px]">
-                Sua sessao anterior esta sendo restaurada automaticamente. Se o aparelho ainda estiver conectado, isso deve levar alguns segundos.
+                Sua sessao anterior esta sendo restaurada. Se o aparelho ainda estiver conectado, isso deve levar alguns segundos.
               </p>
             </div>
           </div>
@@ -205,6 +193,10 @@ export function QRCodePanel({
             {/* Connected Info */}
             <div className="space-y-2">
               <div className="flex items-center justify-between text-sm">
+                <span className="text-muted-foreground">WhatsApp ID</span>
+                <span className="font-mono text-xs">{me.id}</span>
+              </div>
+              <div className="flex items-center justify-between text-sm">
                 <span className="text-muted-foreground">Status</span>
                 <span className="text-emerald-600 dark:text-emerald-400 font-medium">Ativo</span>
               </div>
@@ -212,75 +204,29 @@ export function QRCodePanel({
                 <span className="text-muted-foreground">Sessao</span>
                 <span className="text-emerald-600 dark:text-emerald-400 font-medium text-xs">Salva automaticamente</span>
               </div>
-              <div className="flex items-center justify-between text-sm">
-                <span className="text-muted-foreground">Auto-reconectar</span>
-                <span className="text-emerald-600 dark:text-emerald-400 font-medium text-xs">Sim - ao reabrir o middleware</span>
-              </div>
             </div>
 
             <Separator />
 
-            {/* Disconnect/Logout Buttons */}
-            <div className="space-y-2">
-              <Button
-                variant="outline"
-                className="w-full border-amber-300 text-amber-700 hover:bg-amber-50 dark:border-amber-700 dark:text-amber-400 dark:hover:bg-amber-950/30"
-                onClick={handleDisconnect}
-                disabled={isDisconnecting}
-              >
-                {isDisconnecting ? (
-                  <>
-                    <Loader2 className="size-4 animate-spin" />
-                    Desconectando...
-                  </>
-                ) : (
-                  <>
-                    <Power className="size-4" />
-                    Desconectar (manter sessao)
-                  </>
-                )}
-              </Button>
-              <p className="text-[10px] text-muted-foreground text-center">
-                Desconecta do middleware, mas a sessao fica salva. Ao reabrir, reconecta automaticamente.
-              </p>
-
-              {!showLogoutConfirm ? (
-                <Button
-                  variant="ghost"
-                  className="w-full text-destructive hover:text-destructive hover:bg-destructive/10"
-                  onClick={() => setShowLogoutConfirm(true)}
-                >
-                  <LogOut className="size-4" />
-                  Sair do WhatsApp (apagar sessao)
-                </Button>
+            {/* Disconnect Button */}
+            <Button
+              variant="destructive"
+              className="w-full"
+              onClick={handleDisconnect}
+              disabled={isDisconnecting}
+            >
+              {isDisconnecting ? (
+                <>
+                  <Loader2 className="size-4 animate-spin" />
+                  Desconectando...
+                </>
               ) : (
-                <div className="space-y-2 p-3 border border-destructive/30 rounded-lg bg-destructive/5">
-                  <p className="text-xs text-destructive font-medium">
-                    Tem certeza? Isso apaga a sessao e voce precisara escanear o QR code novamente.
-                  </p>
-                  <div className="flex gap-2">
-                    <Button
-                      variant="destructive"
-                      size="sm"
-                      className="flex-1"
-                      onClick={handleLogout}
-                      disabled={isLoggingOut}
-                    >
-                      {isLoggingOut ? <Loader2 className="size-3 animate-spin" /> : <LogOut className="size-3" />}
-                      Sim, sair
-                    </Button>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="flex-1"
-                      onClick={() => setShowLogoutConfirm(false)}
-                    >
-                      Cancelar
-                    </Button>
-                  </div>
-                </div>
+                <>
+                  <LogOut className="size-4" />
+                  Desconectar WhatsApp
+                </>
               )}
-            </div>
+            </Button>
           </div>
         ) : !isReconnecting ? (
           <div className="space-y-4">
@@ -296,6 +242,7 @@ export function QRCodePanel({
                     fgColor="#111827"
                     includeMargin={false}
                   />
+                  {/* Subtle pulse animation around QR */}
                   <div className="absolute inset-0 rounded-xl border-2 border-primary/20 animate-pulse pointer-events-none" />
                 </div>
                 <div className="text-center space-y-1">

@@ -13,11 +13,12 @@ import type {
   OdooRecord,
 } from '@/lib/types'
 
-// ========== Auto-Sync Types (REMOVED: autoPostMessages) ==========
+// ========== Auto-Sync Types ==========
 export interface AutoSyncSettings {
   enabled: boolean
   autoCreateContact: boolean
   autoCreateLead: boolean
+  autoPostMessages: boolean
   autoCreateActivity: boolean
   leadPrefix: string
   leadTeamId: number | null
@@ -28,6 +29,8 @@ export interface AutoSyncResult {
   phone: string
   partnerId: number | null
   leadId: number | null
+  mailMessageId: number | null
+  activityId: number | null
   created: { partner: boolean; lead: boolean }
   errors: string[]
 }
@@ -40,6 +43,7 @@ export function useOdoo() {
     enabled: true,
     autoCreateContact: true,
     autoCreateLead: true,
+    autoPostMessages: true,
     autoCreateActivity: true,
     leadPrefix: '[WhatsApp] ',
     leadTeamId: null,
@@ -82,6 +86,7 @@ export function useOdoo() {
       console.log('[Odoo] Conversation linked:', data)
     })
 
+    // Auto-sync events
     socket.on('odoo:autosync:settings', (data: AutoSyncSettings) => {
       console.log('[Odoo] Auto-sync settings:', data)
       setAutoSyncSettings(data)
@@ -113,6 +118,7 @@ export function useOdoo() {
     })
   }, [])
 
+  // ===== Auto-Sync Settings =====
   const updateAutoSyncSettings = useCallback((settings: Partial<AutoSyncSettings>): Promise<{ success: boolean; settings?: AutoSyncSettings; error?: string }> => {
     return new Promise((resolve) => {
       socketRef.current?.emit('odoo:autosync:update-settings', settings, (response: any) => {
@@ -129,6 +135,7 @@ export function useOdoo() {
     })
   }, [])
 
+  // ===== Contacts =====
   const searchContacts = useCallback((query?: string, limit?: number): Promise<{ success: boolean; data?: OdooContact[]; error?: string }> => {
     return new Promise((resolve) => {
       socketRef.current?.emit('odoo:contacts:search', { query, limit }, (response: any) => {
@@ -153,6 +160,7 @@ export function useOdoo() {
     })
   }, [])
 
+  // ===== Leads =====
   const searchLeads = useCallback((query?: string, limit?: number): Promise<{ success: boolean; data?: OdooLead[]; error?: string }> => {
     return new Promise((resolve) => {
       socketRef.current?.emit('odoo:leads:search', { query, limit }, (response: any) => {
@@ -169,6 +177,7 @@ export function useOdoo() {
     })
   }, [])
 
+  // ===== Sales =====
   const searchSales = useCallback((query?: string, limit?: number): Promise<{ success: boolean; data?: OdooSale[]; error?: string }> => {
     return new Promise((resolve) => {
       socketRef.current?.emit('odoo:sales:search', { query, limit }, (response: any) => {
@@ -185,6 +194,7 @@ export function useOdoo() {
     })
   }, [])
 
+  // ===== Projects =====
   const searchProjects = useCallback((limit?: number): Promise<{ success: boolean; data?: OdooProject[]; error?: string }> => {
     return new Promise((resolve) => {
       socketRef.current?.emit('odoo:projects:list', { limit }, (response: any) => {
@@ -209,6 +219,7 @@ export function useOdoo() {
     })
   }, [])
 
+  // ===== Link & Log =====
   const linkConversation = useCallback((data: { jid: string; model: string; recordId: number; phone?: string }): Promise<{ success: boolean; error?: string }> => {
     return new Promise((resolve) => {
       socketRef.current?.emit('odoo:link-conversation', data, (response: any) => {
@@ -225,6 +236,7 @@ export function useOdoo() {
     })
   }, [])
 
+  // ===== Generic =====
   const genericSearch = useCallback((data: { model: string; domain: any[]; fields?: string[]; limit?: number }): Promise<{ success: boolean; data?: any[]; error?: string }> => {
     return new Promise((resolve) => {
       socketRef.current?.emit('odoo:search', data, (response: any) => {
@@ -249,6 +261,7 @@ export function useOdoo() {
     })
   }, [])
 
+  // ===== Teams & Users =====
   const searchTeams = useCallback((limit?: number): Promise<{ success: boolean; data?: any[]; error?: string }> => {
     return new Promise((resolve) => {
       socketRef.current?.emit('odoo:teams:search', { limit }, (response: any) => {
@@ -270,25 +283,33 @@ export function useOdoo() {
     isConnected,
     authenticate,
     disconnect,
+    // Auto-sync
     autoSyncSettings,
     lastSyncResult,
     updateAutoSyncSettings,
     getAutoSyncSettings,
+    // Contacts
     searchContacts,
     createContact,
     searchOrCreateContact,
+    // Leads
     searchLeads,
     createLead,
+    // Sales
     searchSales,
     createSale,
+    // Projects
     searchProjects,
     searchTasks,
     createTask,
+    // Link & Log
     linkConversation,
     logMessage,
+    // Generic
     genericSearch,
     genericRead,
     genericWrite,
+    // Teams & Users
     searchTeams,
     searchUsers,
   }

@@ -344,34 +344,6 @@ export function OdooLinkPanel({
 
   return (
     <div className="flex h-full flex-col">
-      {/* Prominent Action Buttons — Criar Contato & Criar Lead */}
-      <div className="border-b p-3 space-y-2">
-        <div className="flex items-center gap-2">
-          <Button
-            className="flex-1 h-9 gap-1.5 bg-blue-600 hover:bg-blue-700 text-white"
-            onClick={() => {
-              setActiveTab('contacts')
-              setCreateDialogOpen(true)
-            }}
-            disabled={!odooConnected}
-          >
-            <User className="size-4" />
-            Criar Contato
-          </Button>
-          <Button
-            className="flex-1 h-9 gap-1.5 bg-orange-500 hover:bg-orange-600 text-white"
-            onClick={() => {
-              setActiveTab('leads')
-              setCreateDialogOpen(true)
-            }}
-            disabled={!odooConnected}
-          >
-            <TrendingUp className="size-4" />
-            Criar Lead
-          </Button>
-        </div>
-      </div>
-
       {/* Linked Records Summary */}
       {linkedRecords.length > 0 && (
         <div className="border-b p-3">

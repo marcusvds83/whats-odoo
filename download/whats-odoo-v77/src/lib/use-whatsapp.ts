@@ -7,7 +7,6 @@ import type {
   WhatsAppMessage,
   WhatsAppStatus,
   WhatsAppMe,
-  WhatsAppContact,
 } from '@/lib/types'
 
 export interface OdooSyncInfo {
@@ -15,6 +14,8 @@ export interface OdooSyncInfo {
   phone: string
   partnerId: number | null
   leadId: number | null
+  mailMessageId: number | null
+  activityId: number | null
   created: { partner: boolean; lead: boolean }
   errors: string[]
 }
@@ -28,6 +29,9 @@ export interface SyncProgress {
   messagesCount?: number
 }
 
+/**
+ * Sort conversations by date (most recent first)
+ */
 function sortConversations(convs: WhatsAppConversation[]): WhatsAppConversation[] {
   return [...convs].sort((a, b) => {
     const tA = a.lastMessageAt ? new Date(a.lastMessageAt).getTime() : 0
@@ -46,7 +50,8 @@ export function useWhatsApp() {
   const [currentJid, setCurrentJid] = useState<string | null>(null)
   const [isConnected, setIsConnected] = useState(false)
   const [syncProgress, setSyncProgress] = useState<SyncProgress | null>(null)
-  const [contacts, setContacts] = useState<WhatsAppContact[]>([])
+
+  // Odoo sync state per conversation
   const [odooSyncMap, setOdooSyncMap] = useState<Map<string, OdooSyncInfo>>(new Map())
 
   useEffect(() => {
@@ -57,7 +62,7 @@ export function useWhatsApp() {
       reconnectionAttempts: Infinity,
       reconnectionDelay: 2000,
       reconnectionDelayMax: 10000,
-      timeout: 20000,
+      timeout: 15000,
     })
 
     socketRef.current = socket
@@ -75,7 +80,9 @@ export function useWhatsApp() {
     socket.on('whatsapp:status', (data: WhatsAppStatus & { hasSession?: boolean }) => {
       console.log('[WhatsApp] Status:', data)
       setStatus(data)
-      if (data.connected) setQrCode(null)
+      if (data.connected) {
+        setQrCode(null)
+      }
     })
 
     socket.on('whatsapp:qr', (data: { qr: string }) => {
@@ -88,14 +95,17 @@ export function useWhatsApp() {
     })
 
     socket.on('whatsapp:conversations', (data: WhatsAppConversation[]) => {
+      // Sort conversations by date (most recent first) and filter out any invalid ones
       const filtered = data.filter(c => {
-        return c.isGroup || (c.phone && /^\d{7,}$/.test(c.phone))
+        // Only accept contacts with phone numbers
+        return c.phone && /^\d{7,}$/.test(c.phone)
       })
       setConversations(sortConversations(filtered))
     })
 
     socket.on('whatsapp:conversation:update', (data: WhatsAppConversation) => {
-      if (!data.isGroup && (!data.phone || !/^\d{7,}$/.test(data.phone))) return
+      // Filter out invalid JIDs
+      if (!data.phone || !/^\d{7,}$/.test(data.phone)) return
 
       setConversations(prev => {
         const idx = prev.findIndex(c => c.jid === data.jid)
@@ -112,7 +122,8 @@ export function useWhatsApp() {
       if (data.conversationJid === currentJid) {
         setCurrentMessages(prev => [...prev, data.message])
       }
-      if (data.conversation && (data.conversation.isGroup || (data.conversation.phone && /^\d{7,}$/.test(data.conversation.phone)))) {
+      // Update conversation in list
+      if (data.conversation && data.conversation.phone && /^\d{7,}$/.test(data.conversation.phone)) {
         setConversations(prev => {
           const idx = prev.findIndex(c => c.jid === data.conversationJid)
           if (idx >= 0) {
@@ -125,14 +136,17 @@ export function useWhatsApp() {
       }
     })
 
+    // Sync progress events
     socket.on('whatsapp:sync-progress', (data: SyncProgress) => {
       console.log('[WhatsApp] Sync progress:', data)
       setSyncProgress(data)
       if (!data.isSyncing) {
-        setTimeout(() => setSyncProgress(null), 5000)
+        // Clear sync progress after a delay
+        setTimeout(() => setSyncProgress(null), 3000)
       }
     })
 
+    // Odoo sync events (from WhatsApp service forwarding)
     socket.on('whatsapp:odoo-sync', (data: OdooSyncInfo) => {
       console.log('[WhatsApp] Odoo sync:', data)
       setOdooSyncMap(prev => {
@@ -145,7 +159,7 @@ export function useWhatsApp() {
     return () => {
       socket.disconnect()
     }
-  }, [currentJid])
+  }, []) // Remove currentJid from deps to avoid re-creating socket
 
   const requestQR = useCallback(() => {
     socketRef.current?.emit('whatsapp:request-qr')
@@ -179,14 +193,6 @@ export function useWhatsApp() {
     })
   }, [])
 
-  const logout = useCallback((): Promise<boolean> => {
-    return new Promise((resolve) => {
-      socketRef.current?.emit('whatsapp:logout', (response: { success: boolean }) => {
-        resolve(response.success)
-      })
-    })
-  }, [])
-
   const getProfilePic = useCallback((jid: string): Promise<string | null> => {
     return new Promise((resolve) => {
       socketRef.current?.emit('whatsapp:get-profile-pic', { jid }, (response: { success: boolean; url?: string | null }) => {
@@ -199,46 +205,24 @@ export function useWhatsApp() {
     return odooSyncMap.get(jid) || null
   }, [odooSyncMap])
 
-  const refreshConversations = useCallback((): Promise<{ success: boolean; refreshed?: number; error?: string }> => {
-    return new Promise((resolve) => {
-      socketRef.current?.emit('whatsapp:refresh-conversations', (response: { success: boolean; refreshed?: number; error?: string }) => {
-        resolve(response)
-      })
-    })
-  }, [])
-
-  const startNewConversation = useCallback((phone: string): Promise<{ success: boolean; jid?: string; conversation?: WhatsAppConversation; error?: string }> => {
-    return new Promise((resolve) => {
-      socketRef.current?.emit('whatsapp:start-conversation', { phone }, (response: { success: boolean; jid?: string; conversation?: WhatsAppConversation; error?: string }) => {
-        resolve(response)
-      })
-    })
-  }, [])
-
-  const getAllContacts = useCallback((): Promise<{ success: boolean; contacts?: WhatsAppContact[]; error?: string }> => {
-    return new Promise((resolve) => {
-      socketRef.current?.emit('whatsapp:get-contacts', (response: { success: boolean; contacts?: WhatsAppContact[]; error?: string }) => {
-        if (response.success && response.contacts) {
-          setContacts(response.contacts)
-        }
-        resolve(response)
-      })
-    })
-  }, [])
-
-  const forceFullSync = useCallback((): Promise<{ success: boolean; message?: string; error?: string }> => {
-    return new Promise((resolve) => {
-      socketRef.current?.emit('whatsapp:force-full-sync', (response: { success: boolean; message?: string; error?: string }) => {
-        resolve(response)
-      })
-    })
-  }, [])
-
   return {
-    status, me, qrCode, conversations, currentMessages, currentJid,
-    isConnected, syncProgress, contacts, odooSyncMap, getOdooSync,
-    requestQR, loadMessages, sendMessage, markRead, disconnect, logout,
-    getProfilePic, refreshConversations, startNewConversation,
-    getAllContacts, forceFullSync,
+    status,
+    me,
+    qrCode,
+    conversations,
+    currentMessages,
+    currentJid,
+    isConnected,
+    syncProgress,
+    // Odoo sync
+    odooSyncMap,
+    getOdooSync,
+    // Actions
+    requestQR,
+    loadMessages,
+    sendMessage,
+    markRead,
+    disconnect,
+    getProfilePic,
   }
 }

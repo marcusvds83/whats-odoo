@@ -5,6 +5,7 @@ import {
   Zap,
   UserPlus,
   TrendingUp,
+  MessageSquare,
   Bell,
   Settings2,
   CheckCircle2,
@@ -62,17 +63,17 @@ export function AutoSyncSettingsPanel({
         <CardHeader>
           <div className="flex items-center gap-2">
             <Zap className="size-4 text-amber-500" />
-            <CardTitle className="text-base">Sincronizacao Automatica</CardTitle>
+            <CardTitle className="text-base">Sincronização Automática</CardTitle>
           </div>
           <CardDescription>
-            Configure como as mensagens WhatsApp sao sincronizadas com o Odoo
+            Configure como as mensagens WhatsApp são sincronizadas com o Odoo
           </CardDescription>
         </CardHeader>
         <CardContent>
           <div className="flex flex-col items-center gap-3 py-6 text-center">
             <AlertCircle className="size-8 text-muted-foreground/50" />
             <p className="text-sm text-muted-foreground">
-              Conecte ao Odoo primeiro para configurar a sincronizacao automatica
+              Conecte ao Odoo primeiro para configurar a sincronização automática
             </p>
           </div>
         </CardContent>
@@ -87,7 +88,7 @@ export function AutoSyncSettingsPanel({
           <div className="flex items-center gap-2">
             <Zap className="size-4 text-amber-500" />
             <div>
-              <CardTitle className="text-base">Sincronizacao Automatica</CardTitle>
+              <CardTitle className="text-base">Sincronização Automática</CardTitle>
               <CardDescription>
                 Quando uma mensagem WhatsApp chega, o middleware pode automaticamente criar registros no Odoo
               </CardDescription>
@@ -107,7 +108,7 @@ export function AutoSyncSettingsPanel({
             </div>
             <div>
               <p className="text-sm font-medium">Auto-Sync Ativo</p>
-              <p className="text-xs text-muted-foreground">Ativa a sincronizacao automatica de mensagens</p>
+              <p className="text-xs text-muted-foreground">Ativa a sincronização automática de mensagens</p>
             </div>
           </div>
           <Switch
@@ -120,7 +121,7 @@ export function AutoSyncSettingsPanel({
         {/* Individual settings */}
         <div className="space-y-3">
           <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-            Acoes Automaticas
+            Ações Automáticas
           </p>
 
           {/* Auto-create contact */}
@@ -132,7 +133,7 @@ export function AutoSyncSettingsPanel({
               <div>
                 <p className="text-sm font-medium">Criar Contato</p>
                 <p className="text-xs text-muted-foreground">
-                  Cria um contato em res.partner com o numero WhatsApp
+                  Cria um contato em res.partner com o número WhatsApp
                 </p>
               </div>
             </div>
@@ -163,6 +164,26 @@ export function AutoSyncSettingsPanel({
             />
           </div>
 
+          {/* Auto-post messages */}
+          <div className="flex items-center justify-between rounded-lg border p-3">
+            <div className="flex items-center gap-3">
+              <div className="flex size-8 items-center justify-center rounded-lg bg-sky-100 dark:bg-sky-950/40">
+                <MessageSquare className="size-3.5 text-sky-700 dark:text-sky-400" />
+              </div>
+              <div>
+                <p className="text-sm font-medium">Registrar Mensagens</p>
+                <p className="text-xs text-muted-foreground">
+                  Posta mensagens WhatsApp no chatter do Lead/Contato no Odoo
+                </p>
+              </div>
+            </div>
+            <Switch
+              checked={settings.autoPostMessages}
+              onCheckedChange={(v) => handleToggle('autoPostMessages', v)}
+              disabled={saving || !settings.enabled}
+            />
+          </div>
+
           {/* Auto-create activity */}
           <div className="flex items-center justify-between rounded-lg border p-3">
             <div className="flex items-center gap-3">
@@ -172,7 +193,7 @@ export function AutoSyncSettingsPanel({
               <div>
                 <p className="text-sm font-medium">Criar Atividade</p>
                 <p className="text-xs text-muted-foreground">
-                  Cria uma atividade de notificacao no lead quando chega a primeira mensagem
+                  Cria uma atividade de notificação no lead quando chega a primeira mensagem
                 </p>
               </div>
             </div>
@@ -189,7 +210,7 @@ export function AutoSyncSettingsPanel({
         {/* Lead settings */}
         <div className="space-y-3">
           <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-            Configuracoes do Lead
+            Configurações do Lead
           </p>
 
           <div className="space-y-2">
@@ -219,19 +240,19 @@ export function AutoSyncSettingsPanel({
           <div className="space-y-2 text-xs text-muted-foreground">
             <div className="flex gap-2">
               <span className="flex size-5 shrink-0 items-center justify-center rounded-full bg-emerald-100 text-emerald-700 text-[10px] font-bold">1</span>
-              <p>Quando uma mensagem WhatsApp chega, o middleware busca ou cria um <strong>Contato</strong> (res.partner) com o numero de telefone.</p>
+              <p>Quando uma mensagem WhatsApp chega, o middleware busca ou cria um <strong>Contato</strong> (res.partner) com o número de telefone.</p>
             </div>
             <div className="flex gap-2">
               <span className="flex size-5 shrink-0 items-center justify-center rounded-full bg-amber-100 text-amber-700 text-[10px] font-bold">2</span>
               <p>Se for uma nova conversa, cria um <strong>Lead</strong> no CRM vinculado ao contato. O lead aparece na listagem do CRM normalmente.</p>
             </div>
             <div className="flex gap-2">
-              <span className="flex size-5 shrink-0 items-center justify-center rounded-full bg-violet-100 text-violet-700 text-[10px] font-bold">3</span>
-              <p>Uma <strong>Atividade</strong> de notificacao e criada para avisar que chegou uma mensagem WhatsApp nova.</p>
+              <span className="flex size-5 shrink-0 items-center justify-center rounded-full bg-sky-100 text-sky-700 text-[10px] font-bold">3</span>
+              <p>A mensagem e registrada no <strong>Chatter</strong> do Lead - igual a qualquer mensagem interna do Odoo. Voce pode ver, responder e gerenciar dentro do Odoo.</p>
             </div>
-            <div className="flex gap-2 mt-1">
-              <span className="flex size-5 shrink-0 items-center justify-center rounded-full bg-muted text-muted-foreground text-[10px] font-bold">i</span>
-              <p>As conversas sao registradas no campo <strong>descricao</strong> do Lead, nao no chatter individual. Para registrar manualmente uma mensagem no chatter, use o botao no painel Odoo ao lado da conversa.</p>
+            <div className="flex gap-2">
+              <span className="flex size-5 shrink-0 items-center justify-center rounded-full bg-violet-100 text-violet-700 text-[10px] font-bold">4</span>
+              <p>Uma <strong>Atividade</strong> de notificação é criada para avisar que chegou uma mensagem WhatsApp nova.</p>
             </div>
           </div>
         </div>

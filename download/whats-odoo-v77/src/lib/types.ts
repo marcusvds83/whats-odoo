@@ -9,8 +9,6 @@ export interface WhatsAppConversation {
   lastMessageAt: string | null
   unreadCount: number
   messageCount: number
-  isGroup: boolean
-  groupName: string | null
   // Odoo links
   odooPartnerId?: number | null
   odooLeadId?: number | null
@@ -27,7 +25,6 @@ export interface WhatsAppMessage {
   mediaType: string | null
   timestamp: string
   status: string
-  senderName?: string | null
 }
 
 export interface WhatsAppStatus {
@@ -39,13 +36,6 @@ export interface WhatsAppMe {
   id: string
   name?: string
   profilePicUrl?: string
-}
-
-// v7.3: Contact from device
-export interface WhatsAppContact {
-  jid: string
-  name: string | null
-  phone: string | null
 }
 
 // ========== Odoo Types ==========
@@ -122,7 +112,7 @@ export interface OdooTask extends OdooRecord {
 }
 
 // ========== App Types ==========
-export type AppTab = 'dashboard' | 'whatsapp' | 'conversations' | 'contacts' | 'chat' | 'settings'
+export type AppTab = 'dashboard' | 'whatsapp' | 'conversations' | 'chat' | 'settings'
 
 export interface ChatViewData {
   conversationJid: string

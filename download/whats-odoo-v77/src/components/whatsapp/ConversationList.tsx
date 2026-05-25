@@ -5,7 +5,6 @@ import { Input } from '@/components/ui/input'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
-import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 import {
   Search,
@@ -13,12 +12,7 @@ import {
   Phone,
   Clock,
   Loader2,
-  Users,
-  RefreshCcw,
-  Plus,
-  Download,
 } from 'lucide-react'
-import { NewConversationDialog } from './NewConversationDialog'
 
 interface ConversationListProps {
   conversations: Array<{
@@ -30,23 +24,16 @@ interface ConversationListProps {
     lastMessage: string | null
     lastMessageAt: string | null
     unreadCount: number
-    isGroup?: boolean
-    groupName?: string | null
   }>
   selectedJid: string | null
   onSelect: (jid: string) => void
   isSyncing?: boolean
   syncProgress?: number
-  waConnected?: boolean
-  onRefresh?: () => Promise<{ success: boolean; refreshed?: number }>
-  onStartConversation?: (phone: string) => Promise<{ success: boolean; jid?: string; error?: string }>
-  onForceFullSync?: () => Promise<{ success: boolean; message?: string }>
 }
 
 function formatTime(dateStr: string | null): string {
   if (!dateStr) return ''
   const date = new Date(dateStr)
-  if (isNaN(date.getTime())) return ''
   const now = new Date()
   const diffMs = now.getTime() - date.getTime()
   const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24))
@@ -63,9 +50,6 @@ function formatTime(dateStr: string | null): string {
 }
 
 function getDisplayName(conversation: ConversationListProps['conversations'][number]): string {
-  if (conversation.isGroup) {
-    return conversation.groupName || conversation.name || 'Grupo'
-  }
   return conversation.name || conversation.pushName || conversation.phone || conversation.jid.split('@')[0]
 }
 
@@ -91,15 +75,8 @@ export function ConversationList({
   onSelect,
   isSyncing,
   syncProgress,
-  waConnected,
-  onRefresh,
-  onStartConversation,
-  onForceFullSync,
 }: ConversationListProps) {
   const [searchQuery, setSearchQuery] = useState('')
-  const [isRefreshing, setIsRefreshing] = useState(false)
-  const [isFullSyncing, setIsFullSyncing] = useState(false)
-  const [showNewConversation, setShowNewConversation] = useState(false)
 
   const filteredConversations = useMemo(() => {
     if (!searchQuery.trim()) return conversations
@@ -109,39 +86,11 @@ export function ConversationList({
         (c.name && c.name.toLowerCase().includes(query)) ||
         (c.phone && c.phone.toLowerCase().includes(query)) ||
         (c.pushName && c.pushName.toLowerCase().includes(query)) ||
-        (c.groupName && c.groupName.toLowerCase().includes(query)) ||
         c.jid.toLowerCase().includes(query)
     )
   }, [conversations, searchQuery])
 
   const totalUnread = conversations.reduce((sum, c) => sum + c.unreadCount, 0)
-  const groupCount = conversations.filter(c => c.isGroup).length
-  const contactCount = conversations.filter(c => !c.isGroup).length
-
-  const handleRefresh = async () => {
-    if (!onRefresh || isRefreshing) return
-    setIsRefreshing(true)
-    try {
-      await onRefresh()
-    } finally {
-      setIsRefreshing(false)
-    }
-  }
-
-  const handleForceFullSync = async () => {
-    if (!onForceFullSync || isFullSyncing) return
-    setIsFullSyncing(true)
-    try {
-      await onForceFullSync()
-    } finally {
-      // Keep spinning for a bit since the reconnect takes time
-      setTimeout(() => setIsFullSyncing(false), 5000)
-    }
-  }
-
-  const handleConversationStarted = (jid: string) => {
-    onSelect(jid)
-  }
 
   return (
     <div className="flex flex-col h-full min-h-0">
@@ -157,54 +106,16 @@ export function ConversationList({
               </Badge>
             )}
           </div>
-          <span className="text-xs text-muted-foreground">
-            {contactCount} contatos{groupCount > 0 ? ` · ${groupCount} grupos` : ''}
-          </span>
-        </div>
-
-        {/* v7.3: Action buttons row */}
-        <div className="flex items-center gap-1.5 mb-2">
-          <Button
-            variant="outline"
-            size="sm"
-            className="h-7 text-xs gap-1 flex-1"
-            onClick={handleRefresh}
-            disabled={!waConnected || isRefreshing}
-            title="Atualizar conversas (buscar fotos e metadados atualizados)"
-          >
-            <RefreshCcw className={cn("size-3", isRefreshing && "animate-spin")} />
-            <span className="truncate">Atualizar</span>
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            className="h-7 text-xs gap-1 flex-1"
-            onClick={handleForceFullSync}
-            disabled={!waConnected || isFullSyncing}
-            title="Trazer TODAS as conversas do aparelho"
-          >
-            <Download className={cn("size-3", isFullSyncing && "animate-bounce")} />
-            <span className="truncate">Trazer do Aparelho</span>
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            className="h-7 text-xs gap-1 shrink-0"
-            onClick={() => setShowNewConversation(true)}
-            disabled={!waConnected}
-            title="Criar nova conversa por numero de telefone"
-          >
-            <Plus className="size-3" />
-          </Button>
+          <span className="text-xs text-muted-foreground">{conversations.length} contatos</span>
         </div>
 
         {/* Sync progress */}
-        {(isSyncing || isFullSyncing) && (
+        {isSyncing && (
           <div className="flex items-center gap-2 mb-2 px-2 py-1.5 bg-primary/5 rounded-lg border border-primary/10">
             <Loader2 className="size-3.5 text-primary animate-spin" />
             <div className="flex-1">
               <div className="flex items-center justify-between">
-                <span className="text-xs font-medium text-primary">{isFullSyncing ? 'Sincronizando tudo...' : 'Sincronizando...'}</span>
+                <span className="text-xs font-medium text-primary">Sincronizando...</span>
                 <span className="text-[10px] text-muted-foreground">{syncProgress || 0}%</span>
               </div>
               <div className="w-full h-1 bg-primary/10 rounded-full mt-1">
@@ -218,7 +129,7 @@ export function ConversationList({
         <div className="relative">
           <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 size-4 text-muted-foreground" />
           <Input
-            placeholder="Buscar conversas, contatos, grupos..."
+            placeholder="Buscar conversas..."
             className="pl-9 h-9 text-sm bg-muted/50 border-transparent focus:border-border focus:bg-background"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
@@ -235,23 +146,17 @@ export function ConversationList({
                 <Search className="size-10 text-muted-foreground/40 mb-3" />
                 <p className="text-sm font-medium text-muted-foreground">Nenhum resultado</p>
               </>
-            ) : isSyncing || isFullSyncing ? (
+            ) : isSyncing ? (
               <>
                 <Loader2 className="size-10 text-primary/40 mb-3 animate-spin" />
                 <p className="text-sm font-medium text-muted-foreground">Sincronizando conversas...</p>
                 <p className="text-xs text-muted-foreground/70 mt-1">Aguarde enquanto carrega</p>
               </>
-            ) : !waConnected ? (
-              <>
-                <MessageCircle className="size-10 text-muted-foreground/40 mb-3" />
-                <p className="text-sm font-medium text-muted-foreground">WhatsApp desconectado</p>
-                <p className="text-xs text-muted-foreground/70 mt-1">Conecte o WhatsApp para ver conversas</p>
-              </>
             ) : (
               <>
                 <MessageCircle className="size-10 text-muted-foreground/40 mb-3" />
                 <p className="text-sm font-medium text-muted-foreground">Nenhuma conversa ainda</p>
-                <p className="text-xs text-muted-foreground/70 mt-1">Clique em "Trazer do Aparelho" para carregar</p>
+                <p className="text-xs text-muted-foreground/70 mt-1">Conecte o WhatsApp para ver conversas</p>
               </>
             )}
           </div>
@@ -261,7 +166,6 @@ export function ConversationList({
               const displayName = getDisplayName(conversation)
               const isSelected = selectedJid === conversation.jid
               const hasUnread = conversation.unreadCount > 0
-              const isGroup = conversation.isGroup
 
               return (
                 <button
@@ -275,37 +179,19 @@ export function ConversationList({
                   )}
                 >
                   <div className="relative shrink-0">
-                    <Avatar className={cn('size-12', isGroup && 'rounded-lg')}>
+                    <Avatar className="size-12">
                       {conversation.avatarUrl && <AvatarImage src={conversation.avatarUrl} alt={displayName} />}
-                      <AvatarFallback className={cn(
-                        'text-sm font-medium',
-                        isGroup
-                          ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300 rounded-lg'
-                          : isSelected
-                            ? 'bg-primary/15 text-primary'
-                            : 'bg-muted text-muted-foreground'
-                      )}>
-                        {isGroup ? <Users className="size-5" /> : getInitials(displayName)}
+                      <AvatarFallback className={cn('text-sm font-medium', isSelected ? 'bg-primary/15 text-primary' : 'bg-muted text-muted-foreground')}>
+                        {getInitials(displayName)}
                       </AvatarFallback>
                     </Avatar>
-                    {/* Group indicator */}
-                    {isGroup && (
-                      <div className="absolute -bottom-0.5 -right-0.5 size-4 rounded-full bg-emerald-500 flex items-center justify-center ring-2 ring-background">
-                        <Users className="size-2.5 text-white" />
-                      </div>
-                    )}
                   </div>
 
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center justify-between gap-2">
-                      <div className="flex items-center gap-1.5 min-w-0">
-                        {isGroup && (
-                          <Users className="size-3 text-emerald-500 shrink-0" />
-                        )}
-                        <span className={cn('text-sm truncate', hasUnread ? 'font-semibold' : 'font-medium')}>
-                          {displayName}
-                        </span>
-                      </div>
+                      <span className={cn('text-sm truncate', hasUnread ? 'font-semibold' : 'font-medium')}>
+                        {displayName}
+                      </span>
                       {conversation.lastMessageAt && (
                         <span className={cn('text-[11px] shrink-0', hasUnread ? 'text-primary font-medium' : 'text-muted-foreground')}>
                           {formatTime(conversation.lastMessageAt)}
@@ -315,7 +201,7 @@ export function ConversationList({
 
                     <div className="flex items-center justify-between gap-2 mt-0.5">
                       <div className="flex items-center gap-1 min-w-0">
-                        {!isGroup && conversation.phone && !conversation.name && <Phone className="size-3 text-muted-foreground/60 shrink-0" />}
+                        {conversation.phone && !conversation.name && <Phone className="size-3 text-muted-foreground/60 shrink-0" />}
                         {conversation.lastMessage ? (
                           <p className={cn('text-xs truncate', hasUnread ? 'text-foreground/80 font-medium' : 'text-muted-foreground')}>
                             {truncateMessage(conversation.lastMessage)}
@@ -339,16 +225,6 @@ export function ConversationList({
           </div>
         )}
       </ScrollArea>
-
-      {/* New Conversation Dialog */}
-      {onStartConversation && (
-        <NewConversationDialog
-          open={showNewConversation}
-          onOpenChange={setShowNewConversation}
-          onStartConversation={onStartConversation}
-          onConversationStarted={handleConversationStarted}
-        />
-      )}
     </div>
   )
 }
