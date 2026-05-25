@@ -49,3 +49,25 @@ Stage Summary:
 - All 5 user-requested features implemented
 - OOM fix included (no next build in start command)
 - Single-process architecture preserved (no websocket bridge errors)
+---
+Task ID: v7.7
+Agent: main
+Task: Build whats-odoo v7.7 with contact names from device, contacts sync fix, conversation sort fix, CSS fix
+
+Work Log:
+- Copied v7.6 as base for v7.7
+- server.ts: Enhanced `resolveName()` to also check Baileys `store.contacts` directly for device-saved names (name + notify fields)
+- server.ts: Added `loadNamesFromStore()` function that reads ALL contacts from `waSocket.store.contacts` and updates `contactNames` map + all conversation names
+- server.ts: Added `loadNamesFromStore()` call after connection opens (3s delay) and after history sync completes (2s delay)
+- server.ts: Enhanced `whatsapp:get-contacts` handler to read from Baileys store directly, then merge with contactNames map, then update ALL conversation names
+- server.ts: Enhanced `whatsapp:refresh-conversations` handler to first load all names from Baileys store, then refresh avatars/metadata, and always update names (not just when empty)
+- globals.css: Removed `@plugin "tailwindcss-animate"` which could cause Turbopack issues. Replaced with inline `@utility` definitions for all animation classes (animate-in, animate-out, fade-in-0, fade-out-0, zoom-in-95, zoom-out-95, slide-in-from-*, slide-out-to-*, etc.)
+- package.json: Removed `tailwindcss-animate` dependency (no longer needed, inlined in CSS)
+- Updated version to 7.7.0 in package.json and page.tsx
+- Conversation sort is already newest-first (tB - tA) which is correct
+
+Stage Summary:
+- v7.7 addresses 3 user issues: (1) contact names from device, (2) contacts not updating, (3) CSS broken
+- Key fix: Reading from Baileys `store.contacts` directly gives ALL device-saved names, not just those in conversations
+- CSS fix: Inlined all animation utilities to avoid @plugin/@import resolution issues with Turbopack
+- File: /home/z/my-project/download/whats-odoo-v77.zip (72K)
