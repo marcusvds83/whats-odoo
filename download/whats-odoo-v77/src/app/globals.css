@@ -188,11 +188,11 @@
 @utility slide-out-to-right-2 { --tw-exit-translate-x: 0.5rem; }
 @utility slide-out-to-right-4 { --tw-exit-translate-x: 1rem; }
 
-/* shadcn/ui dialog/overlay specific animations */
-@utility slide-in-from-left-1\/2 { --tw-enter-translate-x: -50%; }
-@utility slide-in-from-top-\[48\%\] { --tw-enter-translate-y: -48%; }
-@utility slide-out-to-left-1\/2 { --tw-exit-translate-x: -50%; }
-@utility slide-out-to-top-\[48\%\] { --tw-exit-translate-y: -48%; }
+/* shadcn/ui dialog/overlay animations - replaced with valid alphanumeric names */
+@utility slide-in-from-left-half { --tw-enter-translate-x: -50%; }
+@utility slide-in-from-top-48pct { --tw-enter-translate-y: -48%; }
+@utility slide-out-to-left-half { --tw-exit-translate-x: -50%; }
+@utility slide-out-to-top-48pct { --tw-exit-translate-y: -48%; }
 
 @utility duration-100 { animation-duration: 100ms; }
 @utility duration-200 { animation-duration: 200ms; }

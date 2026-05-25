@@ -71,3 +71,28 @@ Stage Summary:
 - Key fix: Reading from Baileys `store.contacts` directly gives ALL device-saved names, not just those in conversations
 - CSS fix: Inlined all animation utilities to avoid @plugin/@import resolution issues with Turbopack
 - File: /home/z/my-project/download/whats-odoo-v77.zip (72K)
+---
+Task ID: 1
+Agent: Main
+Task: Fix v7.7 build error and contact name issues
+
+Work Log:
+- Analyzed build error: `@utility slide-in-from-top-\[48\%\]` defines invalid utility name in Tailwind CSS v4
+- Root cause: Tailwind CSS v4 `@utility` directive requires alphanumeric names, no brackets/percentages
+- Fixed globals.css: Replaced 4 invalid @utility names with valid alphanumeric alternatives
+  - `slide-in-from-left-1\/2` → `slide-in-from-left-half`
+  - `slide-in-from-top-\[48\%\]` → `slide-in-from-top-48pct`
+  - `slide-out-to-left-1\/2` → `slide-out-to-left-half`
+  - `slide-out-to-top-\[48\%\]` → `slide-out-to-top-48pct`
+- Fixed server.ts contacts.upsert handler: Now also checks `contact.notify` (device saved name)
+- Fixed server.ts contacts.update handler: Now also checks `update.notify` (device saved name)
+- Enhanced auto-load of contact names: Now tries at 2s, 5s, and 10s after connection
+- Verified conversation sort order is correct: `tB - tA` (newest first) in both server and frontend
+- Created whats-odoo-v77.zip package
+
+Stage Summary:
+- CSS build error fixed by renaming 4 invalid @utility definitions
+- Contact names now also sourced from `notify` field (device saved names)
+- Auto-load contact names more aggressively (3 attempts post-connection)
+- Conversation sort order confirmed correct (newest first)
+- Package: /home/z/my-project/download/whats-odoo-v77.zip

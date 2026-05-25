@@ -1,7 +1,7 @@
 // ============================================================
-// Whats-Odoo v7.5 — SINGLE PROCESS SERVER
+// Whats-Odoo v7.7 — SINGLE PROCESS SERVER
 // v7.7: Contact names from device, contacts sync from store,
-//        conversation sort newest-first, full fix
+//        conversation sort newest-first, CSS build fix
 // ============================================================
 
 import { createServer } from 'http'
@@ -509,7 +509,10 @@ function initWhatsApp(waNs: ReturnType<import('socket.io')['Server']['of']>, odo
 
           // v7.7: Load ALL contact names from Baileys store after connection
           // This ensures device-saved names are available immediately
-          setTimeout(() => loadNamesFromStore(waNs), 3000)
+          // Try multiple times as the store may not be fully populated right away
+          setTimeout(() => loadNamesFromStore(waNs), 2000)
+          setTimeout(() => loadNamesFromStore(waNs), 5000)
+          setTimeout(() => loadNamesFromStore(waNs), 10000)
         }
       })
 
@@ -752,12 +755,16 @@ function initWhatsApp(waNs: ReturnType<import('socket.io')['Server']['of']>, odo
       waSocket.ev.on('contacts.upsert', async (contacts) => {
         let count = 0
         for (const contact of contacts) {
-          if (contact.id && isValidConversationJid(contact.id) && contact.name) {
-            contactNames.set(jidNormalizedUser(contact.id), contact.name)
+          if (!contact.id || !isValidConversationJid(contact.id)) continue
+          // Use both name and notify — some contacts only have notify (device saved name)
+          const bestName = contact.name || contact.notify || null
+          if (bestName && bestName.trim()) {
+            const norm = jidNormalizedUser(contact.id)
+            contactNames.set(norm, bestName.trim())
             const conv = conversations.get(contact.id)
             if (conv) {
-              if (conv.isGroup) { conv.groupName = contact.name; conv.name = contact.name }
-              else { conv.name = contact.name }
+              if (conv.isGroup) { conv.groupName = bestName.trim(); conv.name = bestName.trim() }
+              else { conv.name = bestName.trim() }
             }
             count++
           }
@@ -771,12 +778,15 @@ function initWhatsApp(waNs: ReturnType<import('socket.io')['Server']['of']>, odo
       waSocket.ev.on('contacts.update', async (updates) => {
         let count = 0
         for (const update of updates) {
-          if (update.id && isValidConversationJid(update.id) && update.name) {
-            contactNames.set(jidNormalizedUser(update.id), update.name)
+          if (!update.id || !isValidConversationJid(update.id)) continue
+          const bestName = update.name || update.notify || null
+          if (bestName && bestName.trim()) {
+            const norm = jidNormalizedUser(update.id)
+            contactNames.set(norm, bestName.trim())
             const conv = conversations.get(update.id)
             if (conv) {
-              if (conv.isGroup) { conv.groupName = update.name; conv.name = update.name }
-              else { conv.name = update.name }
+              if (conv.isGroup) { conv.groupName = bestName.trim(); conv.name = bestName.trim() }
+              else { conv.name = bestName.trim() }
             }
             count++
           }
