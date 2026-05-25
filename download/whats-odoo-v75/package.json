@@ -45,7 +45,7 @@
     "tailwindcss": "^4",
     "tailwindcss-animate": "^1.0.7",
     "tsx": "^4.19.0",
-    "tw-animate-css": "^1.3.5",
+
     "typescript": "^5",
     "xmlrpc": "^1.3.2"
   },
