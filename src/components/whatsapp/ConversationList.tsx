@@ -6,6 +6,20 @@ import { ScrollArea } from '@/components/ui/scroll-area'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from '@/components/ui/tooltip'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import { cn } from '@/lib/utils'
 import {
   Search,
@@ -16,6 +30,9 @@ import {
   Users,
   MessagesSquare,
   Server,
+  RefreshCw,
+  Trash2,
+  MoreVertical,
 } from 'lucide-react'
 import { OdooContactSearchDialog } from './OdooContactSearchDialog'
 import type { DeviceContact } from '@/lib/use-whatsapp'
@@ -43,6 +60,9 @@ interface ConversationListProps {
   onStartConversation?: (phone: string, name?: string) => Promise<{ success: boolean; jid?: string; error?: string }>
   // New in v7.10: create Odoo contact from the dialog
   onCreateOdooContact?: (data: { name: string; phone?: string; mobile?: string; whatsapp?: string; email?: string }) => Promise<{ success: boolean; id?: number; error?: string }>
+  // New in v7.12: delete + refresh
+  onDeleteConversation?: (jid: string) => Promise<{ success: boolean; error?: string }>
+  onRefreshData?: () => Promise<{ success: boolean; chatsFetched?: number; contactsFetched?: number; error?: string }>
 }
 
 function formatTime(dateStr: string | null): string {
@@ -96,10 +116,14 @@ export function ConversationList({
   onSearchOdooContacts,
   onStartConversation,
   onCreateOdooContact,
+  onDeleteConversation,
+  onRefreshData,
 }: ConversationListProps) {
   const [activeTab, setActiveTab] = useState<Tab>('conversations')
   const [searchQuery, setSearchQuery] = useState('')
   const [odooSearchOpen, setOdooSearchOpen] = useState(false)
+  const [isRefreshing, setIsRefreshing] = useState(false)
+  const [deleteTarget, setDeleteTarget] = useState<{ jid: string; name: string } | null>(null)
 
   // Contacts state
   const [contacts, setContacts] = useState<DeviceContact[]>([])
@@ -164,33 +188,83 @@ export function ConversationList({
     onSelect(jid)
   }
 
+  const handleRefresh = async () => {
+    if (!onRefreshData || isRefreshing) return
+    setIsRefreshing(true)
+    try {
+      const result = await onRefreshData()
+      if (!result.success) {
+        console.error('[ConversationList] Refresh failed:', result.error)
+      }
+    } catch (err) {
+      console.error('[ConversationList] Refresh error:', err)
+    } finally {
+      setIsRefreshing(false)
+    }
+  }
+
+  const handleConfirmDelete = async () => {
+    if (!deleteTarget || !onDeleteConversation) return
+    try {
+      await onDeleteConversation(deleteTarget.jid)
+    } catch (err) {
+      console.error('[ConversationList] Delete error:', err)
+    } finally {
+      setDeleteTarget(null)
+    }
+  }
+
   return (
     <div className="flex flex-col h-full min-h-0">
       {/* Header — fixed, never scrolls */}
       <div className="shrink-0 px-4 pt-4 pb-2">
         <div className="flex items-center justify-between mb-3">
-          <div className="flex items-center gap-2">
-            <MessageCircle className="size-5 text-primary" />
-            <h2 className="font-semibold text-base">WhatsApp</h2>
+          <div className="flex items-center gap-2 min-w-0">
+            <MessageCircle className="size-5 text-primary shrink-0" />
+            <h2 className="font-semibold text-base truncate">WhatsApp</h2>
             {totalUnread > 0 && (
-              <Badge className="bg-primary text-primary-foreground text-[10px] px-1.5 min-w-[20px] h-5 flex items-center justify-center">
+              <Badge className="bg-primary text-primary-foreground text-[10px] px-1.5 min-w-[20px] h-5 flex items-center justify-center shrink-0">
                 {totalUnread > 99 ? '99+' : totalUnread}
               </Badge>
             )}
           </div>
-          {/* Odoo contact search button */}
-          {odooConnected && onSearchOdooContacts && (
-            <Button
-              variant="outline"
-              size="sm"
-              className="h-7 gap-1.5 text-xs"
-              onClick={() => setOdooSearchOpen(true)}
-              title="Buscar contato no Odoo"
-            >
-              <Server className="size-3" />
-              <span className="hidden sm:inline">Odoo</span>
-            </Button>
-          )}
+          <div className="flex items-center gap-1 shrink-0">
+            {/* Refresh button — re-fetches chats & contacts from phone */}
+            {onRefreshData && (
+              <TooltipProvider delayDuration={400}>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="size-8"
+                      onClick={handleRefresh}
+                      disabled={isRefreshing}
+                      title="Atualizar conversas e contatos"
+                    >
+                      <RefreshCw className={cn('size-4', isRefreshing && 'animate-spin')} />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent side="bottom" className="text-xs">
+                    Atualizar conversas e contatos do celular
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+            )}
+            {/* Odoo contact search button */}
+            {odooConnected && onSearchOdooContacts && (
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-8 gap-1.5 text-xs"
+                onClick={() => setOdooSearchOpen(true)}
+                title="Buscar contato no Odoo"
+              >
+                <Server className="size-3.5" />
+                <span className="hidden sm:inline">Odoo</span>
+              </Button>
+            )}
+          </div>
         </div>
 
         {/* Tab switcher: Conversas | Contatos */}
@@ -264,6 +338,7 @@ export function ConversationList({
             onSelect={onSelect}
             isSyncing={isSyncing}
             hasSearchQuery={!!searchQuery.trim()}
+            onDeleteConversation={onDeleteConversation ? (jid, name) => setDeleteTarget({ jid, name }) : undefined}
           />
         ) : (
           <ContactsTabContent
@@ -276,6 +351,25 @@ export function ConversationList({
           />
         )}
       </ScrollArea>
+
+      {/* Delete confirmation dialog */}
+      <Dialog open={!!deleteTarget} onOpenChange={(open) => !open && setDeleteTarget(null)}>
+        <DialogContent className="max-w-sm">
+          <DialogHeader>
+            <DialogTitle>Excluir conversa?</DialogTitle>
+            <DialogDescription>
+              Tem certeza que deseja excluir a conversa com <strong>{deleteTarget?.name}</strong>?
+              As mensagens serão removidas localmente, mas a conversa pode reaparecer se o contato enviar uma nova mensagem.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="gap-2">
+            <Button variant="outline" onClick={() => setDeleteTarget(null)}>Cancelar</Button>
+            <Button variant="destructive" onClick={handleConfirmDelete} className="gap-1.5">
+              <Trash2 className="size-4" /> Excluir
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* Odoo contact search dialog */}
       {onSearchOdooContacts && onStartConversation && (
@@ -301,12 +395,14 @@ function ConversationsTabContent({
   onSelect,
   isSyncing,
   hasSearchQuery,
+  onDeleteConversation,
 }: {
   conversations: ConversationListProps['conversations']
   selectedJid: string | null
   onSelect: (jid: string) => void
   isSyncing?: boolean
   hasSearchQuery: boolean
+  onDeleteConversation?: (jid: string, name: string) => void
 }) {
   if (conversations.length === 0) {
     return (
@@ -341,11 +437,11 @@ function ConversationsTabContent({
         const hasUnread = conversation.unreadCount > 0
 
         return (
-          <button
+          <div
             key={conversation.jid}
             onClick={() => onSelect(conversation.jid)}
             className={cn(
-              'w-full flex items-center gap-3 px-4 py-3 text-left transition-colors duration-150',
+              'group w-full flex items-center gap-3 px-4 py-3 text-left transition-colors duration-150 cursor-pointer',
               'hover:bg-muted/60 focus-visible:bg-muted/60 focus-visible:outline-none',
               isSelected ? 'bg-primary/8 border-l-2 border-l-primary' : 'border-l-2 border-l-transparent',
               hasUnread && !isSelected && 'bg-muted/30'
@@ -385,14 +481,32 @@ function ConversationsTabContent({
                     </p>
                   )}
                 </div>
-                {hasUnread && (
-                  <Badge className="bg-primary text-primary-foreground text-[10px] px-1.5 min-w-[18px] h-[18px] flex items-center justify-center shrink-0">
-                    {conversation.unreadCount > 99 ? '99+' : conversation.unreadCount}
-                  </Badge>
-                )}
+                <div className="flex items-center gap-1 shrink-0">
+                  {hasUnread && (
+                    <Badge className="bg-primary text-primary-foreground text-[10px] px-1.5 min-w-[18px] h-[18px] flex items-center justify-center shrink-0">
+                      {conversation.unreadCount > 99 ? '99+' : conversation.unreadCount}
+                    </Badge>
+                  )}
+                  {/* Delete button — shows on hover, stops propagation so click doesn't trigger select */}
+                  {onDeleteConversation && (
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="size-7 opacity-0 group-hover:opacity-100 transition-opacity hover:bg-destructive/10 hover:text-destructive"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        e.preventDefault()
+                        onDeleteConversation(conversation.jid, displayName)
+                      }}
+                      title="Excluir conversa"
+                    >
+                      <Trash2 className="size-3.5" />
+                    </Button>
+                  )}
+                </div>
               </div>
             </div>
-          </button>
+          </div>
         )
       })}
     </div>

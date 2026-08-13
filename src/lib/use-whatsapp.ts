@@ -136,28 +136,75 @@ export function useWhatsApp() {
     })
 
     socket.on('whatsapp:message', (data: { conversationJid: string; message: WhatsAppMessage; conversation: WhatsAppConversation }) => {
+      console.log('[WhatsApp] Message received:', {
+        conversationJid: data.conversationJid,
+        currentJid: currentJidRef.current,
+        messageId: data.message?.id,
+        fromMe: data.message?.fromMe,
+        text: data.message?.textContent?.slice(0, 30),
+      })
+
       // Use the ref so we always see the latest currentJid even though this
       // handler is registered once on mount. Without this, sent/incoming
       // messages would never be appended to the active chat view.
-      if (data.conversationJid === currentJidRef.current) {
+      // Normalize JIDs (strip any ":xx" suffix) for the comparison to be safe.
+      const normalizeJid = (j: string | null | undefined) => (j ? j.split(':')[0] : j)
+      const isActive = normalizeJid(data.conversationJid) === normalizeJid(currentJidRef.current)
+
+      if (isActive) {
         setCurrentMessages(prev => {
           // Dedup by message id — the server echoes our own sends back to us,
           // and Baileys may also deliver the same upsert. Avoid duplicate bubbles.
-          if (data.message?.id && prev.some(m => m.id === data.message.id)) return prev
+          if (data.message?.id && prev.some(m => m.id === data.message.id)) {
+            console.log('[WhatsApp] Message skipped (duplicate id)')
+            return prev
+          }
+          // Also dedup by whatsappId as a fallback
+          if (data.message?.whatsappId && prev.some(m => m.whatsappId === data.message.whatsappId)) {
+            console.log('[WhatsApp] Message skipped (duplicate whatsappId)')
+            return prev
+          }
+          console.log('[WhatsApp] Appending message to active chat')
           return [...prev, data.message]
         })
+      } else {
+        console.log('[WhatsApp] Message for non-active chat, only updating list')
       }
-      // Update conversation in list
+
+      // Always update the conversation list (so unread/lastMessage reflect new state)
       if (data.conversation && data.conversation.phone && /^\d{7,}$/.test(data.conversation.phone)) {
         setConversations(prev => {
           const idx = prev.findIndex(c => c.jid === data.conversationJid)
           if (idx >= 0) {
             const next = [...prev]
-            next[idx] = data.conversation
+            // Preserve the _isDeviceContact flag if the existing conv had it
+            const existing = next[idx]
+            next[idx] = { ...data.conversation, _isDeviceContact: (existing as any)?._isDeviceContact }
             return sortConversations(next)
           }
           return sortConversations([data.conversation, ...prev])
         })
+      }
+    })
+
+    // Message status updates (sent → delivered → read)
+    socket.on('whatsapp:message:status', (data: { conversationJid: string; messageId: string; status: string }) => {
+      console.log('[WhatsApp] Message status update:', data)
+      // Only update if the message is in the active chat
+      if (data.conversationJid === currentJidRef.current) {
+        setCurrentMessages(prev => prev.map(m =>
+          m.id === data.messageId ? { ...m, status: data.status } : m
+        ))
+      }
+    })
+
+    // Handle conversation deletion — clear active chat if needed
+    socket.on('whatsapp:conversation:deleted', (data: { jid: string }) => {
+      console.log('[WhatsApp] Conversation deleted:', data.jid)
+      setConversations(prev => prev.filter(c => c.jid !== data.jid))
+      if (currentJidRef.current === data.jid) {
+        setCurrentJid(null)
+        setCurrentMessages([])
       }
     })
 
@@ -272,6 +319,24 @@ export function useWhatsApp() {
     return odooSyncMap.get(jid) || null
   }, [odooSyncMap])
 
+  // ===== Delete a conversation =====
+  const deleteConversation = useCallback((jid: string): Promise<{ success: boolean; error?: string }> => {
+    return new Promise((resolve) => {
+      socketRef.current?.emit('whatsapp:delete-conversation', { jid }, (response: any) => {
+        resolve(response)
+      })
+    })
+  }, [])
+
+  // ===== Refresh data: re-fetch chats & contacts from phone =====
+  const refreshData = useCallback((): Promise<{ success: boolean; chatsFetched?: number; contactsFetched?: number; picsFetched?: number; totalConversations?: number; error?: string }> => {
+    return new Promise((resolve) => {
+      socketRef.current?.emit('whatsapp:refresh-data', {}, (response: any) => {
+        resolve(response)
+      })
+    })
+  }, [])
+
   return {
     status,
     me,
@@ -291,9 +356,12 @@ export function useWhatsApp() {
     markRead,
     disconnect,
     getProfilePic,
-    // New actions for v7.9
+    // v7.9 actions
     getContacts,
     startConversation,
     injectHistory,
+    // v7.12 actions
+    deleteConversation,
+    refreshData,
   }
 }

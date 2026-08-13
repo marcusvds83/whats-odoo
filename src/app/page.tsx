@@ -233,6 +233,8 @@ function ConversationsView({
   onInjectHistory,
   linkedOdooRecords,
   onCreateOdooContact,
+  onDeleteConversation,
+  onRefreshData,
 }: {
   conversations: any[]
   selectedJid: string | null
@@ -261,6 +263,8 @@ function ConversationsView({
   onInjectHistory?: (jid: string, messages: any[]) => Promise<{ success: boolean; added?: number; skipped?: number; error?: string }>
   linkedOdooRecords?: Array<{ model: string; recordId: number; recordName?: string }>
   onCreateOdooContact?: (data: { name: string; phone?: string; mobile?: string; whatsapp?: string; email?: string }) => Promise<{ success: boolean; id?: number; error?: string }>
+  onDeleteConversation?: (jid: string) => Promise<{ success: boolean; error?: string }>
+  onRefreshData?: () => Promise<{ success: boolean; chatsFetched?: number; contactsFetched?: number; error?: string }>
 }) {
   // Build conversation history payload (for Odoo lead creation)
   const conversationHistory = useMemo(() => {
@@ -274,9 +278,10 @@ function ConversationsView({
 
   return (
     <div className="flex h-full min-h-0 overflow-hidden">
+      {/* Conversation list — always visible, takes full width when no conversation is selected */}
       <div className={cn(
-        "border-r bg-background transition-all duration-200 h-full",
-        selectedJid ? "w-80 lg:w-96" : "w-full max-w-lg mx-auto"
+        "border-r bg-background transition-all duration-200 h-full shrink-0",
+        selectedJid ? "w-72 lg:w-80 xl:w-96" : "w-full max-w-lg mx-auto"
       )}>
         <ConversationList
           conversations={conversations}
@@ -284,67 +289,73 @@ function ConversationsView({
           onSelect={onSelectConversation}
           isSyncing={isSyncing}
           syncProgress={syncProgress}
-          // New in v7.9: contacts tab + Odoo contact search
           onGetContacts={onGetContacts}
           odooConnected={odooStatus.connected}
           onSearchOdooContacts={onSearchContacts}
           onStartConversation={onStartConversation}
-          // New in v7.10: create Odoo contact
           onCreateOdooContact={onCreateOdooContact}
+          onDeleteConversation={onDeleteConversation}
+          onRefreshData={onRefreshData}
         />
       </div>
 
       {selectedJid && (
         <div className="flex-1 flex min-w-0">
-          <div className={cn("flex-1 min-w-0 transition-all duration-200", showOdooPanel && "hidden lg:block")}>
+          {/* Chat view — shrinks (but never hides) to make room for Odoo panel */}
+          <div className="flex-1 min-w-0 transition-all duration-200">
             <ChatView
               conversation={selectedConversation}
               messages={currentMessages}
               onSendMessage={onSendMessage}
               onMarkRead={onMarkRead}
-              // New in v7.9: Pull from Odoo button
               odooConnected={odooStatus.connected}
               odooLinkedRecords={linkedOdooRecords}
               onFetchOdooHistory={onFetchOdooHistory}
               onInjectHistory={onInjectHistory}
+              onDeleteConversation={onDeleteConversation ? (jid) => {
+                // The actual delete is handled by the parent (wa.deleteConversation),
+                // here we just trigger the same confirmation flow as the list.
+                onDeleteConversation(jid)
+              } : undefined}
             />
           </div>
 
-          {showOdooPanel && (
-            <div className="w-80 lg:w-96 border-l bg-background flex flex-col">
-              <div className="flex items-center justify-between px-3 py-2 border-b">
-                <div className="flex items-center gap-2">
-                  <Link2 className="size-4 text-primary" />
-                  <span className="text-sm font-medium">Odoo</span>
+          {/* Right side: collapsible Odoo panel — when open, it takes its own column, never overlapping the chat */}
+          {showOdooPanel ? (
+            <div className="w-72 lg:w-80 xl:w-96 border-l bg-background flex flex-col shrink-0">
+              <div className="flex items-center justify-between px-3 py-2 border-b shrink-0">
+                <div className="flex items-center gap-2 min-w-0">
+                  <Link2 className="size-4 text-primary shrink-0" />
+                  <span className="text-sm font-medium truncate">Odoo</span>
                   {odooStatus.connected && (
-                    <Badge variant="outline" className="text-[10px] bg-emerald-50 text-emerald-700 border-emerald-200">Conectado</Badge>
+                    <Badge variant="outline" className="text-[10px] bg-emerald-50 text-emerald-700 border-emerald-200 shrink-0">Conectado</Badge>
                   )}
                 </div>
-                <Button variant="ghost" size="icon" className="size-7" onClick={() => onToggleOdooPanel(false)}>
+                <Button variant="ghost" size="icon" className="size-8 shrink-0" onClick={() => onToggleOdooPanel(false)} title="Recolher painel Odoo">
                   <PanelRightClose className="size-4" />
                 </Button>
               </div>
-              <OdooLinkPanel
-                conversationJid={selectedJid}
-                conversationPhone={selectedConversation?.phone || null}
-                onLinkConversation={onLinkConversation}
-                onSearchContacts={onSearchContacts}
-                onSearchLeads={onSearchLeads}
-                onSearchSales={onSearchSales}
-                onSearchTasks={onSearchTasks}
-                onCreateLead={onCreateLead}
-                onCreateContact={onCreateContact}
-                onCreateTask={onCreateTask}
-                onLogMessage={onLogMessage}
-                odooConnected={odooStatus.connected}
-                // New in v7.9: pass conversation history for lead creation
-                conversationHistory={conversationHistory}
-              />
+              <div className="flex-1 min-h-0 overflow-hidden">
+                <OdooLinkPanel
+                  conversationJid={selectedJid}
+                  conversationPhone={selectedConversation?.phone || null}
+                  onLinkConversation={onLinkConversation}
+                  onSearchContacts={onSearchContacts}
+                  onSearchLeads={onSearchLeads}
+                  onSearchSales={onSearchSales}
+                  onSearchTasks={onSearchTasks}
+                  onCreateLead={onCreateLead}
+                  onCreateContact={onCreateContact}
+                  onCreateTask={onCreateTask}
+                  onLogMessage={onLogMessage}
+                  odooConnected={odooStatus.connected}
+                  conversationHistory={conversationHistory}
+                />
+              </div>
             </div>
-          )}
-
-          {!showOdooPanel && (
-            <div className="border-l bg-muted/30 flex flex-col items-center pt-3 px-1">
+          ) : (
+            /* Collapsed state — a slim vertical strip with an "open" button */
+            <div className="border-l bg-muted/30 flex flex-col items-center pt-3 px-1 shrink-0 w-12">
               <Button variant="ghost" size="icon" className="size-8" onClick={() => onToggleOdooPanel(true)} title="Abrir painel Odoo">
                 <PanelRightOpen className="size-4" />
               </Button>
@@ -363,12 +374,13 @@ function ConversationsView({
   )
 }
 
-function NavItem({ icon, label, active, onClick, badge }: {
+function NavItem({ icon, label, active, onClick, badge, collapsed }: {
   icon: React.ReactNode
   label: string
   active: boolean
   onClick: () => void
   badge?: string
+  collapsed?: boolean
 }) {
   return (
     <button
@@ -378,24 +390,28 @@ function NavItem({ icon, label, active, onClick, badge }: {
         'hover:bg-muted/80 focus-visible:outline-none focus-visible:bg-muted/80',
         active ? 'bg-primary/10 text-primary font-medium' : 'text-muted-foreground',
       )}
+      title={collapsed ? label : undefined}
     >
-      <span className="shrink-0">{icon}</span>
-      <span className="hidden lg:block flex-1 text-left truncate">{label}</span>
-      {badge && (
+      <span className="shrink-0 mx-auto lg:mx-0">{icon}</span>
+      {!collapsed && <span className="hidden lg:block flex-1 text-left truncate">{label}</span>}
+      {badge && !collapsed && (
         <Badge className="size-5 p-0 flex items-center justify-center text-[10px] bg-emerald-500 text-white border-0">
           {badge === 'online' ? '\u25CF' : badge}
         </Badge>
+      )}
+      {badge && collapsed && (
+        <Badge className="hidden lg:flex absolute top-0 right-0 size-2 p-0 bg-emerald-500 border-0" />
       )}
     </button>
   )
 }
 
-function StatusIndicator({ label, connected }: { label: string; connected: boolean }) {
+function StatusIndicator({ label, connected, collapsed }: { label: string; connected: boolean; collapsed?: boolean }) {
   return (
-    <div className="flex items-center gap-2 px-2 py-1.5 text-xs">
-      <span className={cn('size-2 rounded-full shrink-0', connected ? 'bg-emerald-500' : 'bg-muted-foreground/30')} />
-      <span className="hidden lg:block text-muted-foreground truncate">{label}</span>
-      <span className="hidden lg:block ml-auto font-medium text-[10px]">{connected ? 'ON' : 'OFF'}</span>
+    <div className="flex items-center gap-2 px-2 py-1.5 text-xs" title={collapsed ? `${label}: ${connected ? 'ON' : 'OFF'}` : undefined}>
+      <span className={cn('size-2 rounded-full shrink-0 mx-auto lg:mx-0', connected ? 'bg-emerald-500' : 'bg-muted-foreground/30')} />
+      {!collapsed && <span className="hidden lg:block text-muted-foreground truncate">{label}</span>}
+      {!collapsed && <span className="hidden lg:block ml-auto font-medium text-[10px]">{connected ? 'ON' : 'OFF'}</span>}
     </div>
   )
 }
@@ -429,9 +445,14 @@ export default function HomePage() {
     setActiveTab('conversations')
   }
 
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+
   return (
     <div className="flex h-screen overflow-hidden">
-      <nav className="w-14 lg:w-56 border-r bg-muted/30 flex flex-col shrink-0 max-h-screen">
+      <nav className={cn(
+        "border-r bg-muted/30 flex flex-col shrink-0 max-h-screen transition-all duration-200",
+        sidebarCollapsed ? "w-14" : "w-14 lg:w-56"
+      )}>
         <div className="h-14 flex items-center px-3 lg:px-4 border-b">
           <div className="flex items-center gap-2">
             <Image
@@ -439,29 +460,41 @@ export default function HomePage() {
               alt="Whats-Odoo"
               width={32}
               height={32}
-              className="size-8 rounded-lg object-cover"
+              className="size-8 rounded-lg object-cover shrink-0"
               priority
             />
-            <div className="hidden lg:block">
-              <p className="text-sm font-bold leading-tight">Whats-Odoo</p>
-              <p className="text-[10px] text-muted-foreground">v7.11 Middleware</p>
-            </div>
+            {!sidebarCollapsed && (
+              <div className="hidden lg:block min-w-0">
+                <p className="text-sm font-bold leading-tight truncate">Whats-Odoo</p>
+                <p className="text-[10px] text-muted-foreground">v7.12 Middleware</p>
+              </div>
+            )}
           </div>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="size-7 ml-auto hidden lg:flex shrink-0"
+            onClick={() => setSidebarCollapsed(c => !c)}
+            title={sidebarCollapsed ? 'Expandir menu' : 'Recolher menu'}
+          >
+            {sidebarCollapsed ? <PanelRightOpen className="size-4" /> : <PanelRightClose className="size-4" />}
+          </Button>
         </div>
 
         <div className="flex-1 py-2 space-y-1 px-2">
-          <NavItem icon={<LayoutDashboard className="size-4" />} label="Dashboard" active={activeTab === 'dashboard'} onClick={() => setActiveTab('dashboard')} />
-          <NavItem icon={<Smartphone className="size-4" />} label="WhatsApp" active={activeTab === 'whatsapp'} onClick={() => setActiveTab('whatsapp')} badge={wa.status.connected ? 'online' : undefined} />
+          <NavItem icon={<LayoutDashboard className="size-4" />} label="Dashboard" active={activeTab === 'dashboard'} onClick={() => setActiveTab('dashboard')} collapsed={sidebarCollapsed} />
+          <NavItem icon={<Smartphone className="size-4" />} label="WhatsApp" active={activeTab === 'whatsapp'} onClick={() => setActiveTab('whatsapp')} badge={wa.status.connected ? 'online' : undefined} collapsed={sidebarCollapsed} />
           <NavItem
             icon={<MessageCircle className="size-4" />} label="Conversas" active={activeTab === 'conversations'} onClick={() => setActiveTab('conversations')}
             badge={wa.conversations.reduce((s, c) => s + c.unreadCount, 0) > 0 ? String(wa.conversations.reduce((s, c) => s + c.unreadCount, 0)) : undefined}
+            collapsed={sidebarCollapsed}
           />
-          <NavItem icon={<Settings className="size-4" />} label="Configuracoes" active={activeTab === 'settings'} onClick={() => setActiveTab('settings')} />
+          <NavItem icon={<Settings className="size-4" />} label="Configuracoes" active={activeTab === 'settings'} onClick={() => setActiveTab('settings')} collapsed={sidebarCollapsed} />
         </div>
 
         <div className="p-2 border-t space-y-1">
-          <StatusIndicator label="WhatsApp" connected={wa.status.connected} />
-          <StatusIndicator label="Odoo" connected={odoo.status.connected} />
+          <StatusIndicator label="WhatsApp" connected={wa.status.connected} collapsed={sidebarCollapsed} />
+          <StatusIndicator label="Odoo" connected={odoo.status.connected} collapsed={sidebarCollapsed} />
         </div>
       </nav>
 
@@ -515,14 +548,14 @@ export default function HomePage() {
             onLogMessage={odoo.logMessage}
             isSyncing={wa.syncProgress?.isSyncing}
             syncProgress={wa.syncProgress?.progress}
-            // New in v7.9
             onGetContacts={wa.getContacts}
             onStartConversation={wa.startConversation}
             onFetchOdooHistory={(model, recordId) => odoo.fetchHistory({ model, recordId })}
             onInjectHistory={wa.injectHistory}
             linkedOdooRecords={linkedOdooRecords}
-            // New in v7.10
             onCreateOdooContact={odoo.createContact}
+            onDeleteConversation={wa.deleteConversation}
+            onRefreshData={wa.refreshData}
           />
           </div>
         )}

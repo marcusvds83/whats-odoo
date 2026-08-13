@@ -185,3 +185,68 @@ Stage Summary:
 - Version: 7.11.0
 - Single-process architecture preserved (no mini-services started)
 - File-based Baileys auth preserved (works correctly with Render's persistent disk)
+
+---
+Task ID: FIX-V712
+Agent: main
+Task: Fix incoming messages not appearing + collapsible sidebars + delete conversation + refresh button
+
+Work Log:
+- Fixed messages.upsert handler in server.js:
+  * Added logging to debug message reception
+  * More robust timestamp parsing (handles Baileys' edge cases)
+  * Added support for more message types (templates, buttons, lists, ptt)
+  * Now serializes timestamp to ISO string before emitting (was sending Date object which becomes "{}" on the wire)
+  * Profile picture fetch moved to background (non-blocking)
+  * AutoSync moved to background (non-blocking)
+- Fixed send-message and send-media handlers similarly (timestamp serialization)
+- Fixed get-messages handler to serialize timestamps (was returning raw Date objects)
+- Added messages.update handler for status updates (sent → delivered → read)
+- Improved use-whatsapp.ts whatsapp:message handler:
+  * Added console.log for debugging
+  * Normalize JIDs (strip :xx suffix) for safer comparison
+  * Added whatsappId fallback dedup
+  * Preserve _isDeviceContact flag when updating
+- Added whatsapp:message:status event listener (updates message status in real-time)
+- Added whatsapp:conversation:deleted event listener (clears active chat if needed)
+- Added deleteConversation(jid) method to use-whatsapp hook
+- Added refreshData() method to use-whatsapp hook (re-fetches chats & contacts from phone)
+- Added whatsapp:delete-conversation socket handler in server.js (deletes from conversations Map, emits conversation:deleted event)
+- Added whatsapp:refresh-data socket handler in server.js:
+  * Re-fetches all chats via waSocket.getChats()
+  * Re-fetches all contacts via waSocket.getContacts()
+  * Re-fetches profile pictures for conversations missing one (limit 10 to avoid rate-limit)
+  * Returns counts of fetched items
+- Updated ConversationList.tsx:
+  * Added refresh button (RefreshCw icon, spins while loading) in header
+  * Added delete button on hover (Trash2 icon, with confirmation dialog)
+  * Added Dialog component for delete confirmation
+  * Imported Tooltip, Dialog, RefreshCw, Trash2, MoreVertical icons
+  * Added onDeleteConversation and onRefreshData props
+- Updated ChatView.tsx:
+  * Added shrink-0 to Avatar in header (prevents avatar from being squeezed when right panel opens)
+  * Added delete conversation button (Trash2) in header with Tooltip
+  * Added onDeleteConversation prop
+- Updated page.tsx:
+  * Made left sidebar (app nav) collapsible — added sidebarCollapsed state + toggle button (PanelRightOpen/PanelRightClose)
+  * NavItem and StatusIndicator now accept `collapsed` prop
+  * Layout fix: ChatView no longer uses "hidden lg:block" — it always stays visible (shrinks instead)
+  * Conversation list width: w-72 lg:w-80 xl:w-96 (slightly narrower to give chat more room)
+  * Odoo panel: w-72 lg:w-80 xl:w-96 with shrink-0 (its own column, never overlaps chat)
+  * Collapsed Odoo panel: w-12 slim strip with open button
+  * Added onDeleteConversation and onRefreshData props passed through to ConversationsView
+  * Updated version label to v7.12 Middleware
+- Bumped version to 7.12.0 in package.json
+- Updated start.sh banner to v7.12
+- Updated server.js header comment to v7.12
+- Build test: npx next build succeeded
+- server.js syntax check: OK
+
+Stage Summary:
+- Incoming messages now appear in active chat (root cause: timestamp was being sent as Date object over socket, breaking the message append)
+- Left sidebar (app nav) is now collapsible via a toggle button
+- Right sidebar (Odoo panel) layout fixed — never overlaps the chat, takes its own column
+- Avatar in chat header has shrink-0 so it's never squeezed when the right panel opens
+- Delete conversation: button appears on hover in list (with confirmation) + button in chat header
+- Refresh button in conversation list header re-fetches chats, contacts, and missing profile pictures from phone
+- Version: 7.12.0

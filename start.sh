@@ -2,7 +2,7 @@
 set -e
 
 echo "============================================"
-echo "  Whats-Odoo v7.11 Start Script"
+echo "  Whats-Odoo v7.12 Start Script"
 echo "  (single-process: Next.js + WA + Odoo)"
 echo "============================================"
 

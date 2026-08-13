@@ -31,6 +31,7 @@ import {
   DownloadCloud,
   Loader2,
   Link2,
+  Trash2,
 } from 'lucide-react'
 
 interface ChatViewProps {
@@ -64,6 +65,8 @@ interface ChatViewProps {
     source: string
   }>; error?: string }>
   onInjectHistory?: (jid: string, messages: any[]) => Promise<{ success: boolean; added?: number; skipped?: number; error?: string }>
+  // New in v7.12: delete conversation
+  onDeleteConversation?: (jid: string) => void
 }
 
 function formatMessageTime(dateStr: string): string {
@@ -127,6 +130,7 @@ export function ChatView({
   odooLinkedRecords,
   onFetchOdooHistory,
   onInjectHistory,
+  onDeleteConversation,
 }: ChatViewProps) {
   const [inputText, setInputText] = useState('')
   const [isSending, setIsSending] = useState(false)
@@ -250,7 +254,7 @@ export function ChatView({
       {/* Header — fixed */}
       <div className="shrink-0 border-b bg-background/95 backdrop-blur">
         <div className="flex items-center gap-3 px-4 py-3">
-          <Avatar className="size-10">
+          <Avatar className="size-10 shrink-0">
             {conversation.avatarUrl && <AvatarImage src={conversation.avatarUrl} alt={displayName} />}
             <AvatarFallback className="bg-primary/10 text-primary text-sm">
               {displayName.split(' ').map(w => w[0]).filter(Boolean).slice(0, 2).join('').toUpperCase() || <User className="size-4" />}
@@ -322,6 +326,27 @@ export function ChatView({
                 <span>Nada novo</span>
               )}
             </div>
+          )}
+
+          {/* Delete conversation button */}
+          {onDeleteConversation && (
+            <TooltipProvider delayDuration={300}>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="size-8 shrink-0 hover:bg-destructive/10 hover:text-destructive"
+                    onClick={() => onDeleteConversation(conversation.jid)}
+                  >
+                    <Trash2 className="size-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom" className="text-xs">
+                  Excluir conversa
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
           )}
         </div>
       </div>
