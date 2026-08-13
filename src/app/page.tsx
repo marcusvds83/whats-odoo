@@ -444,7 +444,7 @@ export default function HomePage() {
             />
             <div className="hidden lg:block">
               <p className="text-sm font-bold leading-tight">Whats-Odoo</p>
-              <p className="text-[10px] text-muted-foreground">v7.10 Middleware</p>
+              <p className="text-[10px] text-muted-foreground">v7.11 Middleware</p>
             </div>
           </div>
         </div>

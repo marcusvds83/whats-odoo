@@ -61,6 +61,16 @@ export function useWhatsApp() {
   // Odoo sync state per conversation
   const [odooSyncMap, setOdooSyncMap] = useState<Map<string, OdooSyncInfo>>(new Map())
 
+  // Ref mirror of currentJid — used inside the socket.on('whatsapp:message')
+  // handler so we don't capture a stale closure of currentJid (which was null
+  // at mount). Without this, incoming/sent-echo messages never get appended to
+  // currentMessages because the comparison `data.conversationJid === currentJid`
+  // always evaluated to `=== null`.
+  const currentJidRef = useRef<string | null>(null)
+  useEffect(() => {
+    currentJidRef.current = currentJid
+  }, [currentJid])
+
   useEffect(() => {
     const socket = io('/whatsapp', {
       transports: ['websocket', 'polling'],
@@ -126,8 +136,16 @@ export function useWhatsApp() {
     })
 
     socket.on('whatsapp:message', (data: { conversationJid: string; message: WhatsAppMessage; conversation: WhatsAppConversation }) => {
-      if (data.conversationJid === currentJid) {
-        setCurrentMessages(prev => [...prev, data.message])
+      // Use the ref so we always see the latest currentJid even though this
+      // handler is registered once on mount. Without this, sent/incoming
+      // messages would never be appended to the active chat view.
+      if (data.conversationJid === currentJidRef.current) {
+        setCurrentMessages(prev => {
+          // Dedup by message id — the server echoes our own sends back to us,
+          // and Baileys may also deliver the same upsert. Avoid duplicate bubbles.
+          if (data.message?.id && prev.some(m => m.id === data.message.id)) return prev
+          return [...prev, data.message]
+        })
       }
       // Update conversation in list
       if (data.conversation && data.conversation.phone && /^\d{7,}$/.test(data.conversation.phone)) {

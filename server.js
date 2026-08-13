@@ -1,5 +1,5 @@
 // ====================================================================
-// Whats-Odoo v7.9 — SINGLE-PROCESS SERVER
+// Whats-Odoo v7.11 — SINGLE-PROCESS SERVER
 // Everything in one process: Next.js + WhatsApp (Baileys) + Odoo (XML-RPC)
 // Designed for Render 512MB RAM
 // ====================================================================
