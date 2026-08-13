@@ -507,6 +507,25 @@ function escapeHtml(text: string): string {
     .replace(/\n/g, '<br/>')
 }
 
+function stripHtml(html: string): string {
+  // Replace <br/> and <br> and <p> with newlines first
+  let text = html
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n')
+    .replace(/<p[^>]*>/gi, '')
+    .replace(/<[^>]+>/g, '') // strip all remaining tags
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .trim()
+  // Collapse multiple blank lines
+  text = text.replace(/\n{3,}/g, '\n\n')
+  return text
+}
+
 // ========== Socket.io Events ==========
 io.on('connection', (socket) => {
   console.log(`[Odoo IO] Client connected: ${socket.id}`)
@@ -688,6 +707,12 @@ io.on('connection', (socket) => {
       description?: string
       type?: string
       whatsapp_number?: string
+      messages?: Array<{
+        fromMe: boolean
+        textContent: string | null
+        mediaType?: string | null
+        timestamp: string
+      }>
     }, callback) => {
       try {
         const values: Record<string, any> = {
@@ -701,8 +726,107 @@ io.on('connection', (socket) => {
         if (data.whatsapp_number) values.whatsapp_number = data.whatsapp_number
 
         const id = await odooCreate('crm.lead', values)
-        callback({ success: true, id })
+
+        // If conversation history was provided, post all messages to the chatter
+        let postedMessages = 0
+        if (data.messages && data.messages.length > 0) {
+          console.log(`[Odoo] Posting ${data.messages.length} history messages to crm.lead#${id}`)
+          // Sort by timestamp ascending so chatter shows chronological order
+          const sorted = [...data.messages].sort(
+            (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+          )
+          for (const m of sorted) {
+            try {
+              const direction = m.fromMe ? 'Enviada' : 'Recebida'
+              const dateLabel = new Date(m.timestamp).toLocaleString('pt-BR')
+              const mediaLabel = m.mediaType ? ` [${m.mediaType}]` : ''
+              const body = m.textContent
+                ? `<p><strong>📱 WhatsApp ${direction}</strong> <em>(${dateLabel})</em>${mediaLabel}</p><p>${escapeHtml(m.textContent)}</p>`
+                : `<p><strong>📱 WhatsApp ${direction}</strong> <em>(${dateLabel})</em>${mediaLabel} [Mídia]</p>`
+              await odooPostMessage('crm.lead', id, body)
+              postedMessages++
+            } catch (err: any) {
+              console.error(`[Odoo] Failed to post history message:`, err.message)
+            }
+          }
+          console.log(`[Odoo] Posted ${postedMessages}/${data.messages.length} messages to crm.lead#${id}`)
+        }
+
+        callback({ success: true, id, postedMessages })
         io.emit('odoo:record:created', { model: 'crm.lead', id, values })
+      } catch (error: any) {
+        callback({ success: false, error: error.message })
+      }
+    }
+  )
+
+  // ===== Fetch conversation history from Odoo chatter =====
+  // Reads mail.message records attached to a given model/record and converts
+  // them back to WhatsApp-style message objects so the frontend can merge
+  // them into the local conversation.
+  socket.on(
+    'odoo:fetch-history',
+    async (data: {
+      model: string
+      recordId: number
+      limit?: number
+    }, callback) => {
+      try {
+        if (!odooConfig.uid) {
+          callback({ success: false, error: 'Not authenticated with Odoo' })
+          return
+        }
+
+        // Read mail.message records linked to this record
+        const domain = [
+          ['model', '=', data.model],
+          ['res_id', '=', data.recordId],
+        ]
+        const messages = await odooExecuteKw('mail.message', 'search_read', [domain], {
+          fields: ['id', 'body', 'author_id', 'email_from', 'date', 'message_type', 'subtype_id', 'create_date'],
+          order: 'date asc',
+          limit: data.limit || 200,
+        })
+
+        // Convert each mail.message back to a WhatsApp-style message
+        // We try to detect direction (sent/received) and strip HTML
+        const converted = (messages || []).map((msg: any) => {
+          const body: string = msg.body || ''
+          // Strip HTML tags
+          const plainText = stripHtml(body)
+          // Detect direction from "Enviada" / "Recebida" markers we wrote earlier
+          const isSent = /WhatsApp\s+Enviada/i.test(body)
+          const isReceived = /WhatsApp\s+Recebida/i.test(body)
+
+          // If neither marker matches, this is some other chatter message (note, etc.)
+          // Treat as a received message by default
+          const fromMe = isSent
+
+          // Try to extract a timestamp — prefer the explicit date in body, fall back to msg.date
+          let timestamp: string
+          const dateMatch = body.match(/\(([^)]+)\)/)
+          if (dateMatch) {
+            const parsed = new Date(dateMatch[1])
+            if (!isNaN(parsed.getTime())) {
+              timestamp = parsed.toISOString()
+            } else {
+              timestamp = msg.date || msg.create_date || new Date().toISOString()
+            }
+          } else {
+            timestamp = msg.date || msg.create_date || new Date().toISOString()
+          }
+
+          return {
+            externalId: `odoo-${msg.id}`,
+            fromMe,
+            textContent: plainText || null,
+            mediaType: null,
+            timestamp,
+            source: 'odoo',
+          }
+        })
+
+        callback({ success: true, data: converted })
       } catch (error: any) {
         callback({ success: false, error: error.message })
       }

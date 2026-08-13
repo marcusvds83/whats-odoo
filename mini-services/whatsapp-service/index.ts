@@ -86,6 +86,10 @@ const conversations = new Map<string, {
 // Contact name cache from WhatsApp — device contact names (highest priority)
 const contactNames = new Map<string, string>()
 
+// Device contacts phonebook — full list of contacts synced from device
+// (even those without an existing conversation yet)
+const deviceContacts = new Map<string, { jid: string; phone: string; name: string; avatarUrl: string | null }>()
+
 // ========== HTTP + Socket.io Server ==========
 const httpServer = createServer()
 const io = new Server(httpServer, {
@@ -136,13 +140,14 @@ function getOrCreateConversation(jid: string, pushName?: string | null) {
   if (!isValidPhoneJid(jid)) return null
 
   const cachedName = contactNames.get(jidNormalizedUser(jid)) || null
+  const phone = extractPhone(jid)!
 
   if (!conversations.has(jid)) {
     conversations.set(jid, {
       jid,
       // Device contact name has highest priority, then pushName
       name: cachedName || pushName || null,
-      phone: extractPhone(jid),
+      phone,
       pushName: pushName || null,
       avatarUrl: null,
       lastMessage: null,
@@ -158,6 +163,17 @@ function getOrCreateConversation(jid: string, pushName?: string | null) {
   } else if (pushName && !conv.name) {
     conv.pushName = pushName
   }
+
+  // Also track in deviceContacts phonebook (so conversations started from
+  // incoming messages appear in the Contacts tab too)
+  const displayName = cachedName || pushName || phone
+  if (!deviceContacts.has(jid)) {
+    deviceContacts.set(jid, { jid, phone, name: displayName, avatarUrl: null })
+  } else if (cachedName) {
+    // Update name if device contact name becomes available
+    deviceContacts.get(jid)!.name = cachedName
+  }
+
   return conv
 }
 
@@ -221,10 +237,50 @@ function updateConversationName(jid: string, contactName: string) {
   if (!isValidPhoneJid(jid)) return
   const normalizedJid = jidNormalizedUser(jid)
   contactNames.set(normalizedJid, contactName)
+  // Also track in deviceContacts phonebook
+  const phone = extractPhone(jid)!
+  const existing = deviceContacts.get(jid)
+  if (existing) {
+    existing.name = contactName
+  } else {
+    deviceContacts.set(jid, { jid, phone, name: contactName, avatarUrl: null })
+  }
   const conv = conversations.get(jid)
   if (conv) {
     // Device contact name always takes priority
     conv.name = contactName
+  }
+}
+
+// ========== Normalize phone number to WhatsApp JID ==========
+function normalizePhoneToJid(phone: string): string | null {
+  // Strip all non-digits
+  const digits = phone.replace(/\D/g, '')
+  if (digits.length < 7) return null
+  return `${digits}@s.whatsapp.net`
+}
+
+// ========== Serialize device contacts list ==========
+function getDeviceContactsList() {
+  return Array.from(deviceContacts.values())
+    .sort((a, b) => a.name.localeCompare(b.name))
+}
+
+// ========== Check if phone number is on WhatsApp ==========
+async function checkPhoneNumber(phone: string): Promise<{ exists: boolean; jid: string }> {
+  const jid = normalizePhoneToJid(phone)
+  if (!jid) return { exists: false, jid: '' }
+  if (!waSocket || connectionState.connection !== 'open') {
+    return { exists: false, jid }
+  }
+  try {
+    const result = await waSocket.onWhatsApp(jid)
+    if (result && result.length > 0) {
+      return { exists: !!result[0].exists, jid: result[0].jid || jid }
+    }
+    return { exists: false, jid }
+  } catch {
+    return { exists: false, jid }
   }
 }
 
@@ -284,6 +340,7 @@ async function connectWhatsApp() {
         lastQrCode = null
         conversations.clear()
         contactNames.clear()
+        deviceContacts.clear()
         emitConversationsList()
       }
 
@@ -789,6 +846,7 @@ io.on('connection', (socket) => {
         lastQrCode = null
         conversations.clear()
         contactNames.clear()
+        deviceContacts.clear()
         io.emit('whatsapp:status', { connected: false, reason: 'logged_out', hasSession: false })
         io.emit('whatsapp:conversations', [])
         callback({ success: true })
@@ -807,6 +865,162 @@ io.on('connection', (socket) => {
       if (conv && url) conv.avatarUrl = url
       callback({ success: true, url })
     } catch { callback({ success: false, url: null }) }
+  })
+
+  // ===== Get device contacts (phonebook) =====
+  socket.on('whatsapp:get-contacts', (data: { query?: string }, callback) => {
+    try {
+      let list = getDeviceContactsList()
+      if (data?.query) {
+        const q = data.query.toLowerCase()
+        list = list.filter(c =>
+          c.name.toLowerCase().includes(q) ||
+          c.phone.includes(q)
+        )
+      }
+      callback({ success: true, data: list.slice(0, 200) })
+    } catch (error: any) {
+      callback({ success: false, error: error.message, data: [] })
+    }
+  })
+
+  // ===== Start a conversation from a phone number =====
+  // Creates a JID from the phone, verifies it's on WhatsApp,
+  // ensures the conversation exists in memory, returns the JID
+  socket.on('whatsapp:start-conversation', async (data: {
+    phone: string
+    name?: string
+  }, callback) => {
+    try {
+      if (!waSocket || connectionState.connection !== 'open') {
+        callback({ success: false, error: 'WhatsApp not connected' })
+        return
+      }
+
+      const jid = normalizePhoneToJid(data.phone)
+      if (!jid) {
+        callback({ success: false, error: 'Invalid phone number' })
+        return
+      }
+
+      // Check if the number is on WhatsApp
+      const check = await checkPhoneNumber(data.phone)
+      if (!check.exists) {
+        callback({ success: false, error: 'Phone number is not on WhatsApp' })
+        return
+      }
+
+      const realJid = check.jid || jid
+
+      // Get or create conversation
+      const conv = getOrCreateConversation(realJid, data.name || null)
+      if (!conv) {
+        callback({ success: false, error: 'Could not create conversation' })
+        return
+      }
+
+      // If a name was provided and there's no device contact name, use it
+      if (data.name && !contactNames.has(realJid)) {
+        conv.name = data.name
+      }
+
+      // Try to fetch profile picture
+      try {
+        if (!conv.avatarUrl) {
+          const picUrl = await waSocket!.profilePictureUrl(realJid, 'image').catch(() => null)
+          if (picUrl) conv.avatarUrl = picUrl
+        }
+      } catch {}
+
+      // Notify all clients of the new/updated conversation
+      emitConversationsList()
+
+      callback({
+        success: true,
+        jid: realJid,
+        conversation: serializeConversation(conv),
+      })
+    } catch (error: any) {
+      callback({ success: false, error: error.message })
+    }
+  })
+
+  // ===== Inject historical messages (e.g., pulled from Odoo chatter) =====
+  // Adds messages to a conversation if they're not already present (by whatsappId or content+timestamp).
+  // Used when the user clicks "Pull from Odoo" to restore history that was lost from local memory.
+  socket.on('whatsapp:inject-history', (data: {
+    jid: string
+    messages: Array<{
+      fromMe: boolean
+      textContent: string | null
+      mediaType?: string | null
+      timestamp: string // ISO string
+      source?: string // 'odoo' | 'whatsapp'
+      externalId?: string // optional dedup key
+    }>
+  }, callback) => {
+    try {
+      const conv = conversations.get(data.jid)
+      if (!conv) {
+        callback({ success: false, error: 'Conversation not found' })
+        return
+      }
+
+      let added = 0
+      let skipped = 0
+
+      for (const m of data.messages) {
+        // Dedup by externalId if provided
+        if (m.externalId && conv.messages.some(existing => existing.whatsappId === m.externalId)) {
+          skipped++
+          continue
+        }
+
+        // Dedup by timestamp + content (within 5s window)
+        const ts = new Date(m.timestamp)
+        const isDup = conv.messages.some(existing =>
+          existing.fromMe === m.fromMe &&
+          existing.textContent === m.textContent &&
+          Math.abs(existing.timestamp.getTime() - ts.getTime()) < 5000
+        )
+        if (isDup) {
+          skipped++
+          continue
+        }
+
+        const newMsg = {
+          id: `odoo-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+          whatsappId: m.externalId || null,
+          fromMe: m.fromMe,
+          textContent: m.textContent,
+          mediaType: m.mediaType || null,
+          timestamp: ts,
+          status: 'delivered',
+        }
+        conv.messages.push(newMsg)
+        added++
+      }
+
+      // Sort messages by timestamp
+      conv.messages.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime())
+
+      // Update lastMessage / lastMessageAt if needed
+      if (conv.messages.length > 0) {
+        const last = conv.messages[conv.messages.length - 1]
+        if (!conv.lastMessageAt || last.timestamp > conv.lastMessageAt) {
+          conv.lastMessageAt = last.timestamp
+          if (last.textContent) conv.lastMessage = last.textContent
+          else if (last.mediaType) conv.lastMessage = `[${last.mediaType}]`
+        }
+      }
+
+      // Notify clients of the updated conversation
+      io.emit('whatsapp:conversation:update', serializeConversation(conv))
+
+      callback({ success: true, added, skipped })
+    } catch (error: any) {
+      callback({ success: false, error: error.message })
+    }
   })
 
   socket.on('disconnect', () => console.log(`[IO] Client disconnected: ${socket.id}`))

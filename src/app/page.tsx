@@ -1,6 +1,7 @@
 'use client'
 
 import { useState, useMemo } from 'react'
+import Image from 'next/image'
 import { useWhatsApp } from '@/lib/use-whatsapp'
 import { useOdoo } from '@/lib/use-odoo'
 import { QRCodePanel } from '@/components/whatsapp/QRCodePanel'
@@ -226,6 +227,11 @@ function ConversationsView({
   onLogMessage,
   isSyncing,
   syncProgress,
+  onGetContacts,
+  onStartConversation,
+  onFetchOdooHistory,
+  onInjectHistory,
+  linkedOdooRecords,
 }: {
   conversations: any[]
   selectedJid: string | null
@@ -248,7 +254,22 @@ function ConversationsView({
   onLogMessage: any
   isSyncing?: boolean
   syncProgress?: number
+  onGetContacts?: (query?: string) => Promise<{ success: boolean; data?: any[]; error?: string }>
+  onStartConversation?: (phone: string, name?: string) => Promise<{ success: boolean; jid?: string; error?: string }>
+  onFetchOdooHistory?: (model: string, recordId: number) => Promise<{ success: boolean; data?: any[]; error?: string }>
+  onInjectHistory?: (jid: string, messages: any[]) => Promise<{ success: boolean; added?: number; skipped?: number; error?: string }>
+  linkedOdooRecords?: Array<{ model: string; recordId: number; recordName?: string }>
 }) {
+  // Build conversation history payload (for Odoo lead creation)
+  const conversationHistory = useMemo(() => {
+    return currentMessages.map(m => ({
+      fromMe: m.fromMe,
+      textContent: m.textContent,
+      mediaType: m.mediaType,
+      timestamp: m.timestamp,
+    }))
+  }, [currentMessages])
+
   return (
     <div className="flex h-full min-h-0 overflow-hidden">
       <div className={cn(
@@ -261,6 +282,11 @@ function ConversationsView({
           onSelect={onSelectConversation}
           isSyncing={isSyncing}
           syncProgress={syncProgress}
+          // New in v7.9: contacts tab + Odoo contact search
+          onGetContacts={onGetContacts}
+          odooConnected={odooStatus.connected}
+          onSearchOdooContacts={onSearchContacts}
+          onStartConversation={onStartConversation}
         />
       </div>
 
@@ -272,6 +298,11 @@ function ConversationsView({
               messages={currentMessages}
               onSendMessage={onSendMessage}
               onMarkRead={onMarkRead}
+              // New in v7.9: Pull from Odoo button
+              odooConnected={odooStatus.connected}
+              odooLinkedRecords={linkedOdooRecords}
+              onFetchOdooHistory={onFetchOdooHistory}
+              onInjectHistory={onInjectHistory}
             />
           </div>
 
@@ -302,6 +333,8 @@ function ConversationsView({
                 onCreateTask={onCreateTask}
                 onLogMessage={onLogMessage}
                 odooConnected={odooStatus.connected}
+                // New in v7.9: pass conversation history for lead creation
+                conversationHistory={conversationHistory}
               />
             </div>
           )}
@@ -376,6 +409,15 @@ export default function HomePage() {
     return wa.conversations.find(c => c.jid === selectedJid) || null
   }, [selectedJid, wa.conversations])
 
+  // Derive linked Odoo records for the currently selected conversation
+  // Used by the ChatView's "Pull from Odoo" button
+  const linkedOdooRecords = useMemo(() => {
+    if (!selectedJid) return undefined
+    const links = odoo.conversationLinks.get(selectedJid)
+    if (!links || links.length === 0) return undefined
+    return links
+  }, [selectedJid, odoo.conversationLinks])
+
   const handleSelectConversation = (jid: string) => {
     setSelectedJid(jid)
     wa.loadMessages(jid)
@@ -388,12 +430,17 @@ export default function HomePage() {
       <nav className="w-14 lg:w-56 border-r bg-muted/30 flex flex-col shrink-0 max-h-screen">
         <div className="h-14 flex items-center px-3 lg:px-4 border-b">
           <div className="flex items-center gap-2">
-            <div className="flex size-8 items-center justify-center rounded-lg bg-emerald-600 text-white">
-              <MessageCircle className="size-4" />
-            </div>
+            <Image
+              src="/logo.png"
+              alt="Whats-Odoo"
+              width={32}
+              height={32}
+              className="size-8 rounded-lg object-cover"
+              priority
+            />
             <div className="hidden lg:block">
-              <p className="text-sm font-bold leading-tight">WA-Odoo</p>
-              <p className="text-[10px] text-muted-foreground">v7.8 Middleware</p>
+              <p className="text-sm font-bold leading-tight">Whats-Odoo</p>
+              <p className="text-[10px] text-muted-foreground">v7.9 Middleware</p>
             </div>
           </div>
         </div>
@@ -464,6 +511,12 @@ export default function HomePage() {
             onLogMessage={odoo.logMessage}
             isSyncing={wa.syncProgress?.isSyncing}
             syncProgress={wa.syncProgress?.progress}
+            // New in v7.9
+            onGetContacts={wa.getContacts}
+            onStartConversation={wa.startConversation}
+            onFetchOdooHistory={(model, recordId) => odoo.fetchHistory({ model, recordId })}
+            onInjectHistory={wa.injectHistory}
+            linkedOdooRecords={linkedOdooRecords}
           />
           </div>
         )}

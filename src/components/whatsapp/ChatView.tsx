@@ -7,6 +7,12 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
 import { Separator } from '@/components/ui/separator'
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
 import {
   Send,
@@ -22,6 +28,9 @@ import {
   Clock,
   MessageSquare,
   ArrowDown,
+  DownloadCloud,
+  Loader2,
+  Link2,
 } from 'lucide-react'
 
 interface ChatViewProps {
@@ -43,6 +52,18 @@ interface ChatViewProps {
   }>
   onSendMessage: (jid: string, text: string) => Promise<boolean>
   onMarkRead: (jid: string) => void
+  // New in v7.9: pull history from Odoo
+  odooConnected?: boolean
+  odooLinkedRecords?: Array<{ model: string; recordId: number; recordName?: string }>
+  onFetchOdooHistory?: (model: string, recordId: number) => Promise<{ success: boolean; data?: Array<{
+    externalId: string
+    fromMe: boolean
+    textContent: string | null
+    mediaType: string | null
+    timestamp: string
+    source: string
+  }>; error?: string }>
+  onInjectHistory?: (jid: string, messages: any[]) => Promise<{ success: boolean; added?: number; skipped?: number; error?: string }>
 }
 
 function formatMessageTime(dateStr: string): string {
@@ -102,10 +123,16 @@ export function ChatView({
   messages,
   onSendMessage,
   onMarkRead,
+  odooConnected,
+  odooLinkedRecords,
+  onFetchOdooHistory,
+  onInjectHistory,
 }: ChatViewProps) {
   const [inputText, setInputText] = useState('')
   const [isSending, setIsSending] = useState(false)
   const [showScrollButton, setShowScrollButton] = useState(false)
+  const [isPullingHistory, setIsPullingHistory] = useState(false)
+  const [pullResult, setPullResult] = useState<{ added: number; skipped: number } | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const scrollViewportRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
@@ -119,6 +146,55 @@ export function ChatView({
   useEffect(() => {
     if (conversation) onMarkRead(conversation.jid)
   }, [conversation?.jid, onMarkRead])
+
+  // Reset pull result when conversation changes
+  useEffect(() => {
+    setPullResult(null)
+  }, [conversation?.jid])
+
+  // Pull history from Odoo — used when the user comes back the next day
+  // and the local conversation history was lost from memory.
+  const handlePullFromOdoo = useCallback(async () => {
+    if (!conversation || !odooLinkedRecords || odooLinkedRecords.length === 0) return
+    if (!onFetchOdooHistory || !onInjectHistory) return
+
+    setIsPullingHistory(true)
+    setPullResult(null)
+    try {
+      // Pull from all linked records (typically just one lead or contact)
+      const allMessages: any[] = []
+      for (const rec of odooLinkedRecords) {
+        const result = await onFetchOdooHistory(rec.model, rec.recordId)
+        if (result.success && result.data) {
+          allMessages.push(...result.data)
+        }
+      }
+
+      if (allMessages.length === 0) {
+        setPullResult({ added: 0, skipped: 0 })
+        setTimeout(() => setPullResult(null), 3000)
+        return
+      }
+
+      // Inject into local conversation
+      const injectResult = await onInjectHistory(conversation.jid, allMessages)
+      if (injectResult.success) {
+        setPullResult({
+          added: injectResult.added || 0,
+          skipped: injectResult.skipped || 0,
+        })
+        setTimeout(() => setPullResult(null), 5000)
+      } else {
+        setPullResult({ added: 0, skipped: 0 })
+        setTimeout(() => setPullResult(null), 3000)
+      }
+    } catch (err) {
+      setPullResult({ added: 0, skipped: 0 })
+      setTimeout(() => setPullResult(null), 3000)
+    } finally {
+      setIsPullingHistory(false)
+    }
+  }, [conversation, odooLinkedRecords, onFetchOdooHistory, onInjectHistory])
 
   // Track scroll position for scroll-to-bottom button
   useEffect(() => {
@@ -188,8 +264,65 @@ export function ChatView({
               ) : (
                 <span>{conversation.jid.split('@')[0]}</span>
               )}
+              {odooLinkedRecords && odooLinkedRecords.length > 0 && (
+                <Badge variant="outline" className="ml-1 text-[10px] gap-0.5 py-0 h-4 bg-amber-50 text-amber-700 border-amber-200">
+                  <Link2 className="size-2.5" />
+                  Odoo
+                </Badge>
+              )}
             </div>
           </div>
+
+          {/* Pull from Odoo button — only shown when conversation is linked to Odoo */}
+          {odooConnected && odooLinkedRecords && odooLinkedRecords.length > 0 && onFetchOdooHistory && onInjectHistory && (
+            <TooltipProvider delayDuration={300}>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-8 gap-1.5 shrink-0 text-xs"
+                    disabled={isPullingHistory}
+                    onClick={handlePullFromOdoo}
+                  >
+                    {isPullingHistory ? (
+                      <Loader2 className="size-3.5 animate-spin" />
+                    ) : (
+                      <DownloadCloud className="size-3.5" />
+                    )}
+                    <span className="hidden sm:inline">
+                      {isPullingHistory ? 'Buscando...' : 'Trazer do Odoo'}
+                    </span>
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom" className="max-w-xs">
+                  <p>Busca o histórico da conversa armazenado no Odoo (chatter) e mescla com a conversa local atual.</p>
+                  <p className="text-xs text-muted-foreground mt-1">
+                    Use quando voltar no dia seguinte e o histórico do WhatsApp não estiver mais carregado.
+                  </p>
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          )}
+
+          {/* Pull result feedback */}
+          {pullResult && (
+            <div className={cn(
+              'flex items-center gap-1.5 px-2 py-1 rounded-md text-[11px] shrink-0',
+              pullResult.added > 0
+                ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                : 'bg-muted text-muted-foreground border'
+            )}>
+              {pullResult.added > 0 ? (
+                <>
+                  <CheckCheck className="size-3" />
+                  <span>+{pullResult.added} mensagens</span>
+                </>
+              ) : (
+                <span>Nada novo</span>
+              )}
+            </div>
+          )}
         </div>
       </div>
 

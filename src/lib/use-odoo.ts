@@ -51,6 +51,10 @@ export function useOdoo() {
   })
   const [lastSyncResult, setLastSyncResult] = useState<AutoSyncResult | null>(null)
 
+  // Map of conversation JID -> linked Odoo records (model + recordId)
+  // Updated whenever the Odoo service emits 'odoo:conversation:linked'
+  const [conversationLinks, setConversationLinks] = useState<Map<string, Array<{ model: string; recordId: number }>>>(new Map())
+
   useEffect(() => {
     const socket = io('/odoo', {
       transports: ['websocket', 'polling'],
@@ -84,17 +88,46 @@ export function useOdoo() {
 
     socket.on('odoo:conversation:linked', (data: { jid: string; model: string; recordId: number }) => {
       console.log('[Odoo] Conversation linked:', data)
+      setConversationLinks(prev => {
+        const next = new Map(prev)
+        const existing = next.get(data.jid) || []
+        // Avoid duplicates
+        if (!existing.some(r => r.model === data.model && r.recordId === data.recordId)) {
+          next.set(data.jid, [...existing, { model: data.model, recordId: data.recordId }])
+        }
+        return next
+      })
+    })
+
+    // Also track auto-sync results (from WhatsApp service forwarding)
+    // so the "Pull from Odoo" button knows about auto-created leads/partners
+    socket.on('odoo:autosync:result', (data: AutoSyncResult & { jid?: string }) => {
+      console.log('[Odoo] Auto-sync result:', data)
+      setLastSyncResult(data)
+      // If the result includes a JID (forwarded from WhatsApp service), track links
+      if (data.jid && (data.leadId || data.partnerId)) {
+        setConversationLinks(prev => {
+          const next = new Map(prev)
+          const existing = next.get(data.jid!) || []
+          const additions: Array<{ model: string; recordId: number }> = []
+          if (data.partnerId && !existing.some(r => r.model === 'res.partner' && r.recordId === data.partnerId)) {
+            additions.push({ model: 'res.partner', recordId: data.partnerId })
+          }
+          if (data.leadId && !existing.some(r => r.model === 'crm.lead' && r.recordId === data.leadId)) {
+            additions.push({ model: 'crm.lead', recordId: data.leadId })
+          }
+          if (additions.length > 0) {
+            next.set(data.jid!, [...existing, ...additions])
+          }
+          return next
+        })
+      }
     })
 
     // Auto-sync events
     socket.on('odoo:autosync:settings', (data: AutoSyncSettings) => {
       console.log('[Odoo] Auto-sync settings:', data)
       setAutoSyncSettings(data)
-    })
-
-    socket.on('odoo:autosync:result', (data: AutoSyncResult) => {
-      console.log('[Odoo] Auto-sync result:', data)
-      setLastSyncResult(data)
     })
 
     return () => {
@@ -169,9 +202,45 @@ export function useOdoo() {
     })
   }, [])
 
-  const createLead = useCallback((data: { name: string; phone?: string; partner_id?: number; partner_name?: string; description?: string; type?: string; whatsapp_number?: string }): Promise<{ success: boolean; id?: number; error?: string }> => {
+  const createLead = useCallback((data: {
+    name: string
+    phone?: string
+    partner_id?: number
+    partner_name?: string
+    description?: string
+    type?: string
+    whatsapp_number?: string
+    messages?: Array<{
+      fromMe: boolean
+      textContent: string | null
+      mediaType?: string | null
+      timestamp: string
+    }>
+  }): Promise<{ success: boolean; id?: number; postedMessages?: number; error?: string }> => {
     return new Promise((resolve) => {
       socketRef.current?.emit('odoo:leads:create', data, (response: any) => {
+        resolve(response)
+      })
+    })
+  }, [])
+
+  // ===== Fetch conversation history from Odoo chatter =====
+  // Reads mail.message records linked to a model/record and returns them
+  // as WhatsApp-style message objects so the frontend can merge them back.
+  const fetchHistory = useCallback((data: {
+    model: string
+    recordId: number
+    limit?: number
+  }): Promise<{ success: boolean; data?: Array<{
+    externalId: string
+    fromMe: boolean
+    textContent: string | null
+    mediaType: string | null
+    timestamp: string
+    source: string
+  }>; error?: string }> => {
+    return new Promise((resolve) => {
+      socketRef.current?.emit('odoo:fetch-history', data, (response: any) => {
         resolve(response)
       })
     })
@@ -288,6 +357,8 @@ export function useOdoo() {
     lastSyncResult,
     updateAutoSyncSettings,
     getAutoSyncSettings,
+    // Conversation links (for "Pull from Odoo" button)
+    conversationLinks,
     // Contacts
     searchContacts,
     createContact,
@@ -295,6 +366,8 @@ export function useOdoo() {
     // Leads
     searchLeads,
     createLead,
+    // History
+    fetchHistory,
     // Sales
     searchSales,
     createSale,

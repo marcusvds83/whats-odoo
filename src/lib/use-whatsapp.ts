@@ -29,6 +29,13 @@ export interface SyncProgress {
   messagesCount?: number
 }
 
+export interface DeviceContact {
+  jid: string
+  phone: string
+  name: string
+  avatarUrl: string | null
+}
+
 /**
  * Sort conversations by date (most recent first)
  */
@@ -201,6 +208,48 @@ export function useWhatsApp() {
     })
   }, [])
 
+  // ===== Get device contacts (phonebook) =====
+  const getContacts = useCallback((query?: string): Promise<{ success: boolean; data?: DeviceContact[]; error?: string }> => {
+    return new Promise((resolve) => {
+      socketRef.current?.emit('whatsapp:get-contacts', { query }, (response: any) => {
+        resolve(response)
+      })
+    })
+  }, [])
+
+  // ===== Start a conversation from a phone number =====
+  // Verifies the number is on WhatsApp, creates the conversation in memory,
+  // and returns the JID so the UI can navigate to the chat.
+  const startConversation = useCallback((phone: string, name?: string): Promise<{ success: boolean; jid?: string; error?: string; conversation?: any }> => {
+    return new Promise((resolve) => {
+      socketRef.current?.emit('whatsapp:start-conversation', { phone, name }, (response: any) => {
+        resolve(response)
+      })
+    })
+  }, [])
+
+  // ===== Inject historical messages into a conversation =====
+  // Used by the "Pull from Odoo" button to restore history that was lost from local memory.
+  const injectHistory = useCallback((jid: string, messages: Array<{
+    fromMe: boolean
+    textContent: string | null
+    mediaType?: string | null
+    timestamp: string
+    externalId?: string
+  }>): Promise<{ success: boolean; added?: number; skipped?: number; error?: string }> => {
+    return new Promise((resolve) => {
+      socketRef.current?.emit('whatsapp:inject-history', { jid, messages }, (response: any) => {
+        // After injecting, reload current messages for this JID if it's the active one
+        if (response.success && currentJid === jid) {
+          socketRef.current?.emit('whatsapp:get-messages', { jid }, (msgResponse: { messages: WhatsAppMessage[] }) => {
+            setCurrentMessages(msgResponse.messages)
+          })
+        }
+        resolve(response)
+      })
+    })
+  }, [currentJid])
+
   const getOdooSync = useCallback((jid: string): OdooSyncInfo | null => {
     return odooSyncMap.get(jid) || null
   }, [odooSyncMap])
@@ -224,5 +273,9 @@ export function useWhatsApp() {
     markRead,
     disconnect,
     getProfilePic,
+    // New actions for v7.9
+    getContacts,
+    startConversation,
+    injectHistory,
   }
 }

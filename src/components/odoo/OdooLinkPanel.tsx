@@ -49,11 +49,18 @@ interface OdooLinkPanelProps {
   onSearchLeads: (query?: string, limit?: number) => Promise<{ success: boolean; data?: any[] }>
   onSearchSales: (query?: string, limit?: number) => Promise<{ success: boolean; data?: any[] }>
   onSearchTasks: (query?: string, limit?: number) => Promise<{ success: boolean; data?: any[] }>
-  onCreateLead: (data: any) => Promise<{ success: boolean; id?: number }>
+  onCreateLead: (data: any) => Promise<{ success: boolean; id?: number; postedMessages?: number }>
   onCreateContact: (data: any) => Promise<{ success: boolean; id?: number }>
   onCreateTask: (data: any) => Promise<{ success: boolean; id?: number }>
   onLogMessage: (data: { model: string; recordId: number; message: string; fromWhatsApp?: boolean }) => Promise<{ success: boolean }>
   odooConnected: boolean
+  // New in v7.9: conversation history to send when creating a lead
+  conversationHistory?: Array<{
+    fromMe: boolean
+    textContent: string | null
+    mediaType?: string | null
+    timestamp: string
+  }>
 }
 
 type ModelKey = 'contacts' | 'leads' | 'sales' | 'tasks'
@@ -110,6 +117,7 @@ export function OdooLinkPanel({
   onCreateTask,
   onLogMessage,
   odooConnected,
+  conversationHistory,
 }: OdooLinkPanelProps) {
   const [activeTab, setActiveTab] = useState<ModelKey>('contacts')
 
@@ -273,6 +281,8 @@ export function OdooLinkPanel({
               description: data.description || undefined,
               type: 'lead',
               whatsapp_number: conversationPhone || undefined,
+              // Pass conversation history so all messages are posted to the Odoo chatter
+              messages: conversationHistory || [],
             })
             break
           case 'tasks':
@@ -302,7 +312,7 @@ export function OdooLinkPanel({
         setCreating(false)
       }
     },
-    [activeTab, conversationJid, conversationPhone, onCreateContact, onCreateLead, onCreateTask, onLinkConversation, performSearch, searchQueries]
+    [activeTab, conversationJid, conversationPhone, onCreateContact, onCreateLead, onCreateTask, onLinkConversation, performSearch, searchQueries, conversationHistory]
   )
 
   // ---------- Log message logic ----------
