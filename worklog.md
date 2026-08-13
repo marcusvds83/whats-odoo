@@ -96,3 +96,57 @@ Stage Summary:
 - Auto-load contact names more aggressively (3 attempts post-connection)
 - Conversation sort order confirmed correct (newest first)
 - Package: /home/z/my-project/download/whats-odoo-v77.zip
+
+---
+Task ID: v7.10
+Agent: main
+Task: Fix missing Odoo/socket handlers and add new contact-start features
+
+Work Log:
+- Diagnosed root cause of "everything Odoo disappeared" + missing sidebar:
+  - render.yaml runs `node server.js` directly (single-process)
+  - server.js had embedded WA+Odoo logic BUT was missing 4 critical socket handlers
+    that the frontend was calling (whatsapp:get-contacts, whatsapp:start-conversation,
+    whatsapp:inject-history, odoo:fetch-history)
+  - The mini-services in /mini-services/ were unused dead code (start.sh was never
+    invoked by Render)
+- Added deviceContacts Map to server.js with proper population in:
+  - updateConversationName (now also writes to deviceContacts)
+  - getOrCreateConversation (now also writes to deviceContacts)
+  - Cleared on logout + DisconnectReason.loggedOut
+- Added missing helpers: normalizePhoneToJid, getDeviceContactsList, stripHtml,
+  pullOdooChatterIntoConversation (fetches mail.message records and merges them
+  into local conversation with dedup by externalId + content/timestamp)
+- Added 4 missing socket handlers to server.js:
+  - whatsapp:get-contacts: returns deviceContacts phonebook (with optional filter)
+  - whatsapp:start-conversation: normalizes phone, onWhatsApp check, creates conv,
+    fetches profile pic, AND if Odoo is connected + phone matches a partner/lead,
+    auto-pulls chatter history into the conversation + emits odoo:conversation:linked
+  - whatsapp:inject-history: merges historical messages with dedup logic
+  - odoo:fetch-history: reads mail.message records, returns WhatsApp-style msg objects
+- Updated getSortedConversations to also include device contacts that don't have
+  a conversation yet — they appear with "Sem mensagens" so the user can see all
+  phone contacts in the Conversas tab and start chatting directly
+- Updated OdooContactSearchDialog:
+  - Added "Cadastrar" button next to search bar (when onCreateContact is provided)
+  - New "Cadastrar novo contato" form with name/phone/email fields
+  - On submit: creates Odoo contact via odoo:contacts:create, then starts WhatsApp
+    conversation with the same phone number
+- Updated ConversationList: added onCreateOdooContact prop, passed through to dialog
+- Updated page.tsx ConversationsView: accept + forward onCreateOdooContact prop
+- Updated start.sh to v7.10: removed mini-service startup (was dead code anyway)
+- Bumped version to v7.10.0 in package.json and sidebar label
+- Build test: npx next build succeeded
+- Pushed to GitHub main branch (commit 32a02d3)
+
+Stage Summary:
+- Root cause of "Odoo disappeared": server.js was missing handlers the frontend
+  was calling. All 4 handlers now implemented.
+- Starting a conversation from an Odoo contact now ALSO pulls the Odoo chatter
+  history automatically (if the phone matches a partner/lead) — so when the user
+  comes back the next day, the previous conversation is restored from Odoo.
+- "Cadastrar" button lets the user register a new Odoo contact AND start a
+  WhatsApp conversation in one click.
+- Device contacts (phone book) now appear in the Conversas tab even without
+  prior messages — they show with "Sem mensagens" placeholder.
+- Deploy will trigger automatically from the git push.
