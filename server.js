@@ -339,6 +339,11 @@ let watchdogTimer = null
 const conversations = new Map()
 const contactNames = new Map()
 
+// Device contacts phonebook — full list of contacts synced from device
+// (even those without an existing conversation yet).
+// Each entry: { jid, phone, name, avatarUrl }
+const deviceContacts = new Map()
+
 let syncState = { isSyncing: false, progress: 0, totalChats: 0, totalContacts: 0, totalMessages: 0 }
 
 function isValidPhoneJid(jid) {
@@ -360,12 +365,13 @@ function jidNormalizedUser(jid) {
 function getOrCreateConversation(jid, pushName) {
   if (!isValidPhoneJid(jid)) return null
   const cachedName = contactNames.get(jidNormalizedUser(jid)) || null
+  const phone = extractPhone(jid)
 
   if (!conversations.has(jid)) {
     conversations.set(jid, {
       jid,
       name: cachedName || pushName || null,
-      phone: extractPhone(jid),
+      phone,
       pushName: pushName || null,
       avatarUrl: null,
       lastMessage: null,
@@ -380,6 +386,18 @@ function getOrCreateConversation(jid, pushName) {
   } else if (pushName && !conv.name) {
     conv.pushName = pushName
   }
+
+  // Also track in deviceContacts phonebook (so conversations started from
+  // incoming messages appear in the Contacts tab too)
+  const displayName = cachedName || pushName || phone
+  if (phone) {
+    if (!deviceContacts.has(jid)) {
+      deviceContacts.set(jid, { jid, phone, name: displayName, avatarUrl: null })
+    } else if (cachedName) {
+      deviceContacts.get(jid).name = cachedName
+    }
+  }
+
   return conv
 }
 
@@ -399,22 +417,171 @@ function serializeConversation(conv) {
 }
 
 function getSortedConversations() {
+  // Build a set of JIDs that are already in conversations
+  const conversationJids = new Set(conversations.keys())
+
+  // Convert device contacts (that don't have a conversation yet) into
+  // conversation-like objects so they show up in the Conversas list.
+  // This way, the user can see their phone contacts and start chatting
+  // even without a prior conversation.
+  const deviceContactEntries = []
+  for (const contact of deviceContacts.values()) {
+    if (conversationJids.has(contact.jid)) continue
+    deviceContactEntries.push({
+      jid: contact.jid,
+      name: contact.name,
+      phone: contact.phone,
+      pushName: null,
+      avatarUrl: contact.avatarUrl || null,
+      lastMessage: null,
+      lastMessageAt: null,
+      unreadCount: 0,
+      messageCount: 0,
+      // Custom flag — frontend can use this to show "Sem mensagens" placeholder
+      _isDeviceContact: true,
+    })
+  }
+
   return Array.from(conversations.values())
     .filter(conv => isValidPhoneJid(conv.jid))
-    .sort((a, b) => {
-      const tA = a.lastMessageAt ? a.lastMessageAt.getTime() : 0
-      const tB = b.lastMessageAt ? b.lastMessageAt.getTime() : 0
-      return tB - tA
-    })
     .map(serializeConversation)
     .filter(Boolean)
+    .concat(deviceContactEntries)
+    .sort((a, b) => {
+      // Conversations with messages always come first
+      const tA = a.lastMessageAt ? new Date(a.lastMessageAt).getTime() : 0
+      const tB = b.lastMessageAt ? new Date(b.lastMessageAt).getTime() : 0
+      if (tA === 0 && tB === 0) {
+        // Both are device contacts without messages — sort by name
+        return (a.name || a.phone || '').localeCompare(b.name || b.phone || '')
+      }
+      return tB - tA
+    })
 }
 
 function updateConversationName(jid, contactName) {
   if (!isValidPhoneJid(jid)) return
   contactNames.set(jidNormalizedUser(jid), contactName)
+  // Also track in deviceContacts phonebook
+  const phone = extractPhone(jid)
+  const existing = deviceContacts.get(jid)
+  if (existing) {
+    existing.name = contactName
+  } else if (phone) {
+    deviceContacts.set(jid, { jid, phone, name: contactName, avatarUrl: null })
+  }
   const conv = conversations.get(jid)
   if (conv) conv.name = contactName
+}
+
+// Normalize a phone number (strip non-digits) to a WhatsApp JID
+function normalizePhoneToJid(phone) {
+  if (!phone) return null
+  const digits = String(phone).replace(/\D/g, '')
+  if (digits.length < 7) return null
+  return `${digits}@s.whatsapp.net`
+}
+
+// Serialize device contacts list (sorted by name)
+function getDeviceContactsList() {
+  return Array.from(deviceContacts.values())
+    .sort((a, b) => (a.name || '').localeCompare(b.name || ''))
+}
+
+// Strip HTML tags from a string (used to convert Odoo chatter HTML to plain text)
+function stripHtml(html) {
+  if (!html) return ''
+  let text = String(html)
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n')
+    .replace(/<p[^>]*>/gi, '')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .trim()
+  text = text.replace(/\n{3,}/g, '\n\n')
+  return text
+}
+
+// Fetch chatter messages from Odoo (mail.message) and merge them into a conversation.
+// Returns the number of messages added. Used by "start conversation from Odoo"
+// and by the "Pull from Odoo" button.
+async function pullOdooChatterIntoConversation(jid, model, recordId, limit = 200) {
+  if (!odooConfig.uid) return 0
+  if (!isValidPhoneJid(jid)) return 0
+  const conv = conversations.get(jid)
+  if (!conv) return 0
+
+  try {
+    const domain = [
+      ['model', '=', model],
+      ['res_id', '=', recordId],
+    ]
+    const messages = await odooExecuteKw('mail.message', 'search_read', [domain], {
+      fields: ['id', 'body', 'author_id', 'email_from', 'date', 'message_type', 'subtype_id', 'create_date'],
+      order: 'date asc',
+      limit,
+    })
+
+    let added = 0
+    for (const msg of (messages || [])) {
+      const body = msg.body || ''
+      const plainText = stripHtml(body)
+      // Detect direction from "Enviada" / "Recebida" markers we wrote earlier
+      const isSent = /WhatsApp\s+Enviada/i.test(body)
+      const fromMe = isSent
+
+      // Extract timestamp — prefer date in body parentheses, fall back to msg.date
+      let timestamp
+      const dateMatch = body.match(/\(([^)]+)\)/)
+      if (dateMatch) {
+        const parsed = new Date(dateMatch[1])
+        if (!isNaN(parsed.getTime())) timestamp = parsed
+      }
+      if (!timestamp) timestamp = new Date(msg.date || msg.create_date || Date.now())
+
+      // Dedup by externalId
+      const externalId = `odoo-${msg.id}`
+      if (conv.messages.some(m => m.whatsappId === externalId)) continue
+      // Dedup by content + timestamp window
+      const isDup = conv.messages.some(m =>
+        m.fromMe === fromMe &&
+        m.textContent === plainText &&
+        Math.abs(m.timestamp.getTime() - timestamp.getTime()) < 5000
+      )
+      if (isDup) continue
+
+      conv.messages.push({
+        id: externalId,
+        whatsappId: externalId,
+        fromMe,
+        textContent: plainText || null,
+        mediaType: null,
+        timestamp,
+        status: 'delivered',
+      })
+      added++
+    }
+
+    if (added > 0) {
+      // Sort messages by timestamp
+      conv.messages.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime())
+      // Update lastMessage if needed
+      const last = conv.messages[conv.messages.length - 1]
+      if (!conv.lastMessageAt || last.timestamp > conv.lastMessageAt) {
+        conv.lastMessageAt = last.timestamp
+        if (last.textContent) conv.lastMessage = last.textContent
+      }
+    }
+    return added
+  } catch (err) {
+    console.error(`[Odoo] Chatter pull failed for ${model}#${recordId}:`, err.message)
+    return 0
+  }
 }
 
 // Load Baileys lazily — only after app.prepare()
@@ -485,6 +652,7 @@ async function connectWhatsApp(io) {
         lastQrCode = null
         conversations.clear()
         contactNames.clear()
+        deviceContacts.clear()
         io.of('/whatsapp').emit('whatsapp:conversations', [])
       }
 
@@ -948,6 +1116,7 @@ app.prepare().then(async () => {
           lastQrCode = null
           conversations.clear()
           contactNames.clear()
+          deviceContacts.clear()
           io.of('/whatsapp').emit('whatsapp:status', { connected: false, reason: 'logged_out', hasSession: false })
           io.of('/whatsapp').emit('whatsapp:conversations', [])
           callback({ success: true })
@@ -965,6 +1134,209 @@ app.prepare().then(async () => {
         if (conv && url) conv.avatarUrl = url
         callback({ success: true, url })
       } catch { callback({ success: false, url: null }) }
+    })
+
+    // ===== Get device contacts (phonebook) =====
+    // Returns the list of contacts synced from the phone, optionally filtered by query.
+    socket.on('whatsapp:get-contacts', (data, callback) => {
+      try {
+        let list = getDeviceContactsList()
+        if (data?.query) {
+          const q = String(data.query).toLowerCase()
+          list = list.filter(c =>
+            (c.name || '').toLowerCase().includes(q) ||
+            (c.phone || '').includes(q)
+          )
+        }
+        callback({ success: true, data: list.slice(0, 500) })
+      } catch (error) {
+        callback({ success: false, error: error.message, data: [] })
+      }
+    })
+
+    // ===== Start a conversation from a phone number =====
+    // Verifies the number is on WhatsApp, creates the conversation in memory,
+    // AND if Odoo is connected + the phone matches an Odoo partner/lead,
+    // pulls the chatter history from Odoo and merges it into the conversation.
+    // Returns the JID so the UI can navigate to the chat.
+    socket.on('whatsapp:start-conversation', async (data, callback) => {
+      try {
+        if (!waSocket || connectionState.connection !== 'open') {
+          callback({ success: false, error: 'WhatsApp not connected' })
+          return
+        }
+
+        const jid = normalizePhoneToJid(data.phone)
+        if (!jid) {
+          callback({ success: false, error: 'Invalid phone number' })
+          return
+        }
+
+        // Check if the number is on WhatsApp
+        let realJid = jid
+        try {
+          const result = await waSocket.onWhatsApp(jid)
+          if (result && result.length > 0) {
+            if (!result[0].exists) {
+              callback({ success: false, error: 'Phone number is not on WhatsApp' })
+              return
+            }
+            realJid = result[0].jid || jid
+          }
+        } catch (err) {
+          console.error('[WA] onWhatsApp check failed:', err.message)
+        }
+
+        // Get or create conversation
+        const conv = getOrCreateConversation(realJid, data.name || null)
+        if (!conv) {
+          callback({ success: false, error: 'Could not create conversation' })
+          return
+        }
+
+        // If a name was provided and there's no device contact name, use it
+        if (data.name && !contactNames.has(realJid)) {
+          conv.name = data.name
+        }
+
+        // Try to fetch profile picture
+        try {
+          if (!conv.avatarUrl) {
+            const picUrl = await waSocket.profilePictureUrl(realJid, 'image').catch(() => null)
+            if (picUrl) conv.avatarUrl = picUrl
+          }
+        } catch {}
+
+        // ===== Pull history from Odoo if available =====
+        // When starting a conversation from an Odoo contact, we check if there's
+        // a partner or lead with this phone number and pull its chatter history.
+        let pulledFromOdoo = 0
+        let linkedRecords = []
+        if (odooConfig.uid) {
+          try {
+            const phoneDigits = String(data.phone).replace(/\D/g, '')
+            // Search for partner with matching phone/mobile
+            const partnerDomain = ['|', '|',
+              ['phone', 'ilike', phoneDigits],
+              ['mobile', 'ilike', phoneDigits],
+              ['whatsapp', 'ilike', phoneDigits],
+            ]
+            const partners = await odooExecuteKw('res.partner', 'search_read', [partnerDomain], {
+              fields: ['id', 'name', 'phone', 'mobile'],
+              limit: 5,
+            }).catch(() => [])
+
+            for (const p of (partners || [])) {
+              linkedRecords.push({ model: 'res.partner', recordId: p.id, recordName: p.name })
+              // Notify frontend of the link
+              io.of('/odoo').emit('odoo:conversation:linked', { jid: realJid, model: 'res.partner', recordId: p.id })
+              // Pull chatter
+              const pulled = await pullOdooChatterIntoConversation(realJid, 'res.partner', p.id)
+              pulledFromOdoo += pulled
+            }
+
+            // Also search leads
+            const leadDomain = ['|',
+              ['phone', 'ilike', phoneDigits],
+              ['mobile', 'ilike', phoneDigits],
+            ]
+            const leads = await odooExecuteKw('crm.lead', 'search_read', [leadDomain], {
+              fields: ['id', 'name', 'phone', 'mobile'],
+              limit: 5,
+            }).catch(() => [])
+
+            for (const l of (leads || [])) {
+              linkedRecords.push({ model: 'crm.lead', recordId: l.id, recordName: l.name })
+              io.of('/odoo').emit('odoo:conversation:linked', { jid: realJid, model: 'crm.lead', recordId: l.id })
+              const pulled = await pullOdooChatterIntoConversation(realJid, 'crm.lead', l.id)
+              pulledFromOdoo += pulled
+            }
+          } catch (err) {
+            console.error('[WA] Odoo history pull failed:', err.message)
+          }
+        }
+
+        // Notify all clients of the new/updated conversation
+        io.of('/whatsapp').emit('whatsapp:conversations', getSortedConversations())
+        if (pulledFromOdoo > 0) {
+          io.of('/whatsapp').emit('whatsapp:conversation:update', serializeConversation(conv))
+        }
+
+        callback({
+          success: true,
+          jid: realJid,
+          conversation: serializeConversation(conv),
+          pulledFromOdoo,
+          linkedRecords,
+        })
+      } catch (error) {
+        callback({ success: false, error: error.message })
+      }
+    })
+
+    // ===== Inject historical messages (e.g., pulled from Odoo chatter) =====
+    // Adds messages to a conversation if they're not already present (by externalId
+    // or content+timestamp). Used by the "Pull from Odoo" button on the chat header.
+    socket.on('whatsapp:inject-history', (data, callback) => {
+      try {
+        const conv = conversations.get(data.jid)
+        if (!conv) {
+          callback({ success: false, error: 'Conversation not found' })
+          return
+        }
+
+        let added = 0
+        let skipped = 0
+
+        for (const m of (data.messages || [])) {
+          // Dedup by externalId if provided
+          if (m.externalId && conv.messages.some(existing => existing.whatsappId === m.externalId)) {
+            skipped++
+            continue
+          }
+
+          // Dedup by timestamp + content (within 5s window)
+          const ts = new Date(m.timestamp)
+          const isDup = conv.messages.some(existing =>
+            existing.fromMe === m.fromMe &&
+            existing.textContent === m.textContent &&
+            Math.abs(existing.timestamp.getTime() - ts.getTime()) < 5000
+          )
+          if (isDup) {
+            skipped++
+            continue
+          }
+
+          conv.messages.push({
+            id: `odoo-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+            whatsappId: m.externalId || null,
+            fromMe: m.fromMe,
+            textContent: m.textContent,
+            mediaType: m.mediaType || null,
+            timestamp: ts,
+            status: 'delivered',
+          })
+          added++
+        }
+
+        // Sort messages by timestamp
+        conv.messages.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime())
+
+        // Update lastMessage / lastMessageAt if needed
+        if (conv.messages.length > 0) {
+          const last = conv.messages[conv.messages.length - 1]
+          if (!conv.lastMessageAt || last.timestamp > conv.lastMessageAt) {
+            conv.lastMessageAt = last.timestamp
+            if (last.textContent) conv.lastMessage = last.textContent
+            else if (last.mediaType) conv.lastMessage = `[${last.mediaType}]`
+          }
+        }
+
+        io.of('/whatsapp').emit('whatsapp:conversation:update', serializeConversation(conv))
+        callback({ success: true, added, skipped })
+      } catch (error) {
+        callback({ success: false, error: error.message })
+      }
     })
 
     socket.on('disconnect', () => console.log(`[WA IO] Client disconnected: ${socket.id}`))
@@ -1145,6 +1517,55 @@ app.prepare().then(async () => {
         await odooPostMessage(data.model, data.recordId, body)
         callback({ success: true })
       } catch (error) { callback({ success: false, error: error.message }) }
+    })
+
+    // ===== Fetch conversation history from Odoo chatter =====
+    // Reads mail.message records attached to a model/record and returns them
+    // as WhatsApp-style message objects so the frontend can merge them back.
+    socket.on('odoo:fetch-history', async (data, callback) => {
+      try {
+        if (!odooConfig.uid) {
+          callback({ success: false, error: 'Not authenticated with Odoo' })
+          return
+        }
+        const domain = [
+          ['model', '=', data.model],
+          ['res_id', '=', data.recordId],
+        ]
+        const messages = await odooExecuteKw('mail.message', 'search_read', [domain], {
+          fields: ['id', 'body', 'author_id', 'email_from', 'date', 'message_type', 'subtype_id', 'create_date'],
+          order: 'date asc',
+          limit: data.limit || 200,
+        })
+
+        const converted = (messages || []).map((msg) => {
+          const body = msg.body || ''
+          const plainText = stripHtml(body)
+          const isSent = /WhatsApp\s+Enviada/i.test(body)
+          const fromMe = isSent
+
+          let timestamp
+          const dateMatch = body.match(/\(([^)]+)\)/)
+          if (dateMatch) {
+            const parsed = new Date(dateMatch[1])
+            if (!isNaN(parsed.getTime())) timestamp = parsed.toISOString()
+          }
+          if (!timestamp) timestamp = msg.date || msg.create_date || new Date().toISOString()
+
+          return {
+            externalId: `odoo-${msg.id}`,
+            fromMe,
+            textContent: plainText || null,
+            mediaType: null,
+            timestamp,
+            source: 'odoo',
+          }
+        })
+
+        callback({ success: true, data: converted })
+      } catch (error) {
+        callback({ success: false, error: error.message })
+      }
     })
 
     socket.on('odoo:fields', async (data, callback) => {

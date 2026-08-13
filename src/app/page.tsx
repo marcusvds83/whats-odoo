@@ -232,6 +232,7 @@ function ConversationsView({
   onFetchOdooHistory,
   onInjectHistory,
   linkedOdooRecords,
+  onCreateOdooContact,
 }: {
   conversations: any[]
   selectedJid: string | null
@@ -259,6 +260,7 @@ function ConversationsView({
   onFetchOdooHistory?: (model: string, recordId: number) => Promise<{ success: boolean; data?: any[]; error?: string }>
   onInjectHistory?: (jid: string, messages: any[]) => Promise<{ success: boolean; added?: number; skipped?: number; error?: string }>
   linkedOdooRecords?: Array<{ model: string; recordId: number; recordName?: string }>
+  onCreateOdooContact?: (data: { name: string; phone?: string; mobile?: string; whatsapp?: string; email?: string }) => Promise<{ success: boolean; id?: number; error?: string }>
 }) {
   // Build conversation history payload (for Odoo lead creation)
   const conversationHistory = useMemo(() => {
@@ -287,6 +289,8 @@ function ConversationsView({
           odooConnected={odooStatus.connected}
           onSearchOdooContacts={onSearchContacts}
           onStartConversation={onStartConversation}
+          // New in v7.10: create Odoo contact
+          onCreateOdooContact={onCreateOdooContact}
         />
       </div>
 
@@ -440,7 +444,7 @@ export default function HomePage() {
             />
             <div className="hidden lg:block">
               <p className="text-sm font-bold leading-tight">Whats-Odoo</p>
-              <p className="text-[10px] text-muted-foreground">v7.9 Middleware</p>
+              <p className="text-[10px] text-muted-foreground">v7.10 Middleware</p>
             </div>
           </div>
         </div>
@@ -517,6 +521,8 @@ export default function HomePage() {
             onFetchOdooHistory={(model, recordId) => odoo.fetchHistory({ model, recordId })}
             onInjectHistory={wa.injectHistory}
             linkedOdooRecords={linkedOdooRecords}
+            // New in v7.10
+            onCreateOdooContact={odoo.createContact}
           />
           </div>
         )}

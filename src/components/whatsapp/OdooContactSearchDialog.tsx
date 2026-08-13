@@ -9,6 +9,7 @@ import {
   MessageCircle,
   X,
   AlertCircle,
+  UserPlus,
 } from 'lucide-react'
 import {
   Dialog,
@@ -22,6 +23,7 @@ import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
+import { Label } from '@/components/ui/label'
 import { cn } from '@/lib/utils'
 
 interface OdooContact {
@@ -39,6 +41,7 @@ interface OdooContactSearchDialogProps {
   odooConnected: boolean
   onSearchContacts: (query?: string, limit?: number) => Promise<{ success: boolean; data?: OdooContact[]; error?: string }>
   onStartConversation: (phone: string, name?: string) => Promise<{ success: boolean; jid?: string; error?: string }>
+  onCreateContact?: (data: { name: string; phone?: string; mobile?: string; whatsapp?: string; email?: string }) => Promise<{ success: boolean; id?: number; error?: string }>
   onConversationStarted?: (jid: string) => void
 }
 
@@ -56,6 +59,7 @@ export function OdooContactSearchDialog({
   odooConnected,
   onSearchContacts,
   onStartConversation,
+  onCreateContact,
   onConversationStarted,
 }: OdooContactSearchDialogProps) {
   const [query, setQuery] = useState('')
@@ -65,6 +69,11 @@ export function OdooContactSearchDialog({
   const [startingJid, setStartingJid] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [successMsg, setSuccessMsg] = useState<string | null>(null)
+
+  // "Cadastrar novo contato" form state
+  const [showCreateForm, setShowCreateForm] = useState(false)
+  const [createForm, setCreateForm] = useState({ name: '', phone: '', email: '' })
+  const [creating, setCreating] = useState(false)
 
   // Debounced search
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -101,6 +110,16 @@ export function OdooContactSearchDialog({
     }
   }, [query, open, performSearch])
 
+  // Reset state when dialog closes
+  useEffect(() => {
+    if (!open) {
+      setShowCreateForm(false)
+      setCreateForm({ name: '', phone: '', email: '' })
+      setError(null)
+      setSuccessMsg(null)
+    }
+  }, [open])
+
   const handleStartConversation = async (contact: OdooContact) => {
     const phone = extractDigits(
       (contact.mobile as string) || (contact.phone as string) || ''
@@ -133,6 +152,58 @@ export function OdooContactSearchDialog({
     }
   }
 
+  const handleCreateAndStart = async () => {
+    if (!onCreateContact) {
+      setError('Criação de contato não disponível')
+      return
+    }
+    if (!createForm.name.trim()) {
+      setError('Nome é obrigatório')
+      return
+    }
+    const phoneDigits = extractDigits(createForm.phone)
+    if (phoneDigits.length < 7) {
+      setError('Telefone inválido — precisa ter pelo menos 7 dígitos')
+      return
+    }
+
+    setCreating(true)
+    setError(null)
+    setSuccessMsg(null)
+    try {
+      // Step 1: Create the contact in Odoo
+      const createResult = await onCreateContact({
+        name: createForm.name.trim(),
+        phone: createForm.phone.trim(),
+        mobile: createForm.phone.trim(),
+        email: createForm.email.trim() || undefined,
+      })
+      if (!createResult.success) {
+        setError(createResult.error || 'Erro ao cadastrar contato')
+        return
+      }
+
+      // Step 2: Start a WhatsApp conversation with this contact
+      const startResult = await onStartConversation(phoneDigits, createForm.name.trim())
+      if (startResult.success && startResult.jid) {
+        setSuccessMsg(`Contato cadastrado e conversa iniciada com ${createForm.name.trim()}`)
+        onConversationStarted?.(startResult.jid)
+        onOpenChange(false)
+        setQuery('')
+        setResults([])
+        setSearched(false)
+        setCreateForm({ name: '', phone: '', email: '' })
+        setShowCreateForm(false)
+      } else {
+        setError(`Contato cadastrado (ID: ${createResult.id}) mas erro ao iniciar conversa: ${startResult.error || 'desconhecido'}`)
+      }
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setCreating(false)
+    }
+  }
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-lg">
@@ -153,26 +224,124 @@ export function OdooContactSearchDialog({
               Conecte ao Odoo primeiro para buscar contatos
             </p>
           </div>
-        ) : (
+        ) : showCreateForm ? (
+          // ===== Create new contact form =====
           <div className="space-y-3">
-            {/* Search input */}
-            <div className="relative">
-              <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 size-4 text-muted-foreground" />
+            <div className="flex items-center gap-2 pb-2 border-b">
+              <UserPlus className="size-4 text-primary" />
+              <h3 className="text-sm font-semibold">Cadastrar novo contato</h3>
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="odoo-name" className="text-xs">Nome *</Label>
               <Input
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                placeholder="Buscar por nome, telefone, email..."
-                className="pl-9 pr-9 h-9 text-sm"
+                id="odoo-name"
+                value={createForm.name}
+                onChange={(e) => setCreateForm({ ...createForm, name: e.target.value })}
+                placeholder="Nome do contato"
+                className="h-9 text-sm"
                 autoFocus
               />
-              {query && (
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="odoo-phone" className="text-xs">Telefone / WhatsApp *</Label>
+              <Input
+                id="odoo-phone"
+                value={createForm.phone}
+                onChange={(e) => setCreateForm({ ...createForm, phone: e.target.value })}
+                placeholder="Ex: +55 41 996578109"
+                className="h-9 text-sm"
+              />
+              <p className="text-[10px] text-muted-foreground">
+                Inclua o código do país e DDD. O número será validado no WhatsApp.
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="odoo-email" className="text-xs">Email (opcional)</Label>
+              <Input
+                id="odoo-email"
+                type="email"
+                value={createForm.email}
+                onChange={(e) => setCreateForm({ ...createForm, email: e.target.value })}
+                placeholder="email@exemplo.com"
+                className="h-9 text-sm"
+              />
+            </div>
+
+            {error && (
+              <div className="flex items-center gap-2 rounded-md border border-red-200 bg-red-50 p-2 text-xs text-red-700 dark:border-red-900 dark:bg-red-950/30 dark:text-red-300">
+                <AlertCircle className="size-3.5 shrink-0" />
+                <span>{error}</span>
+              </div>
+            )}
+
+            {successMsg && (
+              <div className="flex items-center gap-2 rounded-md border border-emerald-200 bg-emerald-50 p-2 text-xs text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/30 dark:text-emerald-300">
+                <MessageCircle className="size-3.5 shrink-0" />
+                <span>{successMsg}</span>
+              </div>
+            )}
+
+            <div className="flex gap-2 pt-2">
+              <Button
+                variant="outline"
+                size="sm"
+                className="flex-1"
+                onClick={() => setShowCreateForm(false)}
+                disabled={creating}
+              >
+                Voltar
+              </Button>
+              <Button
+                size="sm"
+                className="flex-1 bg-emerald-600 hover:bg-emerald-700"
+                onClick={handleCreateAndStart}
+                disabled={creating || !createForm.name.trim()}
+              >
+                {creating ? (
+                  <><Loader2 className="size-3.5 animate-spin" /> Cadastrando...</>
+                ) : (
+                  <><MessageCircle className="size-3.5" /> Cadastrar e Conversar</>
+                )}
+              </Button>
+            </div>
+          </div>
+        ) : (
+          <div className="space-y-3">
+            {/* Search input + Cadastrar button */}
+            <div className="flex gap-2">
+              <div className="relative flex-1">
+                <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 size-4 text-muted-foreground" />
+                <Input
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  placeholder="Buscar por nome, telefone, email..."
+                  className="pl-9 pr-9 h-9 text-sm"
+                  autoFocus
+                />
+                {query && (
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="absolute right-0 top-0 size-9"
+                    onClick={() => setQuery('')}
+                  >
+                    <X className="size-3.5" />
+                  </Button>
+                )}
+              </div>
+              {onCreateContact && (
                 <Button
-                  variant="ghost"
-                  size="icon"
-                  className="absolute right-0 top-0 size-9"
-                  onClick={() => setQuery('')}
+                  variant="outline"
+                  size="sm"
+                  className="h-9 gap-1.5 shrink-0"
+                  onClick={() => setShowCreateForm(true)}
+                  title="Cadastrar novo contato no Odoo"
                 >
-                  <X className="size-3.5" />
+                  <UserPlus className="size-3.5" />
+                  <span className="hidden sm:inline">Cadastrar</span>
                 </Button>
               )}
             </div>
@@ -206,6 +375,11 @@ export function OdooContactSearchDialog({
                     <p className="text-sm text-muted-foreground">
                       {searched ? 'Nenhum contato encontrado' : 'Digite para buscar'}
                     </p>
+                    {searched && (
+                      <p className="text-xs text-muted-foreground/70 mt-1">
+                        Não encontrou? Clique em <strong>Cadastrar</strong> para criar um novo.
+                      </p>
+                    )}
                   </div>
                 ) : (
                   results.map((contact) => {

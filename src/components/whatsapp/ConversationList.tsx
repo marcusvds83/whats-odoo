@@ -41,6 +41,8 @@ interface ConversationListProps {
   odooConnected?: boolean
   onSearchOdooContacts?: (query?: string, limit?: number) => Promise<{ success: boolean; data?: any[]; error?: string }>
   onStartConversation?: (phone: string, name?: string) => Promise<{ success: boolean; jid?: string; error?: string }>
+  // New in v7.10: create Odoo contact from the dialog
+  onCreateOdooContact?: (data: { name: string; phone?: string; mobile?: string; whatsapp?: string; email?: string }) => Promise<{ success: boolean; id?: number; error?: string }>
 }
 
 function formatTime(dateStr: string | null): string {
@@ -93,6 +95,7 @@ export function ConversationList({
   odooConnected,
   onSearchOdooContacts,
   onStartConversation,
+  onCreateOdooContact,
 }: ConversationListProps) {
   const [activeTab, setActiveTab] = useState<Tab>('conversations')
   const [searchQuery, setSearchQuery] = useState('')
@@ -283,6 +286,7 @@ export function ConversationList({
           onSearchContacts={onSearchOdooContacts}
           onStartConversation={handleStartFromOdoo}
           onConversationStarted={handleConversationStarted}
+          onCreateContact={onCreateOdooContact}
         />
       )}
     </div>
