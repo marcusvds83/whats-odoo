@@ -385,11 +385,12 @@ export function useWhatsApp() {
   }, [])
 
   // ===== v7.14: Refresh messages for a conversation =====
-  // Called by the "Atualizar mensagens" button in the chat view OR by the
-  // auto-polling mechanism (every 5 seconds for the active conversation).
-  // Returns the latest local messages AND triggers a server-side fetch
-  // (fetchMessageHistory) in the background to catch any missed messages.
-  const refreshMessages = useCallback((jid: string): Promise<{ success: boolean; messages?: WhatsAppMessage[]; count?: number; serverFetchAttempted?: boolean; error?: string }> => {
+  // Called by the "Atualizar mensagens" / "Buscar no aparelho" button in the
+  // chat view. Returns the latest local messages AND triggers a server-side
+  // fetch (fetchMessageHistory + resyncAppState) in the background to catch
+  // any missed messages.
+  // v7.15: returns `serverFetchMethods` so the UI can show what was attempted.
+  const refreshMessages = useCallback((jid: string): Promise<{ success: boolean; messages?: WhatsAppMessage[]; count?: number; serverFetchAttempted?: boolean; serverFetchMethods?: string[]; error?: string }> => {
     return new Promise((resolve) => {
       socketRef.current?.emit('whatsapp:refresh-messages', { jid }, (response: any) => {
         if (response && response.success && response.messages) {
@@ -405,13 +406,26 @@ export function useWhatsApp() {
     })
   }, [])
 
-  // ===== v7.14: Auto-polling for active conversation =====
-  // Polls the server every 5 seconds for the active conversation's messages.
-  // This is a fallback in case `messages.upsert` events don't fire (which has
-  // been reported in some Baileys edge cases). The poll only fetches the local
-  // server-side cache — it does NOT trigger a fetchMessageHistory call (that
-  // would be too expensive every 5s). The user can manually click "Atualizar"
-  // to trigger a server-side fetch.
+  // ===== v7.15: Debug events — for troubleshooting "messages not arriving" =====
+  // Returns the recent `messages.upsert` events captured by the server, plus
+  // connection state and available Baileys methods. Useful for debugging from
+  // the browser console when the user reports that messages aren't arriving.
+  const debugEvents = useCallback((): Promise<any> => {
+    return new Promise((resolve) => {
+      socketRef.current?.emit('whatsapp:debug-events', {}, (response: any) => {
+        console.log('[WhatsApp] Debug events:', response)
+        resolve(response)
+      })
+    })
+  }, [])
+
+  // ===== v7.14/v7.15: Auto-polling for active conversation =====
+  // Polls the server every 3 seconds (v7.15: was 5s) for the active
+  // conversation's messages. This is a fallback in case `messages.upsert`
+  // events don't fire (which has been reported in some Baileys edge cases).
+  // The poll only fetches the local server-side cache — it does NOT trigger
+  // a fetchMessageHistory call (that would be too expensive every 3s).
+  // The user can manually click "Buscar no aparelho" to trigger a server-side fetch.
   useEffect(() => {
     if (!currentJid) return
     // Use a ref-like pattern to avoid stale closures
@@ -432,7 +446,7 @@ export function useWhatsApp() {
           return response.messages
         })
       })
-    }, 5000)
+    }, 3000)
     return () => clearInterval(pollInterval)
   }, [currentJid])
 
@@ -464,5 +478,7 @@ export function useWhatsApp() {
     refreshData,
     // v7.14 actions
     refreshMessages,
+    // v7.15 actions
+    debugEvents,
   }
 }

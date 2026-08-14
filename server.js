@@ -66,6 +66,19 @@ const phoneToPartnerCache = new Map()
 // v7.14: We must NEVER duplicate what was posted to Odoo chatter.
 const postedChatterIds = new Set()
 
+// v7.15: Ring buffer of recent `messages.upsert` events for debugging.
+// When the user reports "messages aren't arriving", we can inspect this via
+// the `whatsapp:debug-events` socket endpoint to see whether upsert is even
+// firing, what JIDs are coming through, and what message types we're receiving.
+const recentUpsertEvents = []
+const MAX_RECENT_EVENTS = 50
+function logUpsertEvent(event) {
+  try {
+    recentUpsertEvents.push({ ts: new Date().toISOString(), ...event })
+    while (recentUpsertEvents.length > MAX_RECENT_EVENTS) recentUpsertEvents.shift()
+  } catch {}
+}
+
 // Track active lead IDs by phone — refreshed on every auto-sync.
 // Used so we can post messages to the lead's chatter too (in addition to partner).
 const phoneToActiveLeadCache = new Map()
@@ -949,156 +962,205 @@ async function connectWhatsApp(io) {
   waSocket.ev.on('messages.upsert', async ({ messages, type }) => {
     // type can be 'notify' (new message) or 'append' (history sync)
     console.log(`[WA] >>>>>> messages.upsert EVENT: ${messages?.length || 0} msgs (type=${type || 'n/a'}) <<<<<<`)
+    logUpsertEvent({
+      type: type || 'n/a',
+      count: messages?.length || 0,
+      ids: (messages || []).slice(0, 5).map(m => m?.key?.id || '?'),
+      jids: (messages || []).slice(0, 5).map(m => m?.key?.remoteJid || '?'),
+    })
+
     for (const msg of messages || []) {
-      if (!msg.key) {
-        console.log('[WA] upsert msg skipped — no key')
-        continue
-      }
-      // *** CRITICAL: Normalize the JID ***
-      // Baileys may deliver messages with the device suffix (e.g. 5511999888777:7@s.whatsapp.net).
-      // If we don't normalize, isValidPhoneJid rejects it and the message is silently dropped,
-      // which is exactly why incoming replies never showed in the chat view.
-      const rawJid = msg.key.remoteJid
-      const jid = normalizeJid(rawJid)
-      const fromMe = msg.key.fromMe || false
-      const pushName = msg.pushName || null
-
-      console.log(`[WA] upsert msg: rawJid=${rawJid} → normalized=${jid} fromMe=${fromMe} id=${msg.key.id} participant=${msg.key.participant || 'n/a'} pushName=${pushName || 'n/a'}`)
-
-      if (rawJid === 'status@broadcast') {
-        console.log(`[WA] upsert msg skipped — status broadcast`)
-        continue
-      }
-      if (!jid) {
-        console.log(`[WA] upsert msg skipped — invalid JID: ${rawJid}`)
-        continue
-      }
-
-      const conv = getOrCreateConversation(jid, fromMe ? undefined : pushName)
-      if (!conv) {
-        console.log(`[WA] upsert msg skipped — could not create conversation for ${jid}`)
-        continue
-      }
-
-      // *** Unwrap nested message types ***
-      // Disappearing messages come wrapped in `ephemeralMessage.message.*`
-      // View-once messages come wrapped in `viewOnceMessage.message.*` / `viewOnceMessageV2.message.*`
-      // Without unwrapping, text extraction fails and the message is silently dropped.
-      let m = msg.message
-      if (m?.ephemeralMessage?.message) m = m.ephemeralMessage.message
-      else if (m?.viewOnceMessage?.message) m = m.viewOnceMessage.message
-      else if (m?.viewOnceMessageV2?.message) m = m.viewOnceMessageV2.message
-      else if (m?.documentWithCaptionMessage?.message) m = m.documentWithCaptionMessage.message
-
-      if (!m) {
-        console.log(`[WA] upsert msg skipped — no message body (protocol/receipt)`)
-        continue
-      }
-
-      const textContent =
-        m.conversation ||
-        m.extendedTextMessage?.text ||
-        m.imageMessage?.caption ||
-        m.videoMessage?.caption ||
-        m.documentMessage?.caption ||
-        m.templateMessage?.hydratedFourRowTemplate?.hydratedContentText ||
-        m.templateMessage?.hydratedTemplate?.hydratedContentText ||
-        m.buttonsMessage?.contentText ||
-        m.listMessage?.description ||
-        m.buttonsResponseMessage?.selectedButtonId ||
-        m.listResponseMessage?.title ||
-        m.listResponseMessage?.description ||
-        null
-
-      let mediaType = null
-      if (m.imageMessage) mediaType = 'image'
-      else if (m.videoMessage) mediaType = 'video'
-      else if (m.audioMessage) mediaType = 'audio'
-      else if (m.pttMessage) mediaType = 'ptt'
-      else if (m.documentMessage) mediaType = 'document'
-      else if (m.stickerMessage) mediaType = 'sticker'
-
-      // Skip protocol/reaction messages with no actual content
-      if (!textContent && !mediaType) {
-        console.log(`[WA] upsert msg skipped — no text/media (msg keys: ${Object.keys(m).join(',')})`)
-        continue
-      }
-
-      const msgId = msg.key.id
-      // Dedup: skip if we already have this message by whatsappId
-      if (msgId && conv.messages.some(m => m.whatsappId === msgId || m.id === msgId)) {
-        console.log(`[WA] Skipping duplicate message ${msgId}`)
-        continue
-      }
-
-      // Robust timestamp handling — Baileys can give number (seconds) or Long object
-      let messageTimestamp
+      // v7.15: Per-message try/catch — one bad message shouldn't break the rest
       try {
-        const ts = typeof msg.messageTimestamp === 'number'
-          ? msg.messageTimestamp
-          : (msg.messageTimestamp?.low || msg.messageTimestamp || Math.floor(Date.now() / 1000))
-        messageTimestamp = new Date(ts * 1000)
-        if (isNaN(messageTimestamp.getTime())) messageTimestamp = new Date()
-      } catch {
-        messageTimestamp = new Date()
-      }
+        if (!msg.key) {
+          console.log('[WA] upsert msg skipped — no key')
+          continue
+        }
 
-      const messageData = {
-        id: msgId || `m-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-        whatsappId: msgId || null,
-        fromMe,
-        textContent,
-        mediaType,
-        timestamp: messageTimestamp,
-        status: fromMe ? 'delivered' : 'received',
-      }
+        // *** CRITICAL: Normalize the JID ***
+        // Baileys may deliver messages with the device suffix (e.g. 5511999888777:7@s.whatsapp.net).
+        // v7.15: Also try `msg.key.participant` if remoteJid is a LID (@lid).
+        const rawJid = msg.key.remoteJid
+        let jid = normalizeJid(rawJid)
+        if (!jid && rawJid && rawJid.endsWith('@lid') && msg.key.participant) {
+          // LID format — DMs sometimes come through with @lid on newer Baileys builds.
+          // The participant field usually holds the canonical phone JID.
+          jid = normalizeJid(msg.key.participant)
+          if (jid) console.log(`[WA] Recovered JID from participant: ${jid} (rawLid=${rawJid})`)
+        }
 
-      conv.messages.push(messageData)
-      conv.lastMessage = textContent || (mediaType ? `[${mediaType}]` : '')
-      conv.lastMessageAt = new Date()
-      if (!fromMe) conv.unreadCount++
+        const fromMe = msg.key.fromMe || false
+        const pushName = msg.pushName || null
 
-      console.log(`[WA] ✓ New message stored in ${jid} fromMe=${fromMe}: ${textContent ? textContent.slice(0, 40) : `[${mediaType}]`}`)
+        console.log(`[WA] upsert msg: rawJid=${rawJid} → normalized=${jid} fromMe=${fromMe} id=${msg.key.id} participant=${msg.key.participant || 'n/a'} pushName=${pushName || 'n/a'}`)
 
-      // Try to fetch profile picture in background (don't block)
-      if (!conv.avatarUrl) {
-        waSocket.profilePictureUrl(jid, 'image').then(picUrl => {
-          if (picUrl) {
-            conv.avatarUrl = picUrl
-            io.of('/whatsapp').emit('whatsapp:conversation:update', serializeConversation(conv))
-          }
-        }).catch(() => {})
-      }
+        if (rawJid === 'status@broadcast') {
+          console.log(`[WA] upsert msg skipped — status broadcast`)
+          continue
+        }
+        // v7.15: Skip group chats too — we only handle DMs in this app
+        if (rawJid && rawJid.endsWith('@g.us')) {
+          console.log(`[WA] upsert msg skipped — group chat`)
+          continue
+        }
+        if (!jid) {
+          console.log(`[WA] upsert msg skipped — invalid JID: ${rawJid}`)
+          // v7.15: log a sample of the message so we can see what type it is
+          try {
+            const sample = JSON.stringify(msg).slice(0, 400)
+            console.log(`[WA] full msg sample:`, sample)
+            logUpsertEvent({ type: 'skipped-invalid-jid', rawJid, sample })
+          } catch {}
+          continue
+        }
 
-      // Emit to all clients — the frontend's currentJidRef will decide if it appends to the active chat
-      // *** IMPORTANT: Use the normalized JID here so the frontend can match it ***
-      io.of('/whatsapp').emit('whatsapp:message', {
-        conversationJid: jid,
-        message: {
-          ...messageData,
-          // Serialize timestamp to ISO string for socket transport
-          timestamp: messageTimestamp.toISOString(),
-        },
-        conversation: serializeConversation(conv),
-      })
-      io.of('/whatsapp').emit('whatsapp:conversation:update', serializeConversation(conv))
+        const conv = getOrCreateConversation(jid, fromMe ? undefined : pushName)
+        if (!conv) {
+          console.log(`[WA] upsert msg skipped — could not create conversation for ${jid}`)
+          continue
+        }
 
-      // Auto-sync to Odoo in background
-      const phone = extractPhone(jid)
-      if (phone) {
-        autoSyncWhatsAppMessage({
-          jid, phone, pushName: conv.pushName, textContent, mediaType, fromMe,
-          timestamp: messageTimestamp.toISOString(),
-          dedupId: msgId,  // v7.14: dedup key for chatter
-        }).then(result => {
-          if (result.partnerId || result.leadId) {
-            io.of('/whatsapp').emit('whatsapp:odoo-sync', {
-              jid, phone, partnerId: result.partnerId, leadId: result.leadId,
-              mailMessageId: result.mailMessageId, activityId: result.activityId,
-              created: result.created, errors: result.errors,
-            })
-          }
-        }).catch(err => console.error('[AutoSync] Error:', err.message))
+        // *** v7.15: Unwrap MORE nested message types ***
+        // - ephemeralMessage: disappearing messages
+        // - viewOnceMessage / viewOnceMessageV2: view-once messages
+        // - documentWithCaptionMessage: documents with caption
+        // - deviceSentMessage: messages sent from another linked device (echo)
+        // - editedMessage: edited messages
+        let m = msg.message
+        if (m?.ephemeralMessage?.message) m = m.ephemeralMessage.message
+        else if (m?.viewOnceMessage?.message) m = m.viewOnceMessage.message
+        else if (m?.viewOnceMessageV2?.message) m = m.viewOnceMessageV2.message
+        else if (m?.documentWithCaptionMessage?.message) m = m.documentWithCaptionMessage.message
+        else if (m?.deviceSentMessage?.message) m = m.deviceSentMessage.message
+        else if (m?.editedMessage?.message) m = m.editedMessage.message
+
+        if (!m) {
+          console.log(`[WA] upsert msg skipped — no message body (msg.message=${msg.message ? Object.keys(msg.message).join(',') : 'null'})`)
+          continue
+        }
+
+        // v7.15: Try MORE text sources — Baileys uses different fields for different message types
+        const textContent =
+          m.conversation ||
+          m.extendedTextMessage?.text ||
+          m.imageMessage?.caption ||
+          m.videoMessage?.caption ||
+          m.documentMessage?.caption ||
+          m.templateMessage?.hydratedFourRowTemplate?.hydratedContentText ||
+          m.templateMessage?.hydratedTemplate?.hydratedContentText ||
+          m.buttonsMessage?.contentText ||
+          m.listMessage?.description ||
+          m.buttonsResponseMessage?.selectedButtonId ||
+          m.listResponseMessage?.title ||
+          m.listResponseMessage?.description ||
+          m.pollCreationMessage?.name ||
+          m.pollCreationMessageV3?.name ||
+          null
+
+        let mediaType = null
+        if (m.imageMessage) mediaType = 'image'
+        else if (m.videoMessage) mediaType = 'video'
+        else if (m.audioMessage) mediaType = 'audio'
+        else if (m.pttMessage) mediaType = 'ptt'
+        else if (m.documentMessage) mediaType = 'document'
+        else if (m.stickerMessage) mediaType = 'sticker'
+
+        // Skip protocol/reaction messages with no actual content
+        if (!textContent && !mediaType) {
+          console.log(`[WA] upsert msg skipped — no text/media (msg keys: ${Object.keys(m).join(',')})`)
+          // v7.15: Log full msg JSON so we can identify unknown message types
+          try {
+            const sample = JSON.stringify(m).slice(0, 500)
+            console.log(`[WA] unknown msg sample:`, sample)
+            logUpsertEvent({ type: 'skipped-no-content', jid, keys: Object.keys(m).join(','), sample })
+          } catch {}
+          continue
+        }
+
+        const msgId = msg.key.id
+        // Dedup: skip if we already have this message by whatsappId
+        if (msgId && conv.messages.some(m => m.whatsappId === msgId || m.id === msgId)) {
+          console.log(`[WA] Skipping duplicate message ${msgId}`)
+          continue
+        }
+
+        // Robust timestamp handling — Baileys can give number (seconds) or Long object
+        let messageTimestamp
+        try {
+          const ts = typeof msg.messageTimestamp === 'number'
+            ? msg.messageTimestamp
+            : (msg.messageTimestamp?.low || msg.messageTimestamp || Math.floor(Date.now() / 1000))
+          messageTimestamp = new Date(ts * 1000)
+          if (isNaN(messageTimestamp.getTime())) messageTimestamp = new Date()
+        } catch {
+          messageTimestamp = new Date()
+        }
+
+        const messageData = {
+          id: msgId || `m-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+          whatsappId: msgId || null,
+          fromMe,
+          textContent,
+          mediaType,
+          timestamp: messageTimestamp,
+          status: fromMe ? 'delivered' : 'received',
+        }
+
+        conv.messages.push(messageData)
+        conv.lastMessage = textContent || (mediaType ? `[${mediaType}]` : '')
+        conv.lastMessageAt = new Date()
+        if (!fromMe) conv.unreadCount++
+
+        console.log(`[WA] ✓ New message stored in ${jid} fromMe=${fromMe}: ${textContent ? textContent.slice(0, 40) : `[${mediaType}]`}`)
+        logUpsertEvent({ type: 'stored', jid, fromMe, msgId, preview: (textContent || '').slice(0, 30) })
+
+        // Try to fetch profile picture in background (don't block)
+        if (!conv.avatarUrl) {
+          waSocket.profilePictureUrl(jid, 'image').then(picUrl => {
+            if (picUrl) {
+              conv.avatarUrl = picUrl
+              io.of('/whatsapp').emit('whatsapp:conversation:update', serializeConversation(conv))
+            }
+          }).catch(() => {})
+        }
+
+        // Emit to all clients — the frontend's currentJidRef will decide if it appends to the active chat
+        // *** IMPORTANT: Use the normalized JID here so the frontend can match it ***
+        io.of('/whatsapp').emit('whatsapp:message', {
+          conversationJid: jid,
+          message: {
+            ...messageData,
+            // Serialize timestamp to ISO string for socket transport
+            timestamp: messageTimestamp.toISOString(),
+          },
+          conversation: serializeConversation(conv),
+        })
+        io.of('/whatsapp').emit('whatsapp:conversation:update', serializeConversation(conv))
+
+        // Auto-sync to Odoo in background
+        const phone = extractPhone(jid)
+        if (phone) {
+          autoSyncWhatsAppMessage({
+            jid, phone, pushName: conv.pushName, textContent, mediaType, fromMe,
+            timestamp: messageTimestamp.toISOString(),
+            dedupId: msgId,  // v7.14: dedup key for chatter
+          }).then(result => {
+            if (result.partnerId || result.leadId) {
+              io.of('/whatsapp').emit('whatsapp:odoo-sync', {
+                jid, phone, partnerId: result.partnerId, leadId: result.leadId,
+                mailMessageId: result.mailMessageId, activityId: result.activityId,
+                created: result.created, errors: result.errors,
+              })
+            }
+          }).catch(err => console.error('[AutoSync] Error:', err.message))
+        }
+      } catch (msgErr) {
+        // v7.15: Per-message error isolation — log and continue with next message
+        console.error(`[WA] upsert msg processing error:`, msgErr.message)
+        try {
+          console.error(`[WA] failing msg sample:`, JSON.stringify(msg).slice(0, 500))
+          logUpsertEvent({ type: 'processing-error', error: msgErr.message, sample: JSON.stringify(msg).slice(0, 300) })
+        } catch {}
       }
     }
   })
@@ -1340,12 +1402,23 @@ app.prepare().then(async () => {
       callback({ messages })
     })
 
-    // ===== v7.14: Manual refresh messages for a conversation =====
-    // Called by the "Atualizar" button in the chat view OR by the auto-polling
-    // mechanism. Re-emits the local conversation's messages to the requesting
-    // client. If Baileys has a `fetchMessageHistory` method and we have a recent
-    // message to anchor to, also tries to fetch the latest messages from the
-    // WhatsApp servers (best-effort, non-blocking).
+    // ===== v7.15: Manual refresh messages — fetches messages FROM THE PHONE =====
+    // Called by the "Atualizar" / "Buscar no aparelho" button in the chat view.
+    //
+    // STRATEGY:
+    //   1. Return local cached messages IMMEDIATELY (instant UI feedback)
+    //   2. If local messages exist → call `fetchMessageHistory(50, anchorKey, anchorTs)`
+    //      to fetch OLDER messages from WhatsApp servers (fills gaps in history)
+    //   3. ALWAYS also call `resyncAppState([...])` to force a fresh app-state
+    //      sync — this triggers `messaging-history.set` with the latest chats/
+    //      contacts/messages from the phone, INCLUDING messages that may have
+    //      been missed by `messages.upsert`
+    //   4. After 2.5s delay, re-emit local messages to all clients so they see
+    //      any new messages that arrived during the sync
+    //
+    // v7.15 fix: previous version did NOTHING if the conversation had 0 local
+    // messages (because fetchMessageHistory requires an anchor). Now we ALWAYS
+    // call resyncAppState which works regardless of local state.
     socket.on('whatsapp:refresh-messages', async (data, callback) => {
       try {
         const jid = normalizeJid(data?.jid)
@@ -1359,51 +1432,57 @@ app.prepare().then(async () => {
           return
         }
 
-        console.log(`[WA] Refresh messages requested for ${jid} (local count: ${conv.messages.length})`)
+        const beforeCount = conv.messages.length
+        console.log(`[WA] Refresh messages for ${jid} (local count: ${beforeCount})`)
 
-        // Best-effort: try to fetch the latest message history from WhatsApp servers.
-        // This is non-blocking — we still return the local messages immediately.
-        // Baileys' fetchMessageHistory requires an "anchor" message key + timestamp.
-        // We use the most recent local message as the anchor. If there are no local
-        // messages, we skip the server fetch (it would need an anchor anyway).
         let serverFetchAttempted = false
-        let serverFetchOk = false
-        if (waSocket && connectionState.connection === 'open' && typeof waSocket.fetchMessageHistory === 'function' && conv.messages.length > 0) {
-          serverFetchAttempted = true
-          try {
-            const lastMsg = conv.messages[conv.messages.length - 1]
-            const anchorKey = {
-              remoteJid: jid,
-              fromMe: lastMsg.fromMe,
-              id: lastMsg.whatsappId || lastMsg.id,
+        let serverFetchMethods = []
+
+        if (waSocket && connectionState.connection === 'open') {
+          // Method 1: fetchMessageHistory — fetches OLDER messages from WA servers
+          // (useful for filling gaps in history). Requires an anchor message.
+          if (typeof waSocket.fetchMessageHistory === 'function' && conv.messages.length > 0) {
+            serverFetchAttempted = true
+            serverFetchMethods.push('fetchMessageHistory')
+            try {
+              const lastMsg = conv.messages[conv.messages.length - 1]
+              const anchorKey = {
+                remoteJid: jid,
+                fromMe: lastMsg.fromMe,
+                id: lastMsg.whatsappId || lastMsg.id,
+              }
+              const anchorTs = lastMsg.timestamp instanceof Date
+                ? Math.floor(lastMsg.timestamp.getTime() / 1000)
+                : Math.floor(new Date(lastMsg.timestamp).getTime() / 1000)
+              console.log(`[WA] Triggering fetchMessageHistory for ${jid} (anchor=${anchorKey.id})`)
+              waSocket.fetchMessageHistory(50, anchorKey, anchorTs)
+                .then(() => console.log(`[WA] fetchMessageHistory completed for ${jid}`))
+                .catch(err => console.error(`[WA] fetchMessageHistory error:`, err.message))
+            } catch (err) {
+              console.error(`[WA] fetchMessageHistory trigger failed:`, err.message)
             }
-            const anchorTs = lastMsg.timestamp instanceof Date
-              ? Math.floor(lastMsg.timestamp.getTime() / 1000)
-              : Math.floor(new Date(lastMsg.timestamp).getTime() / 1000)
-            // Fire-and-forget — the result will come back via messaging-history.set / messages.upsert
-            waSocket.fetchMessageHistory(50, anchorKey, anchorTs)
-              .then(() => {
-                console.log(`[WA] fetchMessageHistory completed for ${jid}`)
-                // After a brief delay (to let the events fire), re-emit messages to all clients
-                setTimeout(() => {
-                  const c = conversations.get(jid)
-                  if (c) {
-                    const msgs = c.messages.slice(-200).map(m => ({
-                      ...m,
-                      timestamp: m.timestamp instanceof Date ? m.timestamp.toISOString() : m.timestamp,
-                    }))
-                    io.of('/whatsapp').emit('whatsapp:messages:refreshed', { jid, messages: msgs })
-                  }
-                }, 2000)
-              })
-              .catch(err => console.error(`[WA] fetchMessageHistory error:`, err.message))
-            serverFetchOk = true
-          } catch (err) {
-            console.error(`[WA] fetchMessageHistory trigger failed:`, err.message)
           }
+
+          // Method 2: resyncAppState — forces a fresh app-state sync (heavier but
+          // more thorough). This is the ONLY way to fetch messages from the phone
+          // when we have no local anchor message. ALWAYS run this on refresh.
+          if (typeof waSocket.resyncAppState === 'function') {
+            serverFetchAttempted = true
+            serverFetchMethods.push('resyncAppState')
+            try {
+              console.log(`[WA] Triggering resyncAppState for refresh`)
+              waSocket.resyncAppState(['critical_block', 'critical_unblock_low', 'regular_high', 'regular_low', 'regular'], false)
+                .then(() => console.log(`[WA] resyncAppState completed for refresh`))
+                .catch(err => console.error(`[WA] resyncAppState error:`, err.message))
+            } catch (err) {
+              console.error(`[WA] resyncAppState trigger failed:`, err.message)
+            }
+          }
+        } else {
+          console.log(`[WA] Refresh skipped server-fetch — WA not connected`)
         }
 
-        // Return local messages immediately
+        // Return local messages immediately (for instant UI feedback)
         const messages = conv.messages.slice(-200).map(m => ({
           ...m,
           timestamp: m.timestamp instanceof Date ? m.timestamp.toISOString() : m.timestamp,
@@ -1413,11 +1492,50 @@ app.prepare().then(async () => {
           messages,
           count: messages.length,
           serverFetchAttempted,
-          serverFetchOk,
+          serverFetchMethods,
         })
+
+        // v7.15: After 2.5s delay, re-emit local messages to ALL clients.
+        // This catches any new messages that arrived during the async fetch.
+        setTimeout(() => {
+          const c = conversations.get(jid)
+          if (c) {
+            const msgs = c.messages.slice(-200).map(m => ({
+              ...m,
+              timestamp: m.timestamp instanceof Date ? m.timestamp.toISOString() : m.timestamp,
+            }))
+            const afterCount = msgs.length
+            console.log(`[WA] Refresh result for ${jid}: ${beforeCount} → ${afterCount} msgs`)
+            io.of('/whatsapp').emit('whatsapp:messages:refreshed', { jid, messages: msgs })
+            io.of('/whatsapp').emit('whatsapp:conversation:update', serializeConversation(c))
+          }
+        }, 2500)
       } catch (error) {
         console.error('[WA] refresh-messages error:', error.message)
         callback({ success: false, error: error.message, messages: [] })
+      }
+    })
+
+    // ===== v7.15: Debug endpoint — returns recent upsert events =====
+    // Used to troubleshoot "messages not arriving" issues. The user can call
+    // this from the browser console to see if `messages.upsert` is firing
+    // and what message types are being received.
+    socket.on('whatsapp:debug-events', (data, callback) => {
+      try {
+        callback({
+          success: true,
+          recentEvents: recentUpsertEvents,
+          connectionState: connectionState.connection,
+          waSocketExists: !!waSocket,
+          waSocketReadyState: waSocket?.ws?.readyState,
+          totalConversations: conversations.size,
+          totalContacts: deviceContacts.size,
+          totalPostedChatter: postedChatterIds.size,
+          hasFetchMessageHistory: typeof waSocket?.fetchMessageHistory === 'function',
+          hasResyncAppState: typeof waSocket?.resyncAppState === 'function',
+        })
+      } catch (error) {
+        callback({ success: false, error: error.message })
       }
     })
 

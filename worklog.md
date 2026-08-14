@@ -381,3 +381,41 @@ Stage Summary:
 - **Never duplicates**: `postedChatterIds` Set tracks every posted WhatsApp message ID. Dedup is checked FIRST (before any Odoo call). Set is capped at 5000 entries with FIFO eviction.
 - **Leads are no longer duplicated**: Search now uses `partner_id + type=lead + active=true` (no longer requires the `[WhatsApp]` prefix in name), so existing leads are reused.
 - Version: 7.14.0
+
+---
+Task ID: v7.15
+Agent: main
+Task: Fix incoming messages not arriving + make "refresh" button actually pull from phone
+
+Work Log:
+- Investigated the v7.14 code in server.js, use-whatsapp.ts, ChatView.tsx
+- Found root cause #1: whatsapp:refresh-messages handler did NOTHING if the conversation had 0 local messages (because fetchMessageHistory requires an anchor). User opens empty chat → clicks "Atualizar" → server returns 0 messages and doesn't call any Baileys fetch.
+- Found root cause #2: messages.upsert handler had no per-message try/catch. One bad message could break processing of subsequent messages in the same batch.
+- Found root cause #3: Some message types weren't unwrapped: deviceSentMessage (echo from linked device), editedMessage, pollCreationMessage. These were silently dropped.
+- Found root cause #4: No way to debug from the UI when user reports "messages aren't arriving". Added whatsapp:debug-events endpoint + recentUpsertEvents ring buffer.
+
+Changes made:
+- server.js:
+  - Added recentUpsertEvents ring buffer (50 events) + logUpsertEvent() helper near top
+  - Rewrote messages.upsert handler: per-message try/catch, unwrap deviceSentMessage/editedMessage, extract text from pollCreationMessage, log full JSON for unknown msg types, log upsert event to ring buffer
+  - Added LID JID fallback: if remoteJid is @lid, try msg.key.participant for canonical phone JID
+  - Skip group chats (@g.us) explicitly with log
+  - Rewrote whatsapp:refresh-messages: ALWAYS call resyncAppState (works even with 0 local messages), also call fetchMessageHistory when local anchor exists, return serverFetchMethods to UI, re-emit messages to all clients after 2.5s delay
+  - Added whatsapp:debug-events socket endpoint: returns recent upsert events, connection state, available Baileys methods
+- src/lib/use-whatsapp.ts:
+  - Bumped auto-polling from 5s to 3s
+  - Added debugEvents() function for browser console troubleshooting
+  - Updated refreshMessages return type to include serverFetchMethods
+- src/components/whatsapp/ChatView.tsx:
+  - Renamed button "Atualizar" → "Buscar no aparelho" (per user's explicit request)
+  - Button styled in emerald color to emphasize it's the "from phone" action
+  - Updated tooltip to mention resyncAppState + fetchMessageHistory
+  - Refresh result shows which server methods were attempted
+- src/app/page.tsx: Updated onRefreshMessages type signature to include serverFetchMethods
+- package.json: Bumped version to 7.15.0
+
+Stage Summary:
+- v7.15.0 ready to deploy
+- Three-layer incoming message handling: messages.upsert (primary, now more robust) + messages.update (fallback) + 3s polling (last resort)
+- "Buscar no aparelho" button now actually fetches from the WhatsApp servers via resyncAppState (works regardless of local message count) + fetchMessageHistory (fills gaps when anchor exists)
+- Debug endpoint whatsapp:debug-events available for troubleshooting from browser console

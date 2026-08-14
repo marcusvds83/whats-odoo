@@ -68,8 +68,8 @@ interface ChatViewProps {
   onInjectHistory?: (jid: string, messages: any[]) => Promise<{ success: boolean; added?: number; skipped?: number; error?: string }>
   // New in v7.12: delete conversation
   onDeleteConversation?: (jid: string) => void
-  // New in v7.14: manual refresh messages button
-  onRefreshMessages?: (jid: string) => Promise<{ success: boolean; count?: number; serverFetchAttempted?: boolean; error?: string }>
+  // New in v7.14/v7.15: manual refresh messages button — fetches FROM THE PHONE
+  onRefreshMessages?: (jid: string) => Promise<{ success: boolean; count?: number; serverFetchAttempted?: boolean; serverFetchMethods?: string[]; error?: string }>
 }
 
 function formatMessageTime(dateStr: string): string {
@@ -142,7 +142,7 @@ export function ChatView({
   const [isPullingHistory, setIsPullingHistory] = useState(false)
   const [pullResult, setPullResult] = useState<{ added: number; skipped: number } | null>(null)
   const [isRefreshing, setIsRefreshing] = useState(false)
-  const [refreshResult, setRefreshResult] = useState<{ count: number; serverFetchAttempted: boolean } | null>(null)
+  const [refreshResult, setRefreshResult] = useState<{ count: number; serverFetchAttempted: boolean; methods?: string[] } | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const scrollViewportRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
@@ -207,8 +207,11 @@ export function ChatView({
     }
   }, [conversation, odooLinkedRecords, onFetchOdooHistory, onInjectHistory])
 
-  // v7.14: Manual refresh messages — fetches latest messages from server cache
-  // AND triggers a fetchMessageHistory call in the background.
+  // v7.14/v7.15: Manual refresh messages — fetches latest messages FROM THE PHONE.
+  // Calls server which uses BOTH `fetchMessageHistory` (older messages) AND
+  // `resyncAppState` (force full app-state re-sync) to bring in messages that
+  // may have been missed by `messages.upsert`. This is the manual fallback the
+  // user requested — "o botão na conversa pra trazer mensagens... do aparelho".
   const handleRefreshMessages = useCallback(async () => {
     if (!conversation || !onRefreshMessages) return
     setIsRefreshing(true)
@@ -219,14 +222,16 @@ export function ChatView({
         setRefreshResult({
           count: result.count || 0,
           serverFetchAttempted: !!result.serverFetchAttempted,
+          // v7.15: show what server methods were attempted
+          methods: (result as any).serverFetchMethods || [],
         })
-        setTimeout(() => setRefreshResult(null), 4000)
+        setTimeout(() => setRefreshResult(null), 5000)
       } else {
-        setRefreshResult({ count: 0, serverFetchAttempted: false })
+        setRefreshResult({ count: 0, serverFetchAttempted: false, methods: [] })
         setTimeout(() => setRefreshResult(null), 3000)
       }
     } catch (err) {
-      setRefreshResult({ count: 0, serverFetchAttempted: false })
+      setRefreshResult({ count: 0, serverFetchAttempted: false, methods: [] })
       setTimeout(() => setRefreshResult(null), 3000)
     } finally {
       setIsRefreshing(false)
@@ -342,7 +347,7 @@ export function ChatView({
             </TooltipProvider>
           )}
 
-          {/* v7.14: Refresh messages button — fetches latest messages from server cache */}
+          {/* v7.15: Refresh messages button — fetches latest messages FROM THE PHONE */}
           {onRefreshMessages && (
             <TooltipProvider delayDuration={300}>
               <Tooltip>
@@ -350,7 +355,7 @@ export function ChatView({
                   <Button
                     variant="outline"
                     size="sm"
-                    className="h-8 gap-1.5 shrink-0 text-xs"
+                    className="h-8 gap-1.5 shrink-0 text-xs border-emerald-200 bg-emerald-50 hover:bg-emerald-100 text-emerald-700"
                     disabled={isRefreshing}
                     onClick={handleRefreshMessages}
                   >
@@ -360,21 +365,22 @@ export function ChatView({
                       <RefreshCw className="size-3.5" />
                     )}
                     <span className="hidden sm:inline">
-                      {isRefreshing ? 'Atualizando...' : 'Atualizar'}
+                      {isRefreshing ? 'Buscando...' : 'Buscar no aparelho'}
                     </span>
                   </Button>
                 </TooltipTrigger>
                 <TooltipContent side="bottom" className="max-w-xs">
-                  <p>Busca as mensagens mais recentes desta conversa.</p>
+                  <p className="font-medium">Busca as mensagens mais recentes do aparelho conectado.</p>
                   <p className="text-xs text-muted-foreground mt-1">
-                    Caso uma mensagem não tenha chegado automaticamente, clique aqui para forçar a busca.
+                    Força uma ressincronização com o WhatsApp (resyncAppState + fetchMessageHistory).
+                    Use se uma mensagem não chegou automaticamente.
                   </p>
                 </TooltipContent>
               </Tooltip>
             </TooltipProvider>
           )}
 
-          {/* v7.14: Refresh result feedback */}
+          {/* v7.15: Refresh result feedback */}
           {refreshResult && (
             <div className={cn(
               'flex items-center gap-1.5 px-2 py-1 rounded-md text-[11px] shrink-0',
@@ -384,7 +390,11 @@ export function ChatView({
             )}>
               <CheckCheck className="size-3" />
               <span>{refreshResult.count} msgs</span>
-              {refreshResult.serverFetchAttempted && <span className="text-[9px] text-muted-foreground ml-1">(servidor)</span>}
+              {refreshResult.serverFetchAttempted && (
+                <span className="text-[9px] text-muted-foreground ml-1">
+                  ({refreshResult.methods?.join('+') || 'servidor'})
+                </span>
+              )}
             </div>
           )}
 

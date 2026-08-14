@@ -266,7 +266,7 @@ function ConversationsView({
   onCreateOdooContact?: (data: { name: string; phone?: string; mobile?: string; whatsapp?: string; email?: string }) => Promise<{ success: boolean; id?: number; error?: string }>
   onDeleteConversation?: (jid: string) => Promise<{ success: boolean; error?: string }>
   onRefreshData?: () => Promise<{ success: boolean; chatsFetched?: number; contactsFetched?: number; error?: string }>
-  onRefreshMessages?: (jid: string) => Promise<{ success: boolean; count?: number; serverFetchAttempted?: boolean; error?: string }>
+  onRefreshMessages?: (jid: string) => Promise<{ success: boolean; count?: number; serverFetchAttempted?: boolean; serverFetchMethods?: string[]; error?: string }>
 }) {
   // Build conversation history payload (for Odoo lead creation)
   const conversationHistory = useMemo(() => {
