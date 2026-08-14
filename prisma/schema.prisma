@@ -7,6 +7,31 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+// v7.22: Multi-user model — each Odoo user has their own middleware account.
+// The first user created becomes the admin (role = "admin").
+// Regular users (role = "user") can be created/managed by the admin via
+// the "Usuários" tab in the settings page.
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique // Login email (also used as display name fallback)
+  passwordHash String            // bcrypt-hashed password
+  name         String?           // Display name
+  role         String   @default("user") // "admin" | "user"
+  // Per-user Odoo credentials — when a user logs in, the middleware uses
+  // THESE credentials to authenticate with Odoo (not the global OdooConfig).
+  // Falls back to OdooConfig if all per-user fields are empty.
+  odooUrl      String?
+  odooDb       String?
+  odooUsername String?
+  odooPassword String?  // Stored as plaintext (could be encrypted later)
+  // User's WhatsApp phone number (informational — for admin to track which
+  // number each user is responsible for).
+  whatsappPhone String?
+  isActive     Boolean  @default(true) // Admin can deactivate users
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
 model OdooConfig {
   id        String   @id @default(cuid())
   url       String   // Odoo instance URL

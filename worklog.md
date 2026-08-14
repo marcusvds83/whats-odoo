@@ -857,3 +857,47 @@ Stage Summary:
 - File upload buttons (image/audio/document) added to chat input bar
 - All changes are additive — existing functionality preserved
 - Next phase: multi-user auth + admin panel (separate commit)
+
+---
+Task ID: v7.22-phase2
+Agent: Main Agent
+Task: Multi-user auth + admin panel
+
+Work Log (Phase 2 — Auth & Admin):
+- Added User model to Prisma schema (email, passwordHash, role, per-user Odoo config, whatsappPhone, isActive)
+- Created src/lib/auth.ts: bcryptjs password hashing, jose JWT signing/verification, cookie helpers
+- Created src/lib/auth-context.tsx: React AuthProvider with useAuth hook (login/logout/refresh)
+- API routes:
+  - POST /api/auth/login  — email/password → JWT cookie
+  - POST /api/auth/logout — clears cookie
+  - GET  /api/auth/me     — current user from JWT
+  - POST /api/auth/setup  — bootstrap first admin (only works if no users exist)
+  - GET  /api/auth/odoo-config — per-user Odoo config (fallback to global)
+  - GET/POST /api/users   — list/create users (admin only)
+  - PATCH/DELETE /api/users/[id] — update/delete user (admin only)
+- Created src/middleware.ts — Next.js proxy that protects all routes except /login and /api/auth/*
+- Created /login page with two modes:
+  - "setup" mode (first run, no users in DB) → create admin
+  - "login" mode (subsequent runs) → email/password
+- Created src/components/admin/UsersPanel.tsx:
+  - Table listing all users (email, name, role, status, phone, Odoo config source)
+  - Create/Edit dialog with: email, name, password, role (user/admin), isActive, whatsappPhone, per-user Odoo config (url/db/username/password)
+  - Delete with confirmation (admin can't delete themselves)
+  - Refresh button
+- Updated src/app/layout.tsx to wrap with AuthProvider
+- Updated src/app/page.tsx:
+  - Auth guard: redirect to /login if not authenticated
+  - Loading spinner while auth state is being determined
+  - User info + logout button in sidebar footer
+  - "Usuários" tab (admin only) renders UsersPanel
+- Installed dependencies: bcryptjs, jose, @types/bcryptjs, @radix-ui/react-popover (from Phase 1)
+- Build verified: npx next build ✓
+
+Stage Summary:
+- v7.22 Phase 2 (Multi-user) complete
+- First-time visitors are redirected to /login → setup wizard creates admin
+- Admin can CRUD users via dedicated tab
+- Per-user Odoo config: each user can have their own Odoo credentials, falling back to global if empty
+- Authenticated users see the same WhatsApp conversations (shared WhatsApp session — per-user WA sessions would be a future v7.23 enhancement)
+- All API routes (except /api/auth/*) require valid JWT cookie
+- Admin-only routes (/api/users/*) return 403 for non-admin users

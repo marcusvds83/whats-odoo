@@ -1,15 +1,18 @@
 'use client'
 
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useEffect } from 'react'
 import Image from 'next/image'
+import { useRouter } from 'next/navigation'
 import { useWhatsApp } from '@/lib/use-whatsapp'
 import { useOdoo } from '@/lib/use-odoo'
+import { useAuth } from '@/lib/auth-context'
 import { QRCodePanel } from '@/components/whatsapp/QRCodePanel'
 import { ConversationList } from '@/components/whatsapp/ConversationList'
 import { ChatView } from '@/components/whatsapp/ChatView'
 import { OdooConfigForm } from '@/components/odoo/OdooConfigForm'
 import { OdooLinkPanel } from '@/components/odoo/OdooLinkPanel'
 import { AutoSyncSettingsPanel } from '@/components/odoo/AutoSyncSettings'
+import { UsersPanel } from '@/components/admin/UsersPanel'
 
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -35,9 +38,11 @@ import {
   Loader2,
   AlertCircle,
   CheckCircle2,
+  LogOut,
+  Shield,
 } from 'lucide-react'
 
-type Tab = 'dashboard' | 'whatsapp' | 'conversations' | 'settings'
+type Tab = 'dashboard' | 'whatsapp' | 'conversations' | 'settings' | 'users'
 
 function DashboardView({
   waStatus,
@@ -427,10 +432,31 @@ function StatusIndicator({ label, connected, collapsed }: { label: string; conne
 export default function HomePage() {
   const wa = useWhatsApp()
   const odoo = useOdoo()
+  const { user, isLoading: authLoading, isAuthenticated, isAdmin, logout } = useAuth()
+  const router = useRouter()
 
   const [activeTab, setActiveTab] = useState<Tab>('dashboard')
   const [selectedJid, setSelectedJid] = useState<string | null>(null)
   const [showOdooPanel, setShowOdooPanel] = useState(false)
+
+  // v7.22: Auth guard — if not authenticated, redirect to /login
+  useEffect(() => {
+    if (!authLoading && !isAuthenticated) {
+      router.replace('/login')
+    }
+  }, [authLoading, isAuthenticated, router])
+
+  // Show loading spinner while auth state is being determined
+  if (authLoading || !isAuthenticated) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-background">
+        <div className="flex flex-col items-center gap-3">
+          <Loader2 className="size-8 animate-spin text-emerald-600" />
+          <p className="text-sm text-muted-foreground">Carregando...</p>
+        </div>
+      </div>
+    )
+  }
 
   const selectedConversation = useMemo(() => {
     if (!selectedJid) return null
@@ -498,11 +524,41 @@ export default function HomePage() {
             collapsed={sidebarCollapsed}
           />
           <NavItem icon={<Settings className="size-4" />} label="Configuracoes" active={activeTab === 'settings'} onClick={() => setActiveTab('settings')} collapsed={sidebarCollapsed} />
+          {/* v7.22: Admin-only "Usuários" tab */}
+          {isAdmin && (
+            <NavItem icon={<Users className="size-4" />} label="Usuários" active={activeTab === 'users'} onClick={() => setActiveTab('users')} collapsed={sidebarCollapsed} />
+          )}
         </div>
 
         <div className="p-2 border-t space-y-1">
           <StatusIndicator label="WhatsApp" connected={wa.status.connected} collapsed={sidebarCollapsed} />
           <StatusIndicator label="Odoo" connected={odoo.status.connected} collapsed={sidebarCollapsed} />
+          {/* v7.22: User info + logout */}
+          <div className="pt-2 mt-2 border-t">
+            <div className="flex items-center gap-2 px-2 py-1.5">
+              <div className="size-7 rounded-full bg-emerald-600 text-white text-xs flex items-center justify-center shrink-0 font-medium">
+                {(user?.name || user?.email || '?').charAt(0).toUpperCase()}
+              </div>
+              {!sidebarCollapsed && (
+                <div className="flex-1 min-w-0 hidden lg:block">
+                  <p className="text-xs font-medium truncate">{user?.name || user?.email}</p>
+                  <p className="text-[10px] text-muted-foreground flex items-center gap-1">
+                    {isAdmin && <Shield className="size-2.5 text-amber-600" />}
+                    {isAdmin ? 'Admin' : 'Usuário'}
+                  </p>
+                </div>
+              )}
+              <Button
+                variant="ghost"
+                size="icon"
+                className="size-7 shrink-0 text-muted-foreground hover:text-destructive"
+                onClick={() => logout()}
+                title="Sair"
+              >
+                <LogOut className="size-3.5" />
+              </Button>
+            </div>
+          </div>
         </div>
       </nav>
 
@@ -677,6 +733,13 @@ export default function HomePage() {
                 </Button>
               </CardContent>
             </Card>
+          </div>
+        )}
+
+        {/* v7.22: Admin user management tab */}
+        {activeTab === 'users' && isAdmin && (
+          <div className="flex-1 overflow-y-auto p-6 max-w-5xl mx-auto">
+            <UsersPanel />
           </div>
         )}
       </main>
