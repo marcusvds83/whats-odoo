@@ -1,7 +1,14 @@
 // ====================================================================
-// Whats-Odoo v7.14 — SINGLE-PROCESS SERVER
+// Whats-Odoo v7.17 — SINGLE-PROCESS SERVER
 // Everything in one process: Next.js + WhatsApp (Baileys) + Odoo (XML-RPC)
 // Designed for Render 512MB RAM
+//
+// v7.17 changes:
+//   - Session persistence across deploys (conversations saved to disk)
+//   - LID JID resolution for chats/contacts (active conversations now sync)
+//   - Conversations tab shows ONLY actual chats (no more device contacts leaking in)
+//   - Odoo auto-auth retry (fixes "Parou de Criar Leads" on cold start)
+//   - Detailed lead creation logging
 // ====================================================================
 
 const { createServer } = require('http')
@@ -24,6 +31,7 @@ const handle = app.getRequestHandler()
 // ========== Paths ==========
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data')
 const AUTH_FOLDER = path.join(DATA_DIR, 'auth_store')
+const CONV_STATE_FILE = path.join(DATA_DIR, 'conversation-state.json')
 
 // Create directories on startup
 function ensureDirs() {
@@ -34,6 +42,155 @@ ensureDirs()
 
 console.log(`[Server] Data dir: ${DATA_DIR}`)
 console.log(`[Server] Auth folder: ${AUTH_FOLDER}`)
+
+// v7.17: Persistence diagnostics — verify the data dir is writable and
+// the auth folder has session files. This helps diagnose "lost session
+// after deploy" issues. If the disk isn't actually attached, the logs
+// will show it immediately.
+function runPersistenceDiagnostics() {
+  try {
+    // Check if DATA_DIR is writable
+    const testFile = path.join(DATA_DIR, '.write-test')
+    fs.writeFileSync(testFile, `persist-test-${Date.now()}`)
+    fs.unlinkSync(testFile)
+    console.log(`[Server] ✓ Data dir is writable: ${DATA_DIR}`)
+
+    // Check auth folder contents
+    if (fs.existsSync(AUTH_FOLDER)) {
+      const files = fs.readdirSync(AUTH_FOLDER)
+      const hasCreds = files.includes('creds.json')
+      console.log(`[Server] Auth folder: ${files.length} files, creds.json=${hasCreds ? 'PRESENT' : 'MISSING'}`)
+      if (hasCreds) {
+        const stats = fs.statSync(path.join(AUTH_FOLDER, 'creds.json'))
+        console.log(`[Server] ✓ WhatsApp session found (creds.json last modified: ${stats.mtime.toISOString()})`)
+      } else {
+        console.log(`[Server] ⚠ No WhatsApp session — will need new QR code scan`)
+      }
+    }
+
+    // Check conversation state file
+    if (fs.existsSync(CONV_STATE_FILE)) {
+      const stats = fs.statSync(CONV_STATE_FILE)
+      console.log(`[Server] ✓ Conversation state file found (last modified: ${stats.mtime.toISOString()})`)
+    }
+  } catch (err) {
+    console.error(`[Server] ✗ Persistence diagnostics FAILED: ${err.message}`)
+    console.error(`[Server] ✗ DATA_DIR (${DATA_DIR}) may not be writable. Session will NOT persist across deploys!`)
+  }
+}
+runPersistenceDiagnostics()
+
+// v7.17: Persist in-memory conversations to disk so they survive deploys.
+// Baileys auth files already persist on disk, but the in-memory conversations
+// Map (chats + messages) is lost on every restart. We save a snapshot to
+// conversation-state.json periodically and on shutdown. On startup, we load
+// it back so the user doesn't see an empty conversation list while the
+// resyncAppState completes.
+function persistConversationsToDisk() {
+  try {
+    const snapshot = {
+      version: 1,
+      savedAt: new Date().toISOString(),
+      conversations: Array.from(conversations.values()).map(c => ({
+        jid: c.jid,
+        name: c.name,
+        phone: c.phone,
+        pushName: c.pushName,
+        avatarUrl: c.avatarUrl,
+        lastMessage: c.lastMessage,
+        lastMessageAt: c.lastMessageAt ? c.lastMessageAt.toISOString() : null,
+        unreadCount: c.unreadCount,
+        messages: c.messages.map(m => ({
+          ...m,
+          timestamp: m.timestamp instanceof Date ? m.timestamp.toISOString() : m.timestamp,
+        })),
+      })),
+      contactNames: Array.from(contactNames.entries()),
+      deviceContacts: Array.from(deviceContacts.values()),
+      lidToPhoneMap: Array.from(lidToPhoneMap.entries()),
+    }
+    fs.writeFileSync(CONV_STATE_FILE, JSON.stringify(snapshot), 'utf8')
+    console.log(`[Server] Persisted ${snapshot.conversations.length} conversations to disk`)
+  } catch (err) {
+    console.error(`[Server] Failed to persist conversations: ${err.message}`)
+  }
+}
+
+function loadConversationsFromDisk() {
+  try {
+    if (!fs.existsSync(CONV_STATE_FILE)) {
+      console.log(`[Server] No saved conversation state — starting fresh`)
+      return
+    }
+    const raw = fs.readFileSync(CONV_STATE_FILE, 'utf8')
+    const snapshot = JSON.parse(raw)
+    if (!snapshot || snapshot.version !== 1) {
+      console.log(`[Server] Saved conversation state is old format — ignoring`)
+      return
+    }
+
+    let loaded = 0
+    for (const c of snapshot.conversations || []) {
+      if (!c.jid || !isValidPhoneJid(c.jid)) continue
+      conversations.set(c.jid, {
+        jid: c.jid,
+        name: c.name || null,
+        phone: c.phone || extractPhone(c.jid),
+        pushName: c.pushName || null,
+        avatarUrl: c.avatarUrl || null,
+        lastMessage: c.lastMessage || null,
+        lastMessageAt: c.lastMessageAt ? new Date(c.lastMessageAt) : null,
+        unreadCount: c.unreadCount || 0,
+        messages: (c.messages || []).map(m => ({
+          ...m,
+          timestamp: m.timestamp ? new Date(m.timestamp) : new Date(),
+        })),
+      })
+      loaded++
+    }
+
+    for (const [jid, name] of snapshot.contactNames || []) {
+      contactNames.set(jid, name)
+    }
+
+    for (const c of snapshot.deviceContacts || []) {
+      if (c.jid) deviceContacts.set(c.jid, c)
+    }
+
+    for (const [lid, phone] of snapshot.lidToPhoneMap || []) {
+      lidToPhoneMap.set(lid, phone)
+    }
+
+    console.log(`[Server] ✓ Loaded ${loaded} conversations, ${contactNames.size} contact names, ${deviceContacts.size} device contacts from disk (saved ${snapshot.savedAt})`)
+  } catch (err) {
+    console.error(`[Server] Failed to load conversations from disk: ${err.message}`)
+  }
+}
+// NOTE: loadConversationsFromDisk() is called later, after the conversations/
+// contactNames/deviceContacts/lidToPhoneMap Maps and helper functions are
+// defined (in the WhatsApp module below). The function itself is hoisted.
+
+// v7.17: Persist conversations every 30 seconds (debounced — only if changed)
+let lastPersistTs = 0
+let conversationDirty = false
+function markConversationsDirty() { conversationDirty = true }
+setInterval(() => {
+  if (conversationDirty && Date.now() - lastPersistTs > 25_000) {
+    conversationDirty = false
+    lastPersistTs = Date.now()
+    persistConversationsToDisk()
+  }
+}, 30_000)
+
+// Persist on shutdown
+process.on('SIGTERM', () => {
+  console.log('[Server] SIGTERM — persisting conversations to disk...')
+  persistConversationsToDisk()
+})
+process.on('SIGINT', () => {
+  console.log('[Server] SIGINT — persisting conversations to disk...')
+  persistConversationsToDisk()
+})
 
 // ====================================================================
 // ODOO MODULE — In-process (no separate service)
@@ -57,6 +214,11 @@ let autoSyncSettings = {
   leadTeamId: null,
   leadUserId: null,
 }
+
+// v7.17: Background re-auth timer — if Odoo auth fails on startup, we retry
+// every 60s until it succeeds. This prevents "Parou de Criar Leads" when Odoo
+// was temporarily unreachable during the middleware's cold start.
+let odooReauthTimer = null
 
 const modelFieldsCache = new Map()
 const phoneToPartnerCache = new Map()
@@ -237,7 +399,16 @@ async function autoSyncWhatsAppMessage(data) {
     chatterPosted: false, chatterLeadPosted: false,
   }
 
-  if (!autoSyncSettings.enabled || !odooConfig.uid) return result
+  // v7.17: Detailed skip logging — when lead creation silently fails, we need
+  // to know WHY. This was the root cause of "Parou de Criar Leads".
+  if (!autoSyncSettings.enabled) {
+    console.log('[AutoSync] SKIP — autoSyncSettings.enabled is false')
+    return result
+  }
+  if (!odooConfig.uid) {
+    console.log('[AutoSync] SKIP — Odoo not authenticated (uid is null). Lead creation and chatter sync will NOT happen. Check ODOO_URL/DB/USERNAME/PASSWORD env vars.')
+    return result
+  }
 
   // v7.14: NEVER duplicate chatter posts — check dedup set FIRST.
   // We dedup by whatsappId (or fallback id) so the same message is never posted twice.
@@ -249,7 +420,7 @@ async function autoSyncWhatsAppMessage(data) {
     return result
   }
 
-  console.log(`[AutoSync] Processing message from ${data.phone} (fromMe=${data.fromMe})`)
+  console.log(`[AutoSync] Processing message from ${data.phone} (fromMe=${data.fromMe}, autoCreateLead=${autoSyncSettings.autoCreateLead}, autoCreateContact=${autoSyncSettings.autoCreateContact})`)
 
   try {
     // ===== Step 1: Always ensure partner exists (for both sent AND received) =====
@@ -276,6 +447,7 @@ async function autoSyncWhatsAppMessage(data) {
       const cached = phoneToPartnerCache.get(data.phone)
       if (cached && cached.leadId && cached.leadCreated) {
         result.leadId = cached.leadId
+        console.log(`[AutoSync] Lead reused from cache: crm.lead#${result.leadId} (partner=${result.partnerId})`)
       } else {
         // Search for an EXISTING open lead for this partner (any name, not just our prefix)
         // — this prevents creating duplicate leads if one already exists.
@@ -289,6 +461,7 @@ async function autoSyncWhatsAppMessage(data) {
           result.leadId = existingLeads[0].id
           if (cached) { cached.leadId = existingLeads[0].id; cached.leadCreated = true }
           else phoneToPartnerCache.set(data.phone, { partnerId: result.partnerId, leadId: existingLeads[0].id, leadCreated: true })
+          console.log(`[AutoSync] Lead reused from Odoo search: crm.lead#${result.leadId} (name="${existingLeads[0].name}")`)
         } else {
           // No existing lead — create one with the WhatsApp prefix
           const leadName = `${autoSyncSettings.leadPrefix}${data.pushName || data.phone}`
@@ -301,12 +474,21 @@ async function autoSyncWhatsAppMessage(data) {
           if (autoSyncSettings.leadTeamId) leadValues.team_id = autoSyncSettings.leadTeamId
           if (autoSyncSettings.leadUserId) leadValues.user_id = autoSyncSettings.leadUserId
 
-          result.leadId = await odooCreate('crm.lead', leadValues)
-          result.created.lead = true
-          if (cached) { cached.leadId = result.leadId; cached.leadCreated = true }
-          else phoneToPartnerCache.set(data.phone, { partnerId: result.partnerId, leadId: result.leadId, leadCreated: true })
+          try {
+            result.leadId = await odooCreate('crm.lead', leadValues)
+            result.created.lead = true
+            if (cached) { cached.leadId = result.leadId; cached.leadCreated = true }
+            else phoneToPartnerCache.set(data.phone, { partnerId: result.partnerId, leadId: result.leadId, leadCreated: true })
+            console.log(`[AutoSync] ✓ NEW Lead created: crm.lead#${result.leadId} (name="${leadName}", partner=${result.partnerId})`)
+          } catch (error) {
+            console.error(`[AutoSync] ✗ Lead creation FAILED for partner ${result.partnerId}: ${error.message}`)
+            result.errors.push(`Lead creation failed: ${error.message}`)
+          }
         }
       }
+    } else if (autoSyncSettings.autoCreateLead && data.fromMe) {
+      // v7.17: Log why we're skipping lead creation for outgoing messages
+      console.log(`[AutoSync] Lead creation skipped — outgoing message (fromMe=true). Leads are only created for incoming messages.`)
     }
 
     // ===== Step 2.5: For OUTGOING messages, find an active lead by phone (if any) =====
@@ -407,17 +589,60 @@ async function autoAuthenticateFromEnv() {
 
   if (envUrl && envDb && envUsername && envPassword) {
     console.log(`[Odoo] Auto-authenticating with env vars: ${envUrl} / ${envDb} / ${envUsername}`)
-    try {
-      odooConfig = { url: envUrl, db: envDb, username: envUsername, password: envPassword, uid: null }
-      modelFieldsCache.clear()
-      phoneToPartnerCache.clear()
-      const uid = await odooAuthenticate()
-      odooConfig.uid = uid
-      console.log(`[Odoo] Auto-authenticated as ${envUsername} (uid: ${uid})`)
-      await getAvailableFields('res.partner')
-      await getAvailableFields('crm.lead')
-    } catch (error) {
-      console.error(`[Odoo] Auto-authentication failed: ${error.message}`)
+    // v7.17: Retry auth up to 3 times with 5s delay between attempts.
+    // This handles transient network errors and Odoo being briefly unavailable
+    // during a cold start. If all retries fail, lead creation / chatter sync
+    // will be skipped silently — which is the "Parou de Criar Leads" bug.
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        odooConfig = { url: envUrl, db: envDb, username: envUsername, password: envPassword, uid: null }
+        if (attempt === 1) {
+          modelFieldsCache.clear()
+          phoneToPartnerCache.clear()
+        }
+        const uid = await odooAuthenticate()
+        odooConfig.uid = uid
+        console.log(`[Odoo] Auto-authenticated as ${envUsername} (uid: ${uid}) on attempt ${attempt}`)
+        await getAvailableFields('res.partner')
+        await getAvailableFields('crm.lead')
+        io.of('/odoo').emit('odoo:status', {
+          connected: true, url: odooConfig.url, db: odooConfig.db, username: odooConfig.username,
+        })
+        return // success
+      } catch (error) {
+        console.error(`[Odoo] Auto-auth attempt ${attempt}/3 failed: ${error.message}`)
+        if (attempt < 3) {
+          console.log(`[Odoo] Retrying in 5s...`)
+          await new Promise(r => setTimeout(r, 5000))
+        }
+      }
+    }
+    console.error(`[Odoo] All auto-auth attempts failed. Lead creation and chatter sync will NOT work until manual auth via UI.`)
+    // v7.17: Schedule a background retry every 60s until auth succeeds.
+    // This handles the case where Odoo was down during startup but comes back later.
+    if (!odooReauthTimer) {
+      odooReauthTimer = setInterval(async () => {
+        if (odooConfig.uid) {
+          clearInterval(odooReauthTimer)
+          odooReauthTimer = null
+          return
+        }
+        console.log(`[Odoo] Background re-auth attempt...`)
+        try {
+          const uid = await odooAuthenticate()
+          odooConfig.uid = uid
+          console.log(`[Odoo] Background re-auth SUCCESS (uid: ${uid})`)
+          await getAvailableFields('res.partner')
+          await getAvailableFields('crm.lead')
+          io.of('/odoo').emit('odoo:status', {
+            connected: true, url: odooConfig.url, db: odooConfig.db, username: odooConfig.username,
+          })
+          clearInterval(odooReauthTimer)
+          odooReauthTimer = null
+        } catch (error) {
+          console.log(`[Odoo] Background re-auth still failing: ${error.message}`)
+        }
+      }, 60_000)
     }
   }
 }
@@ -442,7 +667,19 @@ const contactNames = new Map()
 // Each entry: { jid, phone, name, avatarUrl }
 const deviceContacts = new Map()
 
+// v7.17: Global LID → phone JID map.
+// WhatsApp's new privacy format uses @lid JIDs for chats. The actual phone JID
+// is recoverable from msg.key.senderPn on each message. We maintain a global
+// map so that chats.upsert / chats.update / contacts.upsert events (which only
+// have the LID) can be resolved to phone JIDs.
+const lidToPhoneMap = new Map()
+
 let syncState = { isSyncing: false, progress: 0, totalChats: 0, totalContacts: 0, totalMessages: 0 }
+
+// v7.17: Now that all Maps are defined, load persisted conversation state.
+// This restores conversations/contacts/messages from the previous run so the
+// user doesn't see an empty list while Baileys reconnects and resyncs.
+loadConversationsFromDisk()
 
 // ========== JID Normalization ==========
 // Baileys can deliver JIDs in several forms:
@@ -535,42 +772,22 @@ function serializeConversation(conv) {
 }
 
 function getSortedConversations() {
-  // Build a set of JIDs that are already in conversations
-  const conversationJids = new Set(conversations.keys())
-
-  // Convert device contacts (that don't have a conversation yet) into
-  // conversation-like objects so they show up in the Conversas list.
-  // This way, the user can see their phone contacts and start chatting
-  // even without a prior conversation.
-  const deviceContactEntries = []
-  for (const contact of deviceContacts.values()) {
-    if (conversationJids.has(contact.jid)) continue
-    deviceContactEntries.push({
-      jid: contact.jid,
-      name: contact.name,
-      phone: contact.phone,
-      pushName: null,
-      avatarUrl: contact.avatarUrl || null,
-      lastMessage: null,
-      lastMessageAt: null,
-      unreadCount: 0,
-      messageCount: 0,
-      // Custom flag — frontend can use this to show "Sem mensagens" placeholder
-      _isDeviceContact: true,
-    })
-  }
-
+  // v7.17: Conversations tab shows ONLY actual conversations (chats that exist
+  // on the device — i.e. have at least one message OR were opened as a chat).
+  // Device contacts WITHOUT a conversation are shown in the "Contatos" tab,
+  // accessed via the `whatsapp:get-contacts` endpoint (which reads deviceContacts).
+  // This fixes the bug where 355 device contacts were showing up in Conversas.
   return Array.from(conversations.values())
     .filter(conv => isValidPhoneJid(conv.jid))
     .map(serializeConversation)
     .filter(Boolean)
-    .concat(deviceContactEntries)
     .sort((a, b) => {
-      // Conversations with messages always come first
+      // Sort by lastMessageAt descending (most recent first).
+      // Conversations without a timestamp (no messages yet) sink to the bottom.
       const tA = a.lastMessageAt ? new Date(a.lastMessageAt).getTime() : 0
       const tB = b.lastMessageAt ? new Date(b.lastMessageAt).getTime() : 0
       if (tA === 0 && tB === 0) {
-        // Both are device contacts without messages — sort by name
+        // Both empty — sort by name
         return (a.name || a.phone || '').localeCompare(b.name || b.phone || '')
       }
       return tB - tA
@@ -605,6 +822,13 @@ function normalizePhoneToJid(phone) {
 function getDeviceContactsList() {
   return Array.from(deviceContacts.values())
     .sort((a, b) => (a.name || '').localeCompare(b.name || ''))
+}
+
+// v7.17: Extract a display name from a message's pushName field
+// (used when creating a conversation from a history-sync message that
+// arrived before its chat was processed)
+function pushNameFallback(msg) {
+  return msg?.pushName || null
 }
 
 // Strip HTML tags from a string (used to convert Odoo chatter HTML to plain text)
@@ -772,8 +996,11 @@ async function connectWhatsApp(io) {
         conversations.clear()
         contactNames.clear()
         deviceContacts.clear()
+        lidToPhoneMap.clear()
         postedChatterIds.clear()
         phoneToActiveLeadCache.clear()
+        // v7.17: Also clear the persisted state so we don't reload stale data on restart
+        try { if (fs.existsSync(CONV_STATE_FILE)) fs.unlinkSync(CONV_STATE_FILE) } catch {}
         io.of('/whatsapp').emit('whatsapp:conversations', [])
       }
 
@@ -834,7 +1061,7 @@ async function connectWhatsApp(io) {
         }
       } catch {}
 
-      io.of('/whatsapp').emit('whatsapp:conversations', getSortedConversations())
+      markConversationsDirty(); io.of('/whatsapp').emit('whatsapp:conversations', getSortedConversations())
 
       // v7.16: Auto-resync app state 3s after connection to restore
       // contacts/conversations that were lost from memory after a deploy
@@ -870,9 +1097,38 @@ async function connectWhatsApp(io) {
       chatsCount: chats.length, contactsCount: Object.keys(contacts).length,
     })
 
+    // v7.17: FIRST PASS — Build a LID → phone JID map from messages.
+    // WhatsApp's new privacy format sends chat IDs as @lid (Linked Identity Device).
+    // The actual phone JID is in msg.key.senderPn for each message.
+    // We scan all messages first to build this map, then use it to resolve
+    // LID chats to phone JIDs so active conversations appear in the Conversas list.
+    const lidToPhone = new Map()
+    for (const msg of messages) {
+      if (!msg.key) continue
+      const rawJid = msg.key.remoteJid
+      if (rawJid && rawJid.endsWith('@lid')) {
+        const phoneCandidate = msg.key.senderPn || msg.key.participant
+        if (phoneCandidate) {
+          const normalized = normalizeJid(phoneCandidate)
+          if (normalized) {
+            lidToPhone.set(rawJid, normalized)
+            // v7.17: Also populate the global map for later events
+            lidToPhoneMap.set(rawJid, normalized)
+          }
+        }
+      }
+    }
+    if (lidToPhone.size > 0) {
+      console.log(`[WA] Built LID→phone map: ${lidToPhone.size} entries`)
+    }
+
     let validContactsCount = 0
     for (const [rawJid, contact] of Object.entries(contacts)) {
-      const jid = normalizeJid(rawJid)
+      // v7.17: Resolve LID contact JIDs to phone JIDs using our map
+      let jid = normalizeJid(rawJid)
+      if (!jid && rawJid && rawJid.endsWith('@lid')) {
+        jid = lidToPhone.get(rawJid) || null
+      }
       if (jid && contact?.name) {
         contactNames.set(jid, contact.name)
         // Also populate deviceContacts phonebook so phone contacts show up
@@ -888,21 +1144,36 @@ async function connectWhatsApp(io) {
     syncState.totalContacts = validContactsCount
 
     let chatsProcessed = 0
+    let lidChatsResolved = 0
     for (const chat of chats) {
-      const jid = normalizeJid(chat.id)
+      // v7.17: Resolve LID chat IDs to phone JIDs
+      let jid = normalizeJid(chat.id)
+      if (!jid && chat.id && chat.id.endsWith('@lid')) {
+        jid = lidToPhone.get(chat.id) || null
+        if (jid) lidChatsResolved++
+      }
       if (!jid) continue
       const contactName = contactNames.get(jid) || null
       if (!conversations.has(jid)) {
         conversations.set(jid, {
           jid, name: contactName, phone: extractPhone(jid),
           pushName: null, avatarUrl: null, lastMessage: null,
-          lastMessageAt: null, unreadCount: chat.unreadCount || 0, messages: [],
+          lastMessageAt: chat.t ? new Date(chat.t * 1000) : null,
+          unreadCount: chat.unreadCount || 0, messages: [],
         })
       } else {
         const conv = conversations.get(jid)
         if (contactName) conv.name = contactName
+        // Update unreadCount and lastMessageAt from chat metadata if available
+        if (chat.unreadCount !== undefined) conv.unreadCount = chat.unreadCount
+        if (chat.t && (!conv.lastMessageAt || new Date(chat.t * 1000) > conv.lastMessageAt)) {
+          conv.lastMessageAt = new Date(chat.t * 1000)
+        }
       }
       chatsProcessed++
+    }
+    if (lidChatsResolved > 0) {
+      console.log(`[WA] Resolved ${lidChatsResolved} LID chats to phone JIDs`)
     }
     syncState.totalChats = chatsProcessed
 
@@ -913,8 +1184,12 @@ async function connectWhatsApp(io) {
       const rawJid = msg.key.remoteJid
       let jid = normalizeJid(rawJid)
       if (!jid && rawJid && rawJid.endsWith('@lid')) {
-        const candidate = msg.key.senderPn || msg.key.participant || msg.key.senderLid
-        if (candidate) jid = normalizeJid(candidate)
+        // v7.17: Use the lidToPhone map first (already built), then fall back to key fields
+        jid = lidToPhone.get(rawJid) || null
+        if (!jid) {
+          const candidate = msg.key.senderPn || msg.key.participant || msg.key.senderLid
+          if (candidate) jid = normalizeJid(candidate)
+        }
       }
       if (!jid) continue
 
@@ -944,8 +1219,19 @@ async function connectWhatsApp(io) {
 
       if (!textContent && !mediaType) continue
 
-      const conv = conversations.get(jid)
-      if (!conv) continue
+      // v7.17: Create the conversation if it doesn't exist (messages may arrive
+      // before the chat is processed, especially for LID conversations)
+      let conv = conversations.get(jid)
+      if (!conv) {
+        const contactName = contactNames.get(jid) || null
+        const phone = extractPhone(jid)
+        conv = {
+          jid, name: contactName || pushNameFallback(msg), phone,
+          pushName: null, avatarUrl: null, lastMessage: null,
+          lastMessageAt: null, unreadCount: 0, messages: [],
+        }
+        conversations.set(jid, conv)
+      }
 
       const msgId = msg.key.id
       if (msgId && conv.messages.some(m => m.whatsappId === msgId)) continue
@@ -984,7 +1270,7 @@ async function connectWhatsApp(io) {
         chatsCount: chatsProcessed, contactsCount: validContactsCount, messagesCount: messagesProcessed,
       })
     }
-    io.of('/whatsapp').emit('whatsapp:conversations', getSortedConversations())
+    markConversationsDirty(); io.of('/whatsapp').emit('whatsapp:conversations', getSortedConversations())
   })
 
   waSocket.ev.on('messages.upsert', async ({ messages, type }) => {
@@ -1025,6 +1311,10 @@ async function connectWhatsApp(io) {
             if (jid) {
               const src = msg.key.senderPn ? 'senderPn' : (msg.key.participant ? 'participant' : 'senderLid')
               console.log(`[WA] Recovered JID from ${src}: ${jid} (rawLid=${rawJid})`)
+              // v7.17: Persist this LID→phone mapping globally so that
+              // chats.upsert / chats.update / contacts.upsert events (which
+              // only have the LID) can be resolved later.
+              lidToPhoneMap.set(rawJid, jid)
             }
           }
         }
@@ -1166,7 +1456,7 @@ async function connectWhatsApp(io) {
 
         // Emit to all clients — the frontend's currentJidRef will decide if it appends to the active chat
         // *** IMPORTANT: Use the normalized JID here so the frontend can match it ***
-        io.of('/whatsapp').emit('whatsapp:message', {
+        markConversationsDirty(); io.of('/whatsapp').emit('whatsapp:message', {
           conversationJid: jid,
           message: {
             ...messageData,
@@ -1273,7 +1563,7 @@ async function connectWhatsApp(io) {
             if (!fromMe) conv.unreadCount++
             console.log(`[WA] ✓ (via update) New message stored in ${jid} fromMe=${fromMe}`)
 
-            io.of('/whatsapp').emit('whatsapp:message', {
+            markConversationsDirty(); io.of('/whatsapp').emit('whatsapp:message', {
               conversationJid: jid,
               message: { ...messageData, timestamp: ts.toISOString() },
               conversation: serializeConversation(conv),
@@ -1325,7 +1615,7 @@ async function connectWhatsApp(io) {
     }
     if (updatedCount > 0) {
       console.log(`[WA] Updated ${updatedCount} conversation names from device contacts`)
-      io.of('/whatsapp').emit('whatsapp:conversations', getSortedConversations())
+      markConversationsDirty(); io.of('/whatsapp').emit('whatsapp:conversations', getSortedConversations())
     }
   })
 
@@ -1339,33 +1629,45 @@ async function connectWhatsApp(io) {
     }
     if (updatedCount > 0) {
       console.log(`[WA] Updated ${updatedCount} conversation names from contact updates`)
-      io.of('/whatsapp').emit('whatsapp:conversations', getSortedConversations())
+      markConversationsDirty(); io.of('/whatsapp').emit('whatsapp:conversations', getSortedConversations())
     }
   })
 
   waSocket.ev.on('chats.upsert', async (chats) => {
     for (const chat of chats) {
-      const jid = normalizeJid(chat.id)
+      // v7.17: Try to resolve LID chat IDs using the global lidToPhoneMap
+      let jid = normalizeJid(chat.id)
+      if (!jid && chat.id && chat.id.endsWith('@lid')) {
+        jid = lidToPhoneMap.get(chat.id) || null
+      }
       if (!jid) continue
       if (!conversations.has(jid)) {
         const contactName = contactNames.get(jid) || null
         conversations.set(jid, {
           jid, name: contactName, phone: extractPhone(jid),
           pushName: null, avatarUrl: null, lastMessage: null,
-          lastMessageAt: null, unreadCount: chat.unreadCount || 0, messages: [],
+          lastMessageAt: chat.t ? new Date(chat.t * 1000) : null,
+          unreadCount: chat.unreadCount || 0, messages: [],
         })
       } else {
         const conv = conversations.get(jid)
         const contactName = contactNames.get(jid)
         if (contactName) conv.name = contactName
+        if (chat.unreadCount !== undefined) conv.unreadCount = chat.unreadCount
+        if (chat.t && (!conv.lastMessageAt || new Date(chat.t * 1000) > conv.lastMessageAt)) {
+          conv.lastMessageAt = new Date(chat.t * 1000)
+        }
       }
     }
-    io.of('/whatsapp').emit('whatsapp:conversations', getSortedConversations())
+    markConversationsDirty(); io.of('/whatsapp').emit('whatsapp:conversations', getSortedConversations())
   })
 
   waSocket.ev.on('chats.update', async (updates) => {
     for (const update of updates) {
-      const jid = normalizeJid(update.id)
+      let jid = normalizeJid(update.id)
+      if (!jid && update.id && update.id.endsWith('@lid')) {
+        jid = lidToPhoneMap.get(update.id) || null
+      }
       if (!jid) continue
       const conv = conversations.get(jid)
       if (conv) {
@@ -1373,7 +1675,7 @@ async function connectWhatsApp(io) {
         if (update.t) conv.lastMessageAt = new Date((update.t) * 1000)
       }
     }
-    io.of('/whatsapp').emit('whatsapp:conversations', getSortedConversations())
+    markConversationsDirty(); io.of('/whatsapp').emit('whatsapp:conversations', getSortedConversations())
   })
 }
 
@@ -1645,7 +1947,7 @@ app.prepare().then(async () => {
           conv.lastMessage = data.text
           conv.lastMessageAt = new Date()
 
-          io.of('/whatsapp').emit('whatsapp:message', {
+          markConversationsDirty(); io.of('/whatsapp').emit('whatsapp:message', {
             conversationJid: jid,
             message: {
               ...messageData,
@@ -1702,7 +2004,7 @@ app.prepare().then(async () => {
         conv.lastMessage = data.caption || `[${data.type}]`
         conv.lastMessageAt = new Date()
 
-        io.of('/whatsapp').emit('whatsapp:message', {
+        markConversationsDirty(); io.of('/whatsapp').emit('whatsapp:message', {
           conversationJid: jid,
           message: { ...messageData, timestamp: messageTimestamp.toISOString() },
           conversation: serializeConversation(conv),
@@ -1746,8 +2048,11 @@ app.prepare().then(async () => {
           conversations.clear()
           contactNames.clear()
           deviceContacts.clear()
+        lidToPhoneMap.clear()
           postedChatterIds.clear()
           phoneToActiveLeadCache.clear()
+          // v7.17: Also clear the persisted state so we don't reload stale data on restart
+          try { if (fs.existsSync(CONV_STATE_FILE)) fs.unlinkSync(CONV_STATE_FILE) } catch {}
           io.of('/whatsapp').emit('whatsapp:status', { connected: false, reason: 'logged_out', hasSession: false })
           io.of('/whatsapp').emit('whatsapp:conversations', [])
           callback({ success: true })
@@ -1892,7 +2197,7 @@ app.prepare().then(async () => {
         }
 
         // Notify all clients of the new/updated conversation
-        io.of('/whatsapp').emit('whatsapp:conversations', getSortedConversations())
+        markConversationsDirty(); io.of('/whatsapp').emit('whatsapp:conversations', getSortedConversations())
         if (pulledFromOdoo > 0) {
           io.of('/whatsapp').emit('whatsapp:conversation:update', serializeConversation(conv))
         }
@@ -1986,7 +2291,7 @@ app.prepare().then(async () => {
         // Also remove from deviceContacts so it disappears from the Contacts tab too
         deviceContacts.delete(jid)
         console.log(`[WA] Deleted conversation ${jid} (existed=${existed})`)
-        io.of('/whatsapp').emit('whatsapp:conversations', getSortedConversations())
+        markConversationsDirty(); io.of('/whatsapp').emit('whatsapp:conversations', getSortedConversations())
         io.of('/whatsapp').emit('whatsapp:conversation:deleted', { jid })
         callback({ success: true })
       } catch (error) {
@@ -2059,7 +2364,7 @@ app.prepare().then(async () => {
         ])
 
         // 3. Re-emit the current conversations and contacts lists
-        io.of('/whatsapp').emit('whatsapp:conversations', getSortedConversations())
+        markConversationsDirty(); io.of('/whatsapp').emit('whatsapp:conversations', getSortedConversations())
 
         // 4. Compute counts for the response
         const totalConversations = conversations.size

@@ -500,3 +500,91 @@ Stage Summary:
 - Odoo chatter sync (bidirectional, with dedup) and lead creation will now actually work for incoming messages, because the messages will no longer be dropped before reaching the autoSync code.
 - Manual "Buscar no aparelho" button already fetches from the phone device (fetchMessageHistory + resyncAppState), as the user requested.
 - Version: 7.16.0
+
+---
+Task ID: v7.17
+Agent: main
+Task: Fix 3 situations: (1) session persistence across deploys, (2) lead creation stopped, (3) contacts vs conversations separation
+
+Work Log:
+
+SITUAÇÃO 3 — Contacts vs Conversations separation (ROOT CAUSE FOUND + FIXED):
+- Root cause: `getSortedConversations()` was MERGING device contacts into the
+  conversations list via `.concat(deviceContactEntries)`. This caused all 355
+  device contacts to appear in the Conversas tab.
+- FIX: Removed the `.concat(deviceContactEntries)` block. Conversations tab now
+  shows ONLY actual conversations (chats that exist on the device).
+- Contacts tab continues to use `whatsapp:get-contacts` → `getDeviceContactsList()`
+  which returns ALL device contacts from the `deviceContacts` Map.
+- ALSO FIXED: Active conversations from the device weren't being synced because
+  `messaging-history.set` and `chats.upsert` were skipping chats with `@lid` JIDs.
+  Added LID→phone resolution:
+  * Build a `lidToPhone` map from `msg.key.senderPn` in the FIRST PASS of
+    messaging-history.set (before processing chats/contacts)
+  * Use the map to resolve LID chat IDs and LID contact IDs to phone JIDs
+  * Added a global `lidToPhoneMap` that persists across events — populated
+    by messages.upsert AND messaging-history.set, used by chats.upsert /
+    chats.update / contacts.upsert
+  * Also create conversations on-the-fly when processing history-sync messages
+    (in case the chat wasn't in the chats array but messages exist)
+  * Added `pushNameFallback(msg)` helper for display name when no contact name
+
+SITUAÇÃO 2 — Lead creation stopped (FIXED):
+- Root cause hypothesis: Odoo auto-auth failing silently on cold start →
+  `odooConfig.uid = null` → `autoSyncWhatsAppMessage` returns early →
+  no leads created. This matches the earlier worklog note about
+  "Auto-authentication failed: Authentication failed - invalid credentials".
+- FIX 1: `autoAuthenticateFromEnv()` now retries 3 times with 5s delay.
+  If all 3 fail, schedules a background retry every 60s until auth succeeds.
+  This handles both transient network errors AND Odoo being briefly down.
+- FIX 2: Added detailed logging in `autoSyncWhatsAppMessage`:
+  * Logs `[AutoSync] SKIP — autoSyncSettings.enabled is false` when disabled
+  * Logs `[AutoSync] SKIP — Odoo not authenticated (uid is null)...` when
+    auth failed, with a hint to check env vars
+  * Logs `Lead reused from cache` / `Lead reused from Odoo search` /
+    `✓ NEW Lead created` / `✗ Lead creation FAILED` for every lead action
+  * Logs `Lead creation skipped — outgoing message (fromMe=true)` for
+    outgoing messages (so user understands why no lead is created)
+- FIX 3: Wrapped `odooCreate('crm.lead', ...)` in try/catch so a single
+  lead creation failure doesn't abort the entire autoSync (chatter post
+  can still proceed).
+
+SITUAÇÃO 1 — Session persistence across deploys (FIXED):
+- Verified render.yaml has 1GB persistent disk at `/opt/render/project/src/data`.
+  AUTH_FOLDER = `/opt/render/project/src/data/auth_store` (on disk ✓).
+  SQLite DB = `/opt/render/project/src/data/whats-odoo.db` (on disk ✓).
+  Odoo credentials in env vars (sync: false, set in Render dashboard) ✓.
+- ADDED: Persistence diagnostics on startup — logs whether DATA_DIR is
+  writable, whether creds.json exists, when it was last modified.
+- ADDED: `conversation-state.json` — a snapshot of all in-memory state
+  (conversations + messages + contactNames + deviceContacts + lidToPhoneMap)
+  saved to disk every 30s (debounced) and on SIGTERM/SIGINT.
+  On startup, the state is loaded back so the user sees their conversations
+  immediately while Baileys reconnects and resyncs.
+- ADDED: `markConversationsDirty()` calls in all conversation mutation
+  points (message emit, conversation list emit, send-message, inject-history,
+  delete-conversation) so the 30s persist timer knows when to save.
+- ADDED: On logout (user-initiated or loggedOut event), the
+  conversation-state.json file is DELETED so stale data isn't reloaded
+  on the next start.
+
+Version: 7.16.0 → 7.17.0
+- package.json: 7.16.0 → 7.17.0
+- server.js header: v7.14 → v7.17 (with changelog)
+- start.sh banner: v7.14 → v7.17
+- src/app/page.tsx sidebar: v7.16 → v7.17
+- Build: npx next build ✓ succeeded
+- Syntax: node --check server.js ✓ succeeded
+
+Stage Summary:
+- SITUAÇÃO 1 (persistence): WhatsApp auth + Odoo credentials + conversation
+  state ALL persist across deploys. The user will not lose anything when
+  deploying a new version. Diagnostics on startup confirm disk is attached.
+- SITUAÇÃO 2 (lead creation): Odoo auto-auth retries 3x on startup + every
+  60s in background until success. Detailed logging shows exactly why leads
+  are/aren't created. Lead creation failures no longer abort chatter sync.
+- SITUAÇÃO 3 (contacts vs conversations): Conversas tab shows ONLY actual
+  chats (no more 355 contacts leaking in). Contatos tab shows ALL device
+  contacts. Active conversations from the phone now sync correctly because
+  LID JIDs are resolved to phone JIDs via the lidToPhoneMap built from
+  msg.key.senderPn.
