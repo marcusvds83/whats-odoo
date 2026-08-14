@@ -588,3 +588,30 @@ Stage Summary:
   contacts. Active conversations from the phone now sync correctly because
   LID JIDs are resolved to phone JIDs via the lidToPhoneMap built from
   msg.key.senderPn.
+
+---
+Task ID: 7.18
+Agent: Main Agent
+Task: Fix "clicking a synced contact doesn't start a conversation" — user couldn't open new chats from the Contacts tab, blocking lead creation testing.
+
+Work Log:
+- Diagnosed root cause: after v7.17 separated conversations from contacts, clicking a contact in the Contacts tab called `onSelect(contact.jid)` → `handleSelectConversation(jid)` → `wa.loadMessages(jid)`. But since the contact is NOT in `wa.conversations` (they're now separate lists), `selectedConversation = wa.conversations.find(c => c.jid === selectedJid)` returned `null`, and ChatView showed "Nenhuma conversa selecionada" — making it impossible to send messages or test lead creation.
+- Fix in `src/components/whatsapp/ConversationList.tsx`:
+  - `ContactsTabContent` now accepts `onStartConversation` and `conversations` props
+  - When a contact is clicked:
+    1. If the contact's phone matches an existing conversation → select it directly (instant, no network call)
+    2. Otherwise → call `onStartConversation(phone, name)` which verifies the number on WhatsApp via `onWhatsApp()`, creates the conversation in memory via `getOrCreateConversation()`, pulls Odoo chatter history if linked, and returns the JID
+  - On success → `onConversationStarted(jid)` switches to Conversas tab and selects the new chat
+  - On failure → shows inline error message (e.g. "Phone number is not on WhatsApp") for 4 seconds
+  - Added loading spinner per-contact ("Iniciando conversa...") while the `onWhatsApp` check runs
+  - Added "chat" badge on contacts that already have an active conversation
+- Verified server-side `whatsapp:start-conversation` handler is robust: normalizes phone → JID, checks `onWhatsApp`, `getOrCreateConversation`, fetches profile pic, pulls Odoo history, emits `whatsapp:conversations` to all clients
+- Verified auto-sync lead creation flow: incoming message → `messages.upsert` → `autoSyncWhatsAppMessage` with `fromMe=false` → creates `res.partner` → creates `crm.lead` → posts to chatter → creates activity. User can now test by: clicking a contact → sending a message → having the contact reply → lead appears in Odoo CRM.
+- Confirmed Next.js build passes cleanly
+
+Stage Summary:
+- Conversas vs Contatos separation now fully functional: clicking any contact starts a real conversation
+- Lead creation is testable (was blocked by the conversation-start bug, not by the lead logic itself)
+- Session persistence (v7.17) will be tested by user on next deploy
+- Files changed: `src/components/whatsapp/ConversationList.tsx`, `package.json`, `src/app/page.tsx`, `start.sh`
+- Version bumped to 7.18.0
