@@ -73,11 +73,11 @@ interface LinkedRecord {
 
 // ---------- Tab config ----------
 
-const TAB_CONFIG: Record<ModelKey, { model: string; label: string; icon: React.ElementType; placeholder: string }> = {
-  contacts: { model: 'res.partner', label: 'Contatos', icon: User, placeholder: 'Buscar contato por nome, telefone...' },
-  leads: { model: 'crm.lead', label: 'Leads', icon: TrendingUp, placeholder: 'Buscar lead por nome, empresa...' },
-  sales: { model: 'sale.order', label: 'Vendas', icon: ShoppingCart, placeholder: 'Buscar venda por nome, cliente...' },
-  tasks: { model: 'project.task', label: 'Projetos', icon: ClipboardList, placeholder: 'Buscar tarefa por nome, projeto...' },
+const TAB_CONFIG: Record<ModelKey, { model: string; label: string; singular: string; icon: React.ElementType; placeholder: string }> = {
+  contacts: { model: 'res.partner', label: 'Contatos', singular: 'Contato', icon: User, placeholder: 'Buscar contato por nome, telefone...' },
+  leads: { model: 'crm.lead', label: 'Oportunidades', singular: 'Oportunidade', icon: TrendingUp, placeholder: 'Buscar oportunidade por nome, empresa...' },
+  sales: { model: 'sale.order', label: 'Vendas', icon: ShoppingCart, singular: 'Venda', placeholder: 'Buscar venda por nome, cliente...' },
+  tasks: { model: 'project.task', label: 'Projetos', singular: 'Tarefa', icon: ClipboardList, placeholder: 'Buscar tarefa por nome, projeto...' },
 }
 
 // ---------- Debounce helper ----------
@@ -259,11 +259,15 @@ export function OdooLinkPanel({
 
   // ---------- Create logic ----------
 
+  // v7.19: Error state surfaced to the user when create fails
+  const [createError, setCreateError] = useState<string | null>(null)
+
   const handleCreate = useCallback(
     async (data: Record<string, string>) => {
       setCreating(true)
+      setCreateError(null)
       try {
-        let result: { success: boolean; id?: number }
+        let result: { success: boolean; id?: number; error?: string; postedMessages?: number }
         switch (activeTab) {
           case 'contacts':
             result = await onCreateContact({
@@ -274,14 +278,16 @@ export function OdooLinkPanel({
             })
             break
           case 'leads':
+            // v7.19: Create as opportunity, carry conversation history to chatter + description (notes)
             result = await onCreateLead({
               name: data.name,
               phone: data.phone || conversationPhone || undefined,
               partner_name: data.partner_name || undefined,
               description: data.description || undefined,
-              type: 'lead',
+              type: 'opportunity',
               whatsapp_number: conversationPhone || undefined,
               // Pass conversation history so all messages are posted to the Odoo chatter
+              // AND written to the description field (Notes) of the opportunity
               messages: conversationHistory || [],
             })
             break
@@ -289,11 +295,12 @@ export function OdooLinkPanel({
             result = await onCreateTask({
               name: data.name,
               description: data.description || undefined,
+              project_id: data.project_id ? Number(data.project_id) : undefined,
               whatsapp_number: conversationPhone || undefined,
             })
             break
           default:
-            result = { success: false }
+            result = { success: false, error: 'Operação não suportada' }
         }
 
         if (result.success && result.id) {
@@ -307,7 +314,16 @@ export function OdooLinkPanel({
           // Refresh search
           performSearch(activeTab, searchQueries[activeTab])
           setCreateDialogOpen(false)
+        } else {
+          // v7.19: Surface the error to the dialog so the user sees what happened
+          const errorMsg = result.error || 'Falha ao criar registro no Odoo'
+          console.error('[OdooLinkPanel] Create failed:', errorMsg)
+          setCreateError(errorMsg)
         }
+      } catch (err: any) {
+        const errorMsg = err?.message || 'Erro inesperado ao criar registro'
+        console.error('[OdooLinkPanel] Create error:', err)
+        setCreateError(errorMsg)
       } finally {
         setCreating(false)
       }
@@ -445,10 +461,14 @@ export function OdooLinkPanel({
               <CreateRecordDialog
                 tab={activeTab}
                 open={createDialogOpen}
-                onOpenChange={setCreateDialogOpen}
+                onOpenChange={(open) => {
+                  if (!open) setCreateError(null)
+                  setCreateDialogOpen(open)
+                }}
                 onSubmit={handleCreate}
                 creating={creating}
                 conversationPhone={conversationPhone}
+                createError={createError}
               />
             )}
           </div>

@@ -204,12 +204,15 @@ let odooConfig = {
   uid: null,
 }
 
+// v7.19: autoCreateLead default is FALSE per user request — leads/opportunities
+// must only be created EXPLICITLY via the side menu "Criar Oportunidade" button,
+// which carries the conversation history to chatter AND the description/notes field.
 let autoSyncSettings = {
   enabled: true,
   autoCreateContact: true,
-  autoCreateLead: true,
+  autoCreateLead: false,
   autoPostMessages: true,
-  autoCreateActivity: true,
+  autoCreateActivity: false,
   leadPrefix: '[WhatsApp] ',
   leadTeamId: null,
   leadUserId: null,
@@ -385,11 +388,35 @@ async function odooCreateActivity(model, recordId, summary, note) {
 }
 
 function escapeHtml(text) {
-  return String(text)
+  return String(text || '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/\n/g, '<br/>')
+}
+
+// v7.19: Build a plain-text transcript of the WhatsApp conversation that will
+// be written to the `description` field (Notes) of the CRM lead/opportunity.
+// Format is human-readable, chronological, with direction + date + text per line.
+// Returns an empty string if there are no messages.
+function buildConversationTranscript(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return ''
+
+  const sorted = [...messages].sort(
+    (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+  )
+
+  const lines = sorted.map((m) => {
+    const direction = m.fromMe ? 'Eu' : 'Contato'
+    const dateLabel = new Date(m.timestamp).toLocaleString('pt-BR')
+    const mediaLabel = m.mediaType ? ` [${m.mediaType}]` : ''
+    const text = m.textContent && m.textContent.trim()
+      ? m.textContent
+      : '[Mídia]'
+    return `[${dateLabel}] ${direction}${mediaLabel}: ${text}`
+  })
+
+  return `Conversa WhatsApp:\n${lines.join('\n')}`
 }
 
 async function autoSyncWhatsAppMessage(data) {
@@ -2476,18 +2503,71 @@ app.prepare().then(async () => {
       } catch (error) { callback({ success: false, error: error.message }) }
     })
 
+    // ===== Create Lead / Opportunity in Odoo CRM =====
+    // v7.19: Defaults to type='opportunity' (user wants "Criar Oportunidade").
+    // The conversation history is sent to BOTH:
+    //   1. The chatter (mail.message — appears in the message thread)
+    //   2. The description field (this is the "Notes" field on the CRM lead/opportunity form)
+    // This satisfies the requirement: "criar a oportunidade levando as mensagens
+    // da conversa para o chatter e para o campo notes do CRM odoo".
     socket.on('odoo:leads:create', async (data, callback) => {
       try {
-        const values = { name: data.name, type: data.type || 'lead' }
+        console.log(`[Odoo] Creating ${data.type || 'opportunity'}: "${data.name}"`)
+        // v7.19: Default to 'opportunity' (was 'lead')
+        const leadType = data.type || 'opportunity'
+        const values = { name: data.name, type: leadType }
         if (data.phone) values.phone = data.phone
         if (data.partner_id) values.partner_id = data.partner_id
         if (data.partner_name) values.partner_name = data.partner_name
-        if (data.description) values.description = data.description
         if (data.whatsapp_number) values.whatsapp_number = data.whatsapp_number
+
+        // v7.19: Build a plain-text transcript of the conversation and use it as
+        // the `description` field on the CRM record. In Odoo, `crm.lead.description`
+        // IS the "Internal Notes" / "Notes" field shown on the lead/opportunity form.
+        // If the user provided an explicit description, prepend it; the transcript
+        // is always appended so the conversation context is preserved.
+        const transcript = buildConversationTranscript(data.messages || [])
+        if (transcript) {
+          values.description = data.description
+            ? `${data.description}\n\n${transcript}`
+            : transcript
+        } else if (data.description) {
+          values.description = data.description
+        }
+
         const id = await odooCreate('crm.lead', values)
-        callback({ success: true, id })
+        console.log(`[Odoo] ✓ Created crm.lead#${id} (type=${leadType})`)
+
+        // Post each message to the chatter (so it appears in the message thread too)
+        let postedMessages = 0
+        if (data.messages && data.messages.length > 0) {
+          console.log(`[Odoo] Posting ${data.messages.length} messages to chatter of crm.lead#${id}`)
+          const sorted = [...data.messages].sort(
+            (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+          )
+          for (const m of sorted) {
+            try {
+              const direction = m.fromMe ? 'Enviada' : 'Recebida'
+              const dateLabel = new Date(m.timestamp).toLocaleString('pt-BR')
+              const mediaLabel = m.mediaType ? ` [${m.mediaType}]` : ''
+              const body = m.textContent
+                ? `<p><strong>📱 WhatsApp ${direction}</strong> <em>(${dateLabel})</em>${mediaLabel}</p><p>${escapeHtml(m.textContent)}</p>`
+                : `<p><strong>📱 WhatsApp ${direction}</strong> <em>(${dateLabel})</em>${mediaLabel} [Mídia]</p>`
+              await odooPostMessage('crm.lead', id, body)
+              postedMessages++
+            } catch (err) {
+              console.error(`[Odoo] Failed to post message to chatter:`, err.message)
+            }
+          }
+          console.log(`[Odoo] Posted ${postedMessages}/${data.messages.length} messages to crm.lead#${id} chatter`)
+        }
+
+        callback({ success: true, id, postedMessages })
         io.of('/odoo').emit('odoo:record:created', { model: 'crm.lead', id, values })
-      } catch (error) { callback({ success: false, error: error.message }) }
+      } catch (error) {
+        console.error(`[Odoo] Lead/Opportunity creation FAILED:`, error.message)
+        callback({ success: false, error: error.message })
+      }
     })
 
     socket.on('odoo:sales:search', async (data, callback) => {
@@ -2518,17 +2598,47 @@ app.prepare().then(async () => {
       } catch (error) { callback({ success: false, error: error.message }) }
     })
 
+    // ===== Create Project Task in Odoo =====
+    // v7.19: Fixed — project.task creation was failing silently because:
+    //   (a) project_id is required by default in Odoo's project.task model
+    //   (b) Frontend wasn't passing project_id
+    //   (c) Error was swallowed without logging
+    // Now we: log the attempt, surface the full error to the frontend,
+    // and gracefully degrade if project_id is missing (some Odoo configs allow it).
     socket.on('odoo:projects:create', async (data, callback) => {
       try {
+        console.log(`[Odoo] Creating project.task: "${data.name}" (project_id=${data.project_id || 'none'})`)
         const values = { name: data.name }
         if (data.project_id) values.project_id = data.project_id
         if (data.partner_id) values.partner_id = data.partner_id
         if (data.description) values.description = data.description
         if (data.whatsapp_number) values.whatsapp_number = data.whatsapp_number
+
+        // v7.19: Smart defaults — if no project_id was provided, try to find
+        // the first available project to attach the task to. This prevents the
+        // "required field" error that was blocking task creation.
+        if (!values.project_id) {
+          try {
+            const projects = await odooSearch('project.project', [], ['id', 'name'], 1)
+            if (projects && projects.length > 0) {
+              values.project_id = projects[0].id
+              console.log(`[Odoo] Auto-selected project: ${projects[0].name} (id=${projects[0].id})`)
+            }
+          } catch (err) {
+            console.log(`[Odoo] Could not auto-select project: ${err.message}`)
+          }
+        }
+
         const id = await odooCreate('project.task', values)
+        console.log(`[Odoo] ✓ Created project.task#${id}`)
         callback({ success: true, id })
         io.of('/odoo').emit('odoo:record:created', { model: 'project.task', id, values })
-      } catch (error) { callback({ success: false, error: error.message }) }
+      } catch (error) {
+        console.error(`[Odoo] project.task creation FAILED:`, error.message)
+        // Return a helpful error message to the frontend
+        const errorMsg = error.message || 'Falha ao criar tarefa no Odoo'
+        callback({ success: false, error: errorMsg })
+      }
     })
 
     socket.on('odoo:projects:list', async (data, callback) => {

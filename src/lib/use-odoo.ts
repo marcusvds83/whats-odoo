@@ -39,12 +39,14 @@ export function useOdoo() {
   const socketRef = useRef<Socket | null>(null)
   const [status, setStatus] = useState<OdooStatus>({ connected: false })
   const [isConnected, setIsConnected] = useState(false)
+  // v7.19: Defaults match the server — autoCreateLead is FALSE by default;
+  // opportunities are only created explicitly via the side menu button.
   const [autoSyncSettings, setAutoSyncSettings] = useState<AutoSyncSettings>({
     enabled: true,
     autoCreateContact: true,
-    autoCreateLead: true,
+    autoCreateLead: false,
     autoPostMessages: true,
-    autoCreateActivity: true,
+    autoCreateActivity: false,
     leadPrefix: '[WhatsApp] ',
     leadTeamId: null,
     leadUserId: null,
