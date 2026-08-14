@@ -2,8 +2,8 @@
 set -e
 
 echo "============================================"
-echo "  Whats-Odoo v7.24 Start Script"
-echo "  (per-user sessions + media + pre-deploy backup)"
+echo "  Whats-Odoo v7.25 Start Script"
+echo "  (per-user sessions + /admin + media + pre-deploy backup)"
 echo "============================================"
 
 # [1/4] Create required directories

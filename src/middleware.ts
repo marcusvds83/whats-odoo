@@ -1,5 +1,7 @@
 // ====================================================================
-// v7.22: Next.js middleware — protects all routes except /login, /api/auth/*
+// v7.25: Next.js middleware — protects all routes except public ones.
+// v7.25: /admin is now a public admin login page (separate from /login).
+// v7.25: /api/auth/setup-admin is the emergency admin recovery endpoint.
 // Reads the whats_odoo_session cookie, verifies the JWT, and redirects
 // unauthenticated users to /login.
 // ====================================================================
@@ -11,9 +13,11 @@ import { verifySession, getSessionCookieName } from '@/lib/auth'
 // Routes that don't require authentication
 const PUBLIC_ROUTES = [
   '/login',
+  '/admin',                          // v7.25: admin login page
   '/api/auth/login',
   '/api/auth/logout',
   '/api/auth/setup',
+  '/api/auth/setup-admin',           // v7.25: emergency admin recovery
 ]
 
 function isPublicRoute(pathname: string): boolean {

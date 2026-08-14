@@ -77,12 +77,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     try {
       await fetch('/api/auth/logout', { method: 'POST' })
     } catch {}
+    // v7.25: redirect admins back to /admin, regular users to /login.
+    const wasAdmin = user?.role === 'admin'
     setUser(null)
-    // Redirect to login page
     if (typeof window !== 'undefined') {
-      window.location.href = '/login'
+      window.location.href = wasAdmin ? '/admin' : '/login'
     }
-  }, [])
+  }, [user])
 
   useEffect(() => {
     refresh()

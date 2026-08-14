@@ -165,9 +165,15 @@ function LoginForm() {
           </Button>
 
           {needsSetup === false && (
-            <p className="text-xs text-muted-foreground text-center mt-1">
-              Não tem conta? Peça ao administrador para criar uma para você.
-            </p>
+            <div className="space-y-1 text-xs text-muted-foreground text-center mt-1">
+              <p>Não tem conta? Peça ao administrador para criar uma para você.</p>
+              <p>
+                É administrador?{' '}
+                <a href="/admin" className="text-emerald-600 hover:text-emerald-700 font-medium underline">
+                  Entrar como admin
+                </a>
+              </p>
+            </div>
           )}
         </CardFooter>
       </form>
@@ -200,7 +206,7 @@ export default function LoginPage() {
         </Suspense>
 
         <p className="text-xs text-muted-foreground text-center mt-4">
-          v7.22 • Multi-usuário
+          v7.25 • Multi-usuário
         </p>
       </div>
     </div>
