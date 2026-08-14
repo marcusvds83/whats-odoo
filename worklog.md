@@ -696,3 +696,130 @@ Stage Summary:
 - Create Project Task now works — auto-selects first project if none specified, filters out non-existent fields, surfaces full error to the user via the new `createError` UI.
 - CreateRecordDialog now displays server errors in a red banner so the user knows what went wrong (was silently closing before).
 - Version: 7.20.0 — ready to push to origin/main for Render deploy.
+
+---
+Task ID: v7.21
+Agent: Main Agent
+Task: Implement "reconnect brings back conversation history from Odoo chatter" — the Odoo chatter should be the durable conversation database so that on every middleware restart / WA reconnect / Odoo auth, the local conversation state is rebuilt from Odoo.
+
+User's exact words:
+> "Está funcionando. Toda conversa iniciada cria um contato e leva no odoo a conversa e vai atualizando a conversa. Agora, reconectar na ferramenta, preciso trzer esse histórico de votla na conversa automaticamente quando eu ligar e preciso trazer sabendo o que foi falado comigo e o que eu falei..veja como está o chatter.. ele vai ser nosso banco de dados, toda conversa iniciada precisa fazer o mesmo e quando eu reconectar no middleware trazer as conversas iniciadas de volta. Não precisa trazer outros dados de lead ou projeto, senpre traer de votla as conversas a conversação. Assim nçao perderemos mais os dados iniicados pelo usuário ou mensagens que entraram e viraram contatos no Odoo."
+
+Work Log:
+
+ROOT CAUSE of "history lost on reconnect":
+- The middleware keeps conversations in-memory (Map<jid, conv>) and persists
+  them to disk via conversation-state.json every 30s + on SIGTERM. On Render,
+  this disk persistence works MOST of the time, but:
+  1. If the process is killed hard (OOM, crash), the last 30s of messages are lost.
+  2. If the disk is wiped (new deploy, mount issue), ALL conversations are lost.
+  3. If WA resyncAppState doesn't fire (Baileys bug), history is empty.
+- Meanwhile, EVERY WhatsApp message (sent and received) is already being posted
+  to the Odoo chatter via autoSyncWhatsAppMessage (Step 3, line ~617 of v7.20).
+  Each post has the format:
+    <p><strong> 📱 WhatsApp Enviada:</strong> (2026-08-14T11:15:59.071Z)</p><p>body</p>
+  So Odoo chatter is ALREADY the durable conversation database — we just
+  weren't reading from it on reconnect.
+
+CHANGES MADE:
+
+server.js:
+- Added `syncAllConversationsFromOdoo(io, opts)` (lines ~1068-1236):
+  * Searches `mail.message` for `model='res.partner'` AND `body ilike 'WhatsApp'`
+    — pulls only messages WE posted (not manual notes users added in Odoo).
+  * Groups results by `res_id` (= partner ID), deduped.
+  * Reads each partner's phone from whichever field exists (phone/mobile/whatsapp/
+    whatsapp_number) — uses getAvailableFields() to avoid Odoo 19.4 "Invalid field"
+    errors.
+  * For each partner: find/create local conversation by JID, then call the existing
+    `pullOdooChatterIntoConversation(jid, 'res.partner', partnerId, 500)` which
+    already dedupes by externalId (`odoo-${msg.id}`) + content+timestamp window.
+  * Throttles 50ms between partners (Odoo rate-limit safe).
+  * Emits progress at phases: starting → fetching_partners → processing (every 5) → complete/error.
+  * Has an in-progress lock (odooHistorySyncInProgress) so concurrent calls no-op.
+  * Updates lastMessageAt + lastMessage on each conversation, sorts messages by timestamp.
+  * Calls markConversationsDirty() so the disk persistence picks up the new state.
+  * Emits whatsapp:conversations + whatsapp:odoo-sync-progress at the end.
+
+- HOOK 1: After WA connection 'open', 8s delay (line ~1396):
+  * Gives WA resyncAppState (3s delay) time to start.
+  * Gives Odoo auto-auth (3 attempts × 5s) time to complete.
+  * Then calls syncAllConversationsFromOdoo(io, { silent: false }).
+  * This is the main "reconnect brings back history" trigger.
+
+- HOOK 2: After Odoo auto-auth SUCCESS (initial 3-attempt loop), 3s delay:
+  * Handles the case where Odoo was slow on startup but WA is already connected.
+  * Only fires if `waSocket && connectionState.connection === 'open'`.
+
+- HOOK 3: After Odoo BACKGROUND re-auth success (the 60s retry loop):
+  * Handles the case where Odoo was completely down on startup, came back later.
+  * Same 3s delay + WA-connection check.
+
+- NEW Socket endpoint `odoo:sync-all-history` (manual trigger):
+  * Lets the user click a button in the UI to force a full re-sync.
+  * Returns { success, partnersProcessed, messagesAdded, partnersFailed, lastRun }.
+
+- NEW Socket endpoint `odoo:sync-status`:
+  * Returns { inProgress, lastRun } so the UI can show stats / disable button while running.
+
+- Header comment updated to v7.21 with full changelog.
+
+src/lib/use-odoo.ts:
+- Added `syncAllHistory(data?: { limit?: number })` action — emits 'odoo:sync-all-history'.
+- Added `getSyncStatus()` action — emits 'odoo:sync-status'.
+- Both exposed in the hook's return object.
+
+src/lib/use-whatsapp.ts:
+- Added `odooHistorySync` state: { phase, total, processed, added, failed, error } | null.
+- Added listener for `whatsapp:odoo-sync-progress` event:
+  * Updates state on every phase.
+  * Auto-clears state 6s after 'complete' or 'error' phase.
+- Exposed `odooHistorySync` in the hook's return object.
+
+src/components/odoo/AutoSyncSettings.tsx:
+- Added new optional prop `onSyncAllHistory`.
+- Added local state: `syncing`, `syncResult`.
+- Added `handleSyncAllHistory` callback — calls onSyncAllHistory, shows result.
+- Added NEW "Restauração de Conversas" section with:
+  * Database icon + explanation: "O chatter do Odoo é o banco de dados durável..."
+  * Full-width button "Trazer conversas do Odoo agora" with RefreshCw icon.
+  * Loading state with spinner + "Sincronizando...".
+  * Result banner (green for success, red for error) showing counts.
+
+src/app/page.tsx:
+- Passed `onSyncAllHistory={odoo.syncAllHistory}` to AutoSyncSettingsPanel.
+- Added floating progress banner (top-right corner, z-50) that appears when
+  `wa.odooHistorySync` is non-null:
+  * phase='starting' → "Iniciando..." (sky blue, spinner)
+  * phase='fetching_partners' → "Buscando contatos no Odoo..." (sky blue, spinner)
+  * phase='processing' → "Processando N/M • X msgs" (sky blue, spinner)
+  * phase='complete' → "Conversas restauradas do Odoo" + counts (emerald, check)
+  * phase='error' → "Erro ao sincronizar conversas" + error message (red, alert)
+  * Auto-fades after 6s on complete/error (handled in the hook).
+- Imported AlertCircle + CheckCircle2 from lucide-react.
+
+Version bump:
+- package.json: 7.20.0 → 7.21.0
+- start.sh banner: v7.20 → v7.21
+- src/app/page.tsx sidebar label: v7.20 → v7.21
+- server.js header: v7.20 → v7.21 (with full changelog)
+
+Build verification:
+- `node --check server.js` ✓
+- `npx next build` ✓ (Next.js 16.1.3 with Turbopack — compiled in 18.0s, all 4 static pages generated)
+
+Stage Summary:
+- THE FEATURE: On every WA reconnect (8s delay), the middleware now scans every
+  res.partner in Odoo that has WhatsApp chatter messages and pulls them back
+  into the local conversation state. Survives deploys, crashes, disk wipes.
+- Both directions are pulled: "WhatsApp Enviada" → fromMe=true, "WhatsApp Recebida"
+  → fromMe=false. The user sees the full conversation thread on both sides.
+- Idempotent: dedup by externalId (`odoo-${msg.id}`) + content+timestamp window.
+  Running it 10 times produces the same result as running it once.
+- Three trigger points: WA reconnect (auto), Odoo auth success (auto, if WA already
+  connected), manual button (UI).
+- Progress is visible in two places: floating banner top-right (auto events) and
+  inline result message in the settings panel (manual click).
+- The Odoo chatter is now genuinely the durable conversation database — exactly
+  what the user asked for: "ele vai ser nosso banco de dados".
+- Version: 7.21.0 — ready to push to origin/main for Render deploy.

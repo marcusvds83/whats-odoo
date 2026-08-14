@@ -1,33 +1,39 @@
 // ====================================================================
-// Whats-Odoo v7.20 — SINGLE-PROCESS SERVER
+// Whats-Odoo v7.21 — SINGLE-PROCESS SERVER
 // Everything in one process: Next.js + WhatsApp (Baileys) + Odoo (XML-RPC)
 // Designed for Render 512MB RAM
 //
-// v7.20 changes:
+// v7.21 changes:
+//   - NEW: "Reconnect brings back history" — the Odoo chatter is now the
+//     durable conversation database. On every WA reconnect (and on every
+//     Odoo auth success), we automatically scan all res.partner records
+//     that have WhatsApp chatter messages and pull them back into the
+//     local conversation state. Survives deploys, crashes, disk wipes.
+//   - NEW: syncAllConversationsFromOdoo() — scans mail.message for our
+//     WhatsApp marker (body ilike "WhatsApp"), groups by res.partner,
+//     reads phone from whichever field exists, finds/creates the local
+//     conversation, and pulls chatter via pullOdooChatterIntoConversation
+//     (which already dedupes by externalId + content+timestamp).
+//   - NEW: Socket endpoints — 'odoo:sync-all-history' (manual trigger),
+//     'odoo:sync-status' (in-progress + last run stats).
+//   - NEW: Progress events — 'whatsapp:odoo-sync-progress' emitted at
+//     phases: starting → fetching_partners → processing → complete/error.
+//   - Hooks: fires 8s after WA 'open' event (gives WA resyncAppState
+//     time to start, and gives Odoo auto-auth time to complete). Also
+//     fires 3s after Odoo auth success if WA is already connected.
+//     Idempotent — has an in-progress lock so concurrent calls no-op.
+//
+// v7.20 changes (preserved):
 //   - REVERTED contacts/conversations separation: Conversas tab now shows
-//     BOTH actual conversations AND device contacts (v7.16 behavior). This
-//     fixes "não consegui mais selecionar um contato da lista que veio do
-//     aparelho e abrir uma nova conversa" — clicking any device contact
-//     works again.
-//   - FIXED Odoo 19.4 "Invalid field res.partner.mobile" error: search
-//     domains are now built dynamically based on which phone-like fields
-//     actually exist on the model (was crashing AutoSync on every incoming
-//     message, and breaking "click contact to start conversation").
-//   - Auto-create Lead is now OFF by default (carried over from v7.19).
-//     Opportunities must be created EXPLICITLY via the side panel
-//     "Criar Oportunidade" button, which carries the conversation history
-//     to both the chatter AND the description (Notes) field.
-//   - Create Project Task now works: auto-selects the first available
-//     project if none is specified, and surfaces the full error to the
-//     user if creation fails.
-//   - ContactsTabContent simplified back to v7.16 (no more complex
-//     onStartConversation flow that broke when Odoo mobile field invalid).
+//     BOTH actual conversations AND device contacts (v7.16 behavior).
+//   - FIXED Odoo 19.4 "Invalid field res.partner.mobile" error.
+//   - Auto-create Lead is OFF by default.
+//   - Create Project Task now works with smart defaults + error surfacing.
 //
 // v7.19 changes (preserved):
-//   - autoCreateLead default = false (per user request)
+//   - autoCreateLead default = false
 //   - Lead/Opportunity creation posts messages to chatter AND writes
 //     transcript to the description field (Notes)
-//   - Project task creation has smart defaults + error surfacing
 //
 // v7.17-v7.18 changes (preserved):
 //   - Session persistence across deploys (conversations saved to disk)
@@ -689,6 +695,17 @@ async function autoAuthenticateFromEnv() {
         io.of('/odoo').emit('odoo:status', {
           connected: true, url: odooConfig.url, db: odooConfig.db, username: odooConfig.username,
         })
+        // v7.21: If WhatsApp is already connected, pull conversation history
+        // from Odoo chatter now. This handles the case where WA connected
+        // before Odoo auth completed (e.g. Odoo was slow on startup).
+        if (waSocket && connectionState.connection === 'open') {
+          console.log('[Odoo] WA is connected — scheduling Odoo history sync in 3s')
+          setTimeout(() => {
+            syncAllConversationsFromOdoo(io, { silent: false }).catch(err =>
+              console.error('[Odoo] Post-auth history sync failed:', err.message)
+            )
+          }, 3000)
+        }
         return // success
       } catch (error) {
         console.error(`[Odoo] Auto-auth attempt ${attempt}/3 failed: ${error.message}`)
@@ -720,6 +737,15 @@ async function autoAuthenticateFromEnv() {
           })
           clearInterval(odooReauthTimer)
           odooReauthTimer = null
+          // v7.21: Pull Odoo chatter history now that we finally have auth
+          if (waSocket && connectionState.connection === 'open') {
+            console.log('[Odoo] WA is connected — scheduling Odoo history sync in 3s (post re-auth)')
+            setTimeout(() => {
+              syncAllConversationsFromOdoo(io, { silent: false }).catch(err =>
+                console.error('[Odoo] Post re-auth history sync failed:', err.message)
+              )
+            }, 3000)
+          }
         } catch (error) {
           console.log(`[Odoo] Background re-auth still failing: ${error.message}`)
         }
@@ -1039,6 +1065,202 @@ async function pullOdooChatterIntoConversation(jid, model, recordId, limit = 200
   }
 }
 
+// ====================================================================
+// v7.21: syncAllConversationsFromOdoo()
+// ---------------------------------------------------------------
+// Called automatically when:
+//   (a) WhatsApp reconnects (8s delay after 'open')
+//   (b) Odoo auto-auth succeeds (if WA is already connected)
+//   (c) Manually via the 'odoo:sync-all-history' socket endpoint
+//
+// The Odoo chatter is the "source of truth" for conversation history.
+// On every reconnect/redeploy, we scan all mail.message records that
+// were posted by us (body contains "WhatsApp" + our direction marker),
+// group them by res.partner, and pull each partner's chatter into the
+// corresponding local conversation (creating the conversation if it
+// doesn't exist yet).
+//
+// This makes the conversation history survive:
+//   - Render redeployments (process restart)
+//   - WA disconnect/reconnect (network issue, phone offline)
+//   - Disk wipe (conversation-state.json missing or stale)
+// The Odoo chatter remains the durable store.
+//
+// Returns: { partnersProcessed, messagesAdded, partnersFailed }
+// ====================================================================
+let odooHistorySyncInProgress = false
+let odooHistorySyncLastRun = null
+
+async function syncAllConversationsFromOdoo(io, opts = {}) {
+  const { silent = false, limit = 1000 } = opts
+
+  if (!odooConfig.uid) {
+    if (!silent) console.log('[OdooSync] SKIP — Odoo not authenticated yet')
+    return { skipped: true, reason: 'not_authenticated' }
+  }
+  if (odooHistorySyncInProgress) {
+    if (!silent) console.log('[OdooSync] SKIP — another sync is already running')
+    return { skipped: true, reason: 'already_running' }
+  }
+
+  odooHistorySyncInProgress = true
+  const startedAt = Date.now()
+  if (io) {
+    io.of('/whatsapp').emit('whatsapp:odoo-sync-progress', {
+      phase: 'starting', total: 0, processed: 0, added: 0, failed: 0,
+    })
+  }
+
+  try {
+    // ===== Step 1: Find all mail.message records we posted to res.partner chatter =====
+    // We search by body containing "WhatsApp" (our marker — every message we post
+    // includes "<strong> 📱 WhatsApp Enviada:" or "Recebida:"). This avoids
+    // pulling notes/activities posted by users manually in Odoo.
+    console.log(`[OdooSync] Scanning mail.message for WhatsApp chatter (limit=${limit})...`)
+    const domain = [
+      ['model', '=', 'res.partner'],
+      ['body', 'ilike', 'WhatsApp'],
+    ]
+    const messages = await odooExecuteKw('mail.message', 'search_read', [domain], {
+      fields: ['id', 'res_id', 'body', 'date', 'create_date'],
+      order: 'date asc',
+      limit,
+    })
+
+    if (!messages || messages.length === 0) {
+      console.log('[OdooSync] No WhatsApp chatter messages found in Odoo')
+      odooHistorySyncLastRun = { at: new Date().toISOString(), partnersProcessed: 0, messagesAdded: 0, partnersFailed: 0, durationMs: Date.now() - startedAt }
+      if (io) {
+        io.of('/whatsapp').emit('whatsapp:odoo-sync-progress', {
+          phase: 'complete', total: 0, processed: 0, added: 0, failed: 0,
+        })
+      }
+      return { partnersProcessed: 0, messagesAdded: 0, partnersFailed: 0 }
+    }
+
+    // ===== Step 2: Group by partner ID (res_id) =====
+    const partnerIds = [...new Set(messages.map(m => m.res_id).filter(id => typeof id === 'number' && id > 0))]
+    console.log(`[OdooSync] Found ${messages.length} chatter messages across ${partnerIds.length} partners`)
+
+    if (io) {
+      io.of('/whatsapp').emit('whatsapp:odoo-sync-progress', {
+        phase: 'fetching_partners', total: partnerIds.length, processed: 0, added: 0, failed: 0,
+      })
+    }
+
+    // ===== Step 3: Read partner phone fields =====
+    // We read whichever phone-like fields exist on res.partner (detected dynamically
+    // to avoid the Odoo 19.4 "Invalid field res.partner.mobile" error).
+    const partnerFields = await getAvailableFields('res.partner')
+    const readFields = ['id', 'name']
+    if (partnerFields.has('phone')) readFields.push('phone')
+    if (partnerFields.has('mobile')) readFields.push('mobile')
+    if (partnerFields.has('whatsapp')) readFields.push('whatsapp')
+    if (partnerFields.has('whatsapp_number')) readFields.push('whatsapp_number')
+
+    const partners = await odooExecuteKw('res.partner', 'read', [partnerIds], { fields: readFields })
+    const partnerMap = new Map()
+    for (const p of (partners || [])) partnerMap.set(p.id, p)
+
+    // ===== Step 4: For each partner, find/create local conversation + pull chatter =====
+    let processed = 0
+    let totalAdded = 0
+    let failed = 0
+    for (const partnerId of partnerIds) {
+      const p = partnerMap.get(partnerId)
+      if (!p) { failed++; continue }
+
+      // Pick the first non-empty phone-like field
+      const phoneRaw = p.phone || p.mobile || p.whatsapp || p.whatsapp_number || ''
+      const phoneDigits = String(phoneRaw).replace(/\D/g, '')
+      if (phoneDigits.length < 7) {
+        console.log(`[OdooSync] Partner ${partnerId} (${p.name || '?'}) has no valid phone — skipping`)
+        failed++
+        continue
+      }
+
+      // Build the WhatsApp JID from the phone digits
+      const jid = `${phoneDigits}@s.whatsapp.net`
+      if (!isValidPhoneJid(jid)) {
+        console.log(`[OdooSync] Partner ${partnerId} phone "${phoneRaw}" → invalid JID — skipping`)
+        failed++
+        continue
+      }
+
+      // Find or create the local conversation
+      let conv = conversations.get(jid)
+      if (!conv) {
+        conv = getOrCreateConversation(jid, p.name || null)
+        if (conv && p.name && !contactNames.has(jid)) {
+          contactNames.set(jid, p.name)
+          conv.name = p.name
+        }
+      } else if (p.name && !conv.name) {
+        conv.name = p.name
+        if (!contactNames.has(jid)) contactNames.set(jid, p.name)
+      }
+
+      if (!conv) { failed++; continue }
+
+      // Pull the chatter (this function already dedupes by externalId + content+timestamp)
+      try {
+        const added = await pullOdooChatterIntoConversation(jid, 'res.partner', partnerId, 500)
+        totalAdded += added
+        processed++
+        if (added > 0) {
+          console.log(`[OdooSync] ✓ Partner ${partnerId} (${p.name || phoneDigits}): +${added} messages`)
+        }
+      } catch (err) {
+        console.error(`[OdooSync] Partner ${partnerId} pull failed: ${err.message}`)
+        failed++
+      }
+
+      // Notify frontend of the link
+      if (io) {
+        io.of('/odoo').emit('odoo:conversation:linked', { jid, model: 'res.partner', recordId: partnerId })
+      }
+
+      // Throttle to avoid hammering Odoo (rate-limit safe)
+      await new Promise(r => setTimeout(r, 50))
+
+      // Progress update every 5 partners
+      if (io && processed % 5 === 0) {
+        io.of('/whatsapp').emit('whatsapp:odoo-sync-progress', {
+          phase: 'processing', total: partnerIds.length, processed, added: totalAdded, failed,
+        })
+      }
+    }
+
+    // ===== Step 5: Sort all affected conversations + emit final update =====
+    for (const [, conv] of conversations) {
+      conv.messages.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime())
+    }
+
+    markConversationsDirty()
+    if (io) {
+      io.of('/whatsapp').emit('whatsapp:conversations', getSortedConversations())
+      io.of('/whatsapp').emit('whatsapp:odoo-sync-progress', {
+        phase: 'complete', total: partnerIds.length, processed, added: totalAdded, failed,
+      })
+    }
+
+    const durationMs = Date.now() - startedAt
+    odooHistorySyncLastRun = { at: new Date().toISOString(), partnersProcessed: processed, messagesAdded: totalAdded, partnersFailed: failed, durationMs }
+    console.log(`[OdooSync] ✓ DONE in ${durationMs}ms — partners processed: ${processed}, messages added: ${totalAdded}, failed: ${failed}`)
+    return { partnersProcessed: processed, messagesAdded: totalAdded, partnersFailed: failed }
+  } catch (err) {
+    console.error(`[OdooSync] FAILED:`, err.message)
+    if (io) {
+      io.of('/whatsapp').emit('whatsapp:odoo-sync-progress', {
+        phase: 'error', error: err.message,
+      })
+    }
+    return { error: err.message }
+  } finally {
+    odooHistorySyncInProgress = false
+  }
+}
+
 // Load Baileys lazily — only after app.prepare()
 let baileysModule = null
 async function loadBaileys() {
@@ -1196,6 +1418,22 @@ async function connectWhatsApp(io) {
           console.error('[WA] Auto-resync trigger failed:', err.message)
         }
       }, 3000)
+
+      // v7.21: 8s after WA connects, pull all conversation history from Odoo
+      // chatter. This is the "reconnect brings back history" feature — the
+      // Odoo chatter is our durable conversation database, so every time the
+      // middleware restarts (deploy, crash, network glitch), we rebuild the
+      // local conversation state from Odoo. See syncAllConversationsFromOdoo()
+      // above for details. The 8s delay gives Odoo auto-auth time to complete
+      // and gives the WA resyncAppState time to start.
+      setTimeout(() => {
+        if (waSocket && connectionState.connection === 'open') {
+          console.log('[WA] Triggering Odoo chatter history sync (reconnect restore)')
+          syncAllConversationsFromOdoo(io, { silent: false }).catch(err =>
+            console.error('[WA] Odoo history sync failed:', err.message)
+          )
+        }
+      }, 8000)
     }
   })
 
@@ -2836,6 +3074,38 @@ app.prepare().then(async () => {
         })
 
         callback({ success: true, data: converted })
+      } catch (error) {
+        callback({ success: false, error: error.message })
+      }
+    })
+
+    // ===== v7.21: Manual trigger — pull ALL conversation history from Odoo =====
+    // Scans every res.partner that has WhatsApp chatter messages and pulls
+    // them into the local conversation state. Idempotent (dedup by externalId
+    // + content+timestamp). Use this after a deploy or whenever the local
+    // conversation list looks incomplete.
+    socket.on('odoo:sync-all-history', async (data, callback) => {
+      try {
+        if (!odooConfig.uid) {
+          callback({ success: false, error: 'Not authenticated with Odoo' })
+          return
+        }
+        console.log(`[Odoo] Manual sync-all-history triggered by ${socket.id}`)
+        const result = await syncAllConversationsFromOdoo(io, { silent: false, limit: data?.limit || 1000 })
+        callback({ success: true, ...result, lastRun: odooHistorySyncLastRun })
+      } catch (error) {
+        callback({ success: false, error: error.message })
+      }
+    })
+
+    // ===== v7.21: Get sync status (in-progress? last run stats?) =====
+    socket.on('odoo:sync-status', (data, callback) => {
+      try {
+        callback({
+          success: true,
+          inProgress: odooHistorySyncInProgress,
+          lastRun: odooHistorySyncLastRun,
+        })
       } catch (error) {
         callback({ success: false, error: error.message })
       }

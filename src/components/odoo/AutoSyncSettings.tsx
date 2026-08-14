@@ -11,6 +11,8 @@ import {
   CheckCircle2,
   Loader2,
   AlertCircle,
+  RefreshCw,
+  Database,
 } from 'lucide-react'
 
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -27,16 +29,28 @@ interface AutoSyncSettingsPanelProps {
   odooConnected: boolean
   settings: AutoSyncSettings
   onUpdateSettings: (settings: Partial<AutoSyncSettings>) => Promise<{ success: boolean; settings?: AutoSyncSettings; error?: string }>
+  // v7.21: Manual trigger for "sync all conversation history from Odoo"
+  onSyncAllHistory?: (data?: { limit?: number }) => Promise<{
+    success: boolean
+    partnersProcessed?: number
+    messagesAdded?: number
+    partnersFailed?: number
+    error?: string
+  }>
 }
 
 export function AutoSyncSettingsPanel({
   odooConnected,
   settings,
   onUpdateSettings,
+  onSyncAllHistory,
 }: AutoSyncSettingsPanelProps) {
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  // v7.21: Manual sync state
+  const [syncing, setSyncing] = useState(false)
+  const [syncResult, setSyncResult] = useState<string | null>(null)
 
   const handleToggle = useCallback(async (key: keyof AutoSyncSettings, value: boolean | string | number | null) => {
     setSaving(true)
@@ -56,6 +70,28 @@ export function AutoSyncSettingsPanel({
       setSaving(false)
     }
   }, [onUpdateSettings])
+
+  // v7.21: Manual sync handler — pulls all conversation history from Odoo chatter
+  const handleSyncAllHistory = useCallback(async () => {
+    if (!onSyncAllHistory) return
+    setSyncing(true)
+    setSyncResult(null)
+    try {
+      const result = await onSyncAllHistory({ limit: 1000 })
+      if (result.success) {
+        const { partnersProcessed = 0, messagesAdded = 0, partnersFailed = 0 } = result
+        setSyncResult(`✓ ${partnersProcessed} contatos sincronizados, ${messagesAdded} mensagens trazidas${partnersFailed > 0 ? `, ${partnersFailed} falharam` : ''}.`)
+      } else {
+        setSyncResult(`✗ ${result.error || 'Erro ao sincronizar'}`)
+      }
+    } catch (err) {
+      setSyncResult(`✗ ${err instanceof Error ? err.message : 'Erro desconhecido'}`)
+    } finally {
+      setSyncing(false)
+      // Clear the result after 8 seconds
+      setTimeout(() => setSyncResult(null), 8000)
+    }
+  }, [onSyncAllHistory])
 
   if (!odooConnected) {
     return (
@@ -226,6 +262,59 @@ export function AutoSyncSettingsPanel({
             <p className="text-xs text-muted-foreground">
               Prefixo adicionado ao nome do lead criado automaticamente
             </p>
+          </div>
+        </div>
+
+        <Separator />
+
+        {/* v7.21: Restore conversations from Odoo chatter */}
+        <div className="space-y-3">
+          <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+            Restauração de Conversas
+          </p>
+          <div className="rounded-lg border border-sky-200 dark:border-sky-900 bg-sky-50/50 dark:bg-sky-950/20 p-4 space-y-3">
+            <div className="flex items-start gap-3">
+              <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-sky-100 dark:bg-sky-950/40">
+                <Database className="size-4 text-sky-700 dark:text-sky-400" />
+              </div>
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-medium">Trazer conversas do Odoo</p>
+                <p className="text-xs text-muted-foreground mt-0.5">
+                  O chatter do Odoo é o banco de dados durável das conversas. Esta ação
+                  varre todos os contatos com mensagens no chatter e traz o histórico
+                  de volta para o middleware. Roda automaticamente ao reconectar, mas
+                  você pode disparar manualmente se preciso. É idempotente — não duplica
+                  mensagens já existentes.
+                </p>
+              </div>
+            </div>
+            <Button
+              onClick={handleSyncAllHistory}
+              disabled={syncing || !onSyncAllHistory}
+              variant="default"
+              size="sm"
+              className="w-full"
+            >
+              {syncing ? (
+                <>
+                  <Loader2 className="size-4 animate-spin mr-2" />
+                  Sincronizando...
+                </>
+              ) : (
+                <>
+                  <RefreshCw className="size-4 mr-2" />
+                  Trazer conversas do Odoo agora
+                </>
+              )}
+            </Button>
+            {syncResult && (
+              <div className={`text-xs rounded-md p-2 ${syncResult.startsWith('✓')
+                ? 'bg-emerald-50 dark:bg-emerald-950/30 text-emerald-700 dark:text-emerald-400'
+                : 'bg-destructive/10 text-destructive'
+              }`}>
+                {syncResult}
+              </div>
+            )}
           </div>
         </div>
 

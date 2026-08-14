@@ -33,6 +33,8 @@ import {
   PanelRightClose,
   Zap,
   Loader2,
+  AlertCircle,
+  CheckCircle2,
 } from 'lucide-react'
 
 type Tab = 'dashboard' | 'whatsapp' | 'conversations' | 'settings'
@@ -469,7 +471,7 @@ export default function HomePage() {
             {!sidebarCollapsed && (
               <div className="hidden lg:block min-w-0">
                 <p className="text-sm font-bold leading-tight truncate">Whats-Odoo</p>
-                <p className="text-[10px] text-muted-foreground">v7.20 Middleware</p>
+                <p className="text-[10px] text-muted-foreground">v7.21 Middleware</p>
               </div>
             )}
           </div>
@@ -501,7 +503,59 @@ export default function HomePage() {
         </div>
       </nav>
 
-      <main className="flex-1 flex flex-col min-h-0 max-h-screen">
+      <main className="flex-1 flex flex-col min-h-0 max-h-screen relative">
+        {/* v7.21: Floating banner showing Odoo chatter history sync progress */}
+        {wa.odooHistorySync && (
+          <div className="absolute top-3 right-3 z-50 max-w-sm animate-in fade-in slide-in-from-top-2">
+            <div className={`rounded-lg border shadow-lg p-3 text-xs ${
+              wa.odooHistorySync.phase === 'error'
+                ? 'bg-destructive/95 text-destructive-foreground border-destructive'
+                : wa.odooHistorySync.phase === 'complete'
+                ? 'bg-emerald-600/95 text-white border-emerald-700'
+                : 'bg-sky-600/95 text-white border-sky-700'
+            }`}>
+              <div className="flex items-start gap-2">
+                {wa.odooHistorySync.phase === 'error' ? (
+                  <AlertCircle className="size-4 shrink-0 mt-0.5" />
+                ) : wa.odooHistorySync.phase === 'complete' ? (
+                  <CheckCircle2 className="size-4 shrink-0 mt-0.5" />
+                ) : (
+                  <Loader2 className="size-4 shrink-0 mt-0.5 animate-spin" />
+                )}
+                <div className="flex-1 min-w-0">
+                  <p className="font-semibold">
+                    {wa.odooHistorySync.phase === 'error'
+                      ? 'Erro ao sincronizar conversas'
+                      : wa.odooHistorySync.phase === 'complete'
+                      ? 'Conversas restauradas do Odoo'
+                      : 'Trazendo conversas do Odoo...'}
+                  </p>
+                  {wa.odooHistorySync.phase === 'error' && wa.odooHistorySync.error && (
+                    <p className="mt-0.5 opacity-90 break-words">{wa.odooHistorySync.error}</p>
+                  )}
+                  {wa.odooHistorySync.phase === 'complete' && (
+                    <p className="mt-0.5 opacity-90">
+                      {wa.odooHistorySync.processed || 0} contatos • {(wa.odooHistorySync.added || 0)} mensagens
+                      {(wa.odooHistorySync.failed || 0) > 0 && ` • ${wa.odooHistorySync.failed} falhas`}
+                    </p>
+                  )}
+                  {(wa.odooHistorySync.phase === 'starting' ||
+                    wa.odooHistorySync.phase === 'fetching_partners' ||
+                    wa.odooHistorySync.phase === 'processing') && (
+                    <p className="mt-0.5 opacity-90">
+                      {wa.odooHistorySync.phase === 'fetching_partners'
+                        ? 'Buscando contatos no Odoo...'
+                        : wa.odooHistorySync.phase === 'processing'
+                        ? `Processando ${wa.odooHistorySync.processed || 0}/${wa.odooHistorySync.total || 0} • ${wa.odooHistorySync.added || 0} msgs`
+                        : 'Iniciando...'}
+                    </p>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
         {activeTab === 'dashboard' && (
           <div className="flex-1 overflow-y-auto">
             <DashboardView
@@ -580,6 +634,7 @@ export default function HomePage() {
               odooConnected={odoo.status.connected}
               settings={odoo.autoSyncSettings}
               onUpdateSettings={odoo.updateAutoSyncSettings}
+              onSyncAllHistory={odoo.syncAllHistory}
             />
             <Card>
               <CardHeader>

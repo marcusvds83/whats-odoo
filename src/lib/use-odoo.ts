@@ -248,6 +248,41 @@ export function useOdoo() {
     })
   }, [])
 
+  // ===== v7.21: Sync ALL conversation history from Odoo chatter =====
+  // Scans every res.partner that has WhatsApp chatter messages and pulls
+  // them into the local conversation state. This is what runs automatically
+  // on WA reconnect — exposed here so the UI can also trigger it manually.
+  // Idempotent: running it twice won't duplicate messages (dedup by externalId
+  // + content+timestamp).
+  const syncAllHistory = useCallback((data?: { limit?: number }): Promise<{
+    success: boolean
+    partnersProcessed?: number
+    messagesAdded?: number
+    partnersFailed?: number
+    lastRun?: { at: string; partnersProcessed: number; messagesAdded: number; partnersFailed: number; durationMs: number } | null
+    error?: string
+  }> => {
+    return new Promise((resolve) => {
+      socketRef.current?.emit('odoo:sync-all-history', data || {}, (response: any) => {
+        resolve(response)
+      })
+    })
+  }, [])
+
+  // ===== v7.21: Get current sync status (in-progress? last run stats?) =====
+  const getSyncStatus = useCallback((): Promise<{
+    success: boolean
+    inProgress?: boolean
+    lastRun?: { at: string; partnersProcessed: number; messagesAdded: number; partnersFailed: number; durationMs: number } | null
+    error?: string
+  }> => {
+    return new Promise((resolve) => {
+      socketRef.current?.emit('odoo:sync-status', {}, (response: any) => {
+        resolve(response)
+      })
+    })
+  }, [])
+
   // ===== Sales =====
   const searchSales = useCallback((query?: string, limit?: number): Promise<{ success: boolean; data?: OdooSale[]; error?: string }> => {
     return new Promise((resolve) => {
@@ -370,6 +405,9 @@ export function useOdoo() {
     createLead,
     // History
     fetchHistory,
+    // v7.21: Sync all + status
+    syncAllHistory,
+    getSyncStatus,
     // Sales
     searchSales,
     createSale,

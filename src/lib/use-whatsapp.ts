@@ -75,6 +75,17 @@ export function useWhatsApp() {
   const [isConnected, setIsConnected] = useState(false)
   const [syncProgress, setSyncProgress] = useState<SyncProgress | null>(null)
 
+  // v7.21: Odoo chatter history sync progress
+  // (emitted by syncAllConversationsFromOdoo in server.js)
+  const [odooHistorySync, setOdooHistorySync] = useState<{
+    phase: string
+    total?: number
+    processed?: number
+    added?: number
+    failed?: number
+    error?: string
+  } | null>(null)
+
   // Odoo sync state per conversation
   const [odooSyncMap, setOdooSyncMap] = useState<Map<string, OdooSyncInfo>>(new Map())
 
@@ -275,6 +286,23 @@ export function useWhatsApp() {
       })
     })
 
+    // v7.21: Odoo chatter history sync progress (auto-fired on reconnect)
+    socket.on('whatsapp:odoo-sync-progress', (data: {
+      phase: string
+      total?: number
+      processed?: number
+      added?: number
+      failed?: number
+      error?: string
+    }) => {
+      console.log('[WhatsApp] Odoo history sync progress:', data)
+      setOdooHistorySync(data)
+      // Clear error/complete states after a delay
+      if (data.phase === 'complete' || data.phase === 'error') {
+        setTimeout(() => setOdooHistorySync(null), 6000)
+      }
+    })
+
     return () => {
       socket.disconnect()
     }
@@ -459,6 +487,8 @@ export function useWhatsApp() {
     currentJid,
     isConnected,
     syncProgress,
+    // v7.21: Odoo chatter history sync progress (auto on reconnect)
+    odooHistorySync,
     // Odoo sync
     odooSyncMap,
     getOdooSync,
