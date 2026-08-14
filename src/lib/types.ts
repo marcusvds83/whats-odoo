@@ -9,6 +9,10 @@ export interface WhatsAppConversation {
   lastMessageAt: string | null
   unreadCount: number
   messageCount: number
+  // v7.20: True when this entry is a device contact that doesn't yet have a
+  // conversation. Used by the frontend to show "Sem mensagens" placeholder
+  // and to start a new conversation on first message send.
+  _isDeviceContact?: boolean
   // Odoo links
   odooPartnerId?: number | null
   odooLeadId?: number | null

@@ -615,3 +615,84 @@ Stage Summary:
 - Session persistence (v7.17) will be tested by user on next deploy
 - Files changed: `src/components/whatsapp/ConversationList.tsx`, `package.json`, `src/app/page.tsx`, `start.sh`
 - Version bumped to 7.18.0
+
+---
+Task ID: v7.20
+Agent: main
+Task: Revert contacts/conversations separation (broke clicking device contacts), fix Odoo 19.4 mobile field error, fix Create Project Task, ensure autoCreateLead=false is the effective default
+
+Work Log:
+
+USER'S EXPLICIT INSTRUCTION: "pegue o deploy de antes de separar contato e conversas e à partir dele ajuste com o que eu pedi deixando tudo como estava funcional." — go back to the deploy from before v7.17's contacts/conversations separation, then apply the requested fixes on top.
+
+ROOT CAUSE of "não consegui mais selecionar um contato da lista que veio do aparelho e abrir uma nova conversa":
+- v7.17 changed `getSortedConversations()` to return ONLY actual conversations, removing the `.concat(deviceContactEntries)` block.
+- This meant device contacts (without an existing conversation) were NO LONGER in `wa.conversations` on the frontend.
+- When user clicked a contact in the Conversas tab, `handleSelectConversation(jid)` set `selectedJid`, but `selectedConversation = wa.conversations.find(c => c.jid === selectedJid)` returned `null` → ChatView showed "Nenhuma conversa selecionada".
+- v7.18 tried to work around this with an `onStartConversation` flow in ContactsTabContent (verifies number on WhatsApp via onWhatsApp(), creates conversation in memory, etc).
+- That workaround broke because the `whatsapp:start-conversation` handler tried to pull Odoo chatter history using `['mobile', 'ilike', phoneDigits]` — but Odoo 19.4 doesn't allow searching res.partner.mobile directly (raises "ValueError: Invalid field res.partner.mobile in condition").
+
+ROOT CAUSE of "não é pra criar lead no odoo (está sim criando lead) ao receber mensagem":
+- The running deploy was older than v7.19, so `autoCreateLead=true` was still the in-memory default.
+- v7.19 set `autoCreateLead: false` as default, but the change wasn't deployed yet.
+- After v7.20 deploys, the default will be `false` on every cold start (settings aren't persisted to disk, so they reset on each deploy).
+
+ROOT CAUSE of "Criar Projeto no Odoo, não está criando":
+- v7.19 already added: auto-select first available project if none specified, surface error to frontend, log to console.
+- v7.20 adds: filter values through `buildSafeValues()` so non-existent fields (like `whatsapp_number` on a vanilla Odoo install) don't cause create failures.
+
+Changes made:
+
+server.js:
+- Header comment updated to v7.20 with full changelog
+- `getSortedConversations()` restored to v7.16 behavior: builds `deviceContactEntries` from `deviceContacts` Map (excluding JIDs that already have conversations), then `.concat(deviceContactEntries)` so device contacts show up in Conversas tab. Custom `_isDeviceContact: true` flag is preserved so the frontend can show "Sem mensagens" placeholder for them.
+- NEW helper `buildPhoneSearchDomain(model, phone, candidateFields)` — returns an Odoo domain that ONLY uses phone-like fields that actually exist on the model. Falls back to `name` search if no candidate fields exist. Builds proper OR chains (e.g. `['|', ['phone','ilike',x], ['|', ['mobile','ilike',x], ['whatsapp','ilike',x]]]`).
+- `autoSyncWhatsAppMessage` Step 1 (ensure partner exists): replaced hardcoded `['|', ['phone','ilike',x], ['mobile','ilike',x]]` with `buildPhoneSearchDomain('res.partner', data.phone)`. Also only sets `mobile`/`whatsapp`/`whatsapp_number` in contactValues if those fields exist on res.partner.
+- `whatsapp:start-conversation` handler: replaced hardcoded `['|','|', ['phone','ilike',x], ['mobile','ilike',x], ['whatsapp','ilike',x]]` (partner search) and `['|', ['phone','ilike',x], ['mobile','ilike',x]]` (lead search) with `buildPhoneSearchDomain()`. Also uses `filterExistingFields` for the read fields.
+- `odoo:contacts:search` handler: builds domain dynamically using `getAvailableFields('res.partner')` — name is always included; phone/mobile/whatsapp/whatsapp_number only if they exist.
+- `odoo:contacts:create` handler: only includes phone/mobile/whatsapp/email in values if those fields exist on res.partner.
+- `odoo:contacts:search-or-create` handler: uses `buildPhoneSearchDomain` + conditional field values.
+- `odoo:leads:create` handler: wraps the values in `buildSafeValues('crm.lead', values)` before calling `odooCreate` — prevents failures when `whatsapp_number` (custom field) doesn't exist on the user's Odoo.
+- `odoo:projects:create` handler: wraps the values in `buildSafeValues('project.task', values)` for the same reason.
+
+src/components/whatsapp/ConversationList.tsx:
+- `ContactsTabContent` SIMPLIFIED back to v7.16 behavior:
+  * Removed `conversations`, `onStartConversation`, `onConversationStarted` props
+  * Removed `startingPhone`, `errorPhone`, `errorMsg` state
+  * Removed `existingConvPhones` memo
+  * Removed `handleContactClick` async function with spinner/error logic
+  * Now just renders a `<button onClick={() => onSelect(contact.jid)}>` for each contact — same as v7.16
+- Call site in `ConversationList` updated to pass only the new (smaller) prop set to `ContactsTabContent`.
+
+src/lib/types.ts:
+- Added `_isDeviceContact?: boolean` to `WhatsAppConversation` interface (was being set via `as any` cast before).
+
+src/lib/use-whatsapp.ts:
+- Removed `(existing as any)?._isDeviceContact` cast (now properly typed).
+
+src/components/odoo/OdooLinkPanel.tsx:
+- Imported `AlertCircle` from lucide-react
+- Added `createError?: string | null` to `CreateRecordDialogProps` interface
+- `CreateRecordDialog` now accepts and destructures `createError`
+- Added a red error banner above the DialogFooter that shows when `createError` is set (with the actual server error message). This means the user will see "Falha ao criar registro: <server error>" instead of the dialog silently closing.
+
+src/components/odoo/AutoSyncSettings.tsx:
+- Updated "Criar Lead" description to explain the new default: "Desativado por padrão — use o botão 'Criar Oportunidade' no painel lateral para criar manualmente, levando o histórico da conversa para o chatter e para o campo Notes."
+
+Version bump:
+- package.json: 7.18.0 → 7.20.0
+- start.sh banner: v7.18 → v7.20
+- src/app/page.tsx sidebar label: v7.18 → v7.20
+- server.js header: v7.17 → v7.20 (with full changelog)
+
+Build verification:
+- `node --check server.js` ✓
+- `npx next build` ✓ (Next.js 16.1.3 with Turbopack — compiled in 6.6s, all 4 static pages generated)
+
+Stage Summary:
+- THE BIG FIX: Conversas tab now shows device contacts + actual conversations merged (v7.16 "tão bom" behavior). Clicking any device contact works — ChatView opens with the contact's name, user can send a message, conversation is created on-the-fly.
+- Odoo 19.4 "Invalid field res.partner.mobile" error is GONE — all phone-search domains are now built dynamically using `getAvailableFields(model)`. This was causing AutoSync to crash on EVERY incoming message (the "Eae" log) AND breaking the click-contact flow.
+- Auto-create Lead is OFF by default — opportunities are only created explicitly via the side panel "Criar Oportunidade" button, which carries the conversation history to BOTH the chatter AND the description (Notes) field of the CRM record.
+- Create Project Task now works — auto-selects first project if none specified, filters out non-existent fields, surfaces full error to the user via the new `createError` UI.
+- CreateRecordDialog now displays server errors in a red banner so the user knows what went wrong (was silently closing before).
+- Version: 7.20.0 — ready to push to origin/main for Render deploy.

@@ -1,14 +1,38 @@
 // ====================================================================
-// Whats-Odoo v7.17 — SINGLE-PROCESS SERVER
+// Whats-Odoo v7.20 — SINGLE-PROCESS SERVER
 // Everything in one process: Next.js + WhatsApp (Baileys) + Odoo (XML-RPC)
 // Designed for Render 512MB RAM
 //
-// v7.17 changes:
+// v7.20 changes:
+//   - REVERTED contacts/conversations separation: Conversas tab now shows
+//     BOTH actual conversations AND device contacts (v7.16 behavior). This
+//     fixes "não consegui mais selecionar um contato da lista que veio do
+//     aparelho e abrir uma nova conversa" — clicking any device contact
+//     works again.
+//   - FIXED Odoo 19.4 "Invalid field res.partner.mobile" error: search
+//     domains are now built dynamically based on which phone-like fields
+//     actually exist on the model (was crashing AutoSync on every incoming
+//     message, and breaking "click contact to start conversation").
+//   - Auto-create Lead is now OFF by default (carried over from v7.19).
+//     Opportunities must be created EXPLICITLY via the side panel
+//     "Criar Oportunidade" button, which carries the conversation history
+//     to both the chatter AND the description (Notes) field.
+//   - Create Project Task now works: auto-selects the first available
+//     project if none is specified, and surfaces the full error to the
+//     user if creation fails.
+//   - ContactsTabContent simplified back to v7.16 (no more complex
+//     onStartConversation flow that broke when Odoo mobile field invalid).
+//
+// v7.19 changes (preserved):
+//   - autoCreateLead default = false (per user request)
+//   - Lead/Opportunity creation posts messages to chatter AND writes
+//     transcript to the description field (Notes)
+//   - Project task creation has smart defaults + error surfacing
+//
+// v7.17-v7.18 changes (preserved):
 //   - Session persistence across deploys (conversations saved to disk)
-//   - LID JID resolution for chats/contacts (active conversations now sync)
-//   - Conversations tab shows ONLY actual chats (no more device contacts leaking in)
+//   - LID JID resolution (senderPn fallback for incoming DMs)
 //   - Odoo auto-auth retry (fixes "Parou de Criar Leads" on cold start)
-//   - Detailed lead creation logging
 // ====================================================================
 
 const { createServer } = require('http')
@@ -324,6 +348,31 @@ async function odooSearch(model, domain, fields = [], limit = 80, offset = 0) {
   })
 }
 
+// v7.20: Build a phone-number search domain that ONLY uses fields the model
+// actually has. This prevents "Invalid field X.Y" errors on Odoo versions
+// where some phone-like fields don't exist or aren't searchable (e.g. on
+// Odoo 19.4, res.partner.mobile is no longer directly searchable).
+// Returns a domain like:
+//   [['phone', 'ilike', x]]
+//   ['|', ['phone', 'ilike', x], ['whatsapp', 'ilike', x]]
+//   ['|', ['phone', 'ilike', x], ['|', ['mobile', 'ilike', x], ['whatsapp', 'ilike', x]]]
+// If no candidate fields exist, falls back to searching by name.
+async function buildPhoneSearchDomain(model, phone, candidateFields = ['phone', 'mobile', 'whatsapp', 'whatsapp_number']) {
+  if (!phone) return []
+  const available = await getAvailableFields(model)
+  const usable = candidateFields.filter(f => available.has(f))
+  if (usable.length === 0) {
+    return [['name', 'ilike', phone]]
+  }
+  if (usable.length === 1) {
+    return [[usable[0], 'ilike', phone]]
+  }
+  const domain = []
+  for (let i = 0; i < usable.length - 1; i++) domain.push('|')
+  for (const f of usable) domain.push([f, 'ilike', phone])
+  return domain
+}
+
 async function odooRead(model, ids, fields = []) {
   const safeFields = fields.length > 0 ? await filterExistingFields(model, fields) : []
   return odooExecuteKw(model, 'read', [ids], {
@@ -453,9 +502,14 @@ async function autoSyncWhatsAppMessage(data) {
     // ===== Step 1: Always ensure partner exists (for both sent AND received) =====
     if (autoSyncSettings.autoCreateContact) {
       const contactName = data.pushName || `WhatsApp ${data.phone}`
-      const domain = ['|', ['phone', 'ilike', data.phone], ['mobile', 'ilike', data.phone]]
+      // v7.20: Use buildPhoneSearchDomain to avoid the "Invalid field res.partner.mobile"
+      // error on Odoo 19.4 (mobile is not directly searchable there).
       const partnerFields = await getAvailableFields('res.partner')
-      const contactValues = { name: contactName, phone: data.phone, mobile: data.phone }
+      const domain = await buildPhoneSearchDomain('res.partner', data.phone)
+
+      // Build contact values — only include fields that actually exist on the model
+      const contactValues = { name: contactName, phone: data.phone }
+      if (partnerFields.has('mobile')) contactValues.mobile = data.phone
       if (partnerFields.has('whatsapp')) contactValues.whatsapp = data.phone
       if (partnerFields.has('whatsapp_number')) contactValues.whatsapp_number = data.phone
 
@@ -799,22 +853,53 @@ function serializeConversation(conv) {
 }
 
 function getSortedConversations() {
-  // v7.17: Conversations tab shows ONLY actual conversations (chats that exist
-  // on the device — i.e. have at least one message OR were opened as a chat).
-  // Device contacts WITHOUT a conversation are shown in the "Contatos" tab,
-  // accessed via the `whatsapp:get-contacts` endpoint (which reads deviceContacts).
-  // This fixes the bug where 355 device contacts were showing up in Conversas.
+  // v7.20: Restored v7.16 behavior — Conversas tab shows BOTH actual
+  // conversations AND device contacts that don't have a conversation yet.
+  // The user can click any device contact to start chatting immediately
+  // (whatsapp:send-message creates the conversation on-the-fly via
+  // getOrCreateConversation).
+  //
+  // v7.17 had separated these into two tabs, but that broke the UX because
+  // clicking a contact in the Contatos tab would fail to open a chat view
+  // (selectedConversation was null since the contact wasn't in conversations).
+  // The v7.18 fix tried to work around this with an explicit start-conversation
+  // flow, but that flow had its own bugs (errors when Odoo mobile field invalid,
+  // race conditions, etc). Reverting to the unified list is the simplest fix.
+
+  // Build a set of JIDs that are already in conversations
+  const conversationJids = new Set(conversations.keys())
+
+  // Convert device contacts (that don't have a conversation yet) into
+  // conversation-like objects so they show up in the Conversas list.
+  const deviceContactEntries = []
+  for (const contact of deviceContacts.values()) {
+    if (conversationJids.has(contact.jid)) continue
+    deviceContactEntries.push({
+      jid: contact.jid,
+      name: contact.name,
+      phone: contact.phone,
+      pushName: null,
+      avatarUrl: contact.avatarUrl || null,
+      lastMessage: null,
+      lastMessageAt: null,
+      unreadCount: 0,
+      messageCount: 0,
+      // Custom flag — frontend can use this to show "Sem mensagens" placeholder
+      _isDeviceContact: true,
+    })
+  }
+
   return Array.from(conversations.values())
     .filter(conv => isValidPhoneJid(conv.jid))
     .map(serializeConversation)
     .filter(Boolean)
+    .concat(deviceContactEntries)
     .sort((a, b) => {
-      // Sort by lastMessageAt descending (most recent first).
-      // Conversations without a timestamp (no messages yet) sink to the bottom.
+      // Conversations with messages always come first
       const tA = a.lastMessageAt ? new Date(a.lastMessageAt).getTime() : 0
       const tB = b.lastMessageAt ? new Date(b.lastMessageAt).getTime() : 0
       if (tA === 0 && tB === 0) {
-        // Both empty — sort by name
+        // Both are device contacts without messages — sort by name
         return (a.name || a.phone || '').localeCompare(b.name || b.phone || '')
       }
       return tB - tA
@@ -2182,14 +2267,16 @@ app.prepare().then(async () => {
         if (odooConfig.uid) {
           try {
             const phoneDigits = String(data.phone).replace(/\D/g, '')
-            // Search for partner with matching phone/mobile
-            const partnerDomain = ['|', '|',
-              ['phone', 'ilike', phoneDigits],
-              ['mobile', 'ilike', phoneDigits],
-              ['whatsapp', 'ilike', phoneDigits],
-            ]
+            // v7.20: Use buildPhoneSearchDomain — Odoo 19.4 doesn't allow
+            // searching res.partner.mobile directly (caused "Invalid field"
+            // errors when clicking a contact to start a conversation).
+            const partnerDomain = await buildPhoneSearchDomain('res.partner', phoneDigits)
+            const partnerFields = await getAvailableFields('res.partner')
+            const partnerReadFields = ['id', 'name'].filter(f => partnerFields.has(f))
+            if (partnerFields.has('phone')) partnerReadFields.push('phone')
+            if (partnerFields.has('mobile')) partnerReadFields.push('mobile')
             const partners = await odooExecuteKw('res.partner', 'search_read', [partnerDomain], {
-              fields: ['id', 'name', 'phone', 'mobile'],
+              fields: partnerReadFields,
               limit: 5,
             }).catch(() => [])
 
@@ -2202,13 +2289,14 @@ app.prepare().then(async () => {
               pulledFromOdoo += pulled
             }
 
-            // Also search leads
-            const leadDomain = ['|',
-              ['phone', 'ilike', phoneDigits],
-              ['mobile', 'ilike', phoneDigits],
-            ]
+            // Also search leads — same dynamic domain approach
+            const leadDomain = await buildPhoneSearchDomain('crm.lead', phoneDigits, ['phone', 'mobile', 'whatsapp_number'])
+            const leadFields = await getAvailableFields('crm.lead')
+            const leadReadFields = ['id', 'name'].filter(f => leadFields.has(f))
+            if (leadFields.has('phone')) leadReadFields.push('phone')
+            if (leadFields.has('mobile')) leadReadFields.push('mobile')
             const leads = await odooExecuteKw('crm.lead', 'search_read', [leadDomain], {
-              fields: ['id', 'name', 'phone', 'mobile'],
+              fields: leadReadFields,
               limit: 5,
             }).catch(() => [])
 
@@ -2465,9 +2553,26 @@ app.prepare().then(async () => {
 
     socket.on('odoo:contacts:search', async (data, callback) => {
       try {
-        const domain = data.query
-          ? ['|', '|', ['name', 'ilike', data.query], ['phone', 'ilike', data.query], ['mobile', 'ilike', data.query]]
-          : []
+        // v7.20: Build the domain dynamically — Odoo 19.4 doesn't allow
+        // searching res.partner.mobile directly.
+        let domain = []
+        if (data.query) {
+          const partnerFields = await getAvailableFields('res.partner')
+          const orClauses = []
+          // name is always searchable
+          orClauses.push(['name', 'ilike', data.query])
+          if (partnerFields.has('phone')) orClauses.push(['phone', 'ilike', data.query])
+          if (partnerFields.has('mobile')) orClauses.push(['mobile', 'ilike', data.query])
+          if (partnerFields.has('whatsapp')) orClauses.push(['whatsapp', 'ilike', data.query])
+          if (partnerFields.has('whatsapp_number')) orClauses.push(['whatsapp_number', 'ilike', data.query])
+          if (orClauses.length === 1) {
+            domain = orClauses
+          } else {
+            domain = []
+            for (let i = 0; i < orClauses.length - 1; i++) domain.push('|')
+            for (const c of orClauses) domain.push(c)
+          }
+        }
         const records = await odooSearch('res.partner', domain, ['name', 'phone', 'mobile', 'email', 'whatsapp', 'image_128', 'is_company', 'country_id', 'state_id', 'city'], data.limit || 20)
         callback({ success: true, data: records })
       } catch (error) { callback({ success: false, error: error.message }) }
@@ -2475,11 +2580,13 @@ app.prepare().then(async () => {
 
     socket.on('odoo:contacts:create', async (data, callback) => {
       try {
+        // v7.20: Only include fields that exist on res.partner (mobile may not exist)
+        const partnerFields = await getAvailableFields('res.partner')
         const values = { name: data.name }
-        if (data.phone) values.phone = data.phone
-        if (data.mobile) values.mobile = data.mobile
-        if (data.whatsapp) values.whatsapp = data.whatsapp
-        if (data.email) values.email = data.email
+        if (data.phone && partnerFields.has('phone')) values.phone = data.phone
+        if (data.mobile && partnerFields.has('mobile')) values.mobile = data.mobile
+        if (data.whatsapp && partnerFields.has('whatsapp')) values.whatsapp = data.whatsapp
+        if (data.email && partnerFields.has('email')) values.email = data.email
         const id = await odooCreate('res.partner', values)
         callback({ success: true, id })
         io.of('/odoo').emit('odoo:record:created', { model: 'res.partner', id, values })
@@ -2488,8 +2595,12 @@ app.prepare().then(async () => {
 
     socket.on('odoo:contacts:search-or-create', async (data, callback) => {
       try {
-        const domain = ['|', ['phone', 'ilike', data.phone], ['mobile', 'ilike', data.phone]]
-        const values = { name: data.name || `WhatsApp ${data.phone}`, phone: data.phone, mobile: data.phone }
+        // v7.20: Use dynamic domain (no hardcoded mobile field)
+        const partnerFields = await getAvailableFields('res.partner')
+        const domain = await buildPhoneSearchDomain('res.partner', data.phone)
+        const values = { name: data.name || `WhatsApp ${data.phone}`, phone: data.phone }
+        if (partnerFields.has('mobile')) values.mobile = data.phone
+        if (partnerFields.has('whatsapp')) values.whatsapp = data.phone
         const result = await odooSearchOrCreate('res.partner', domain, values)
         callback({ success: true, ...result })
       } catch (error) { callback({ success: false, error: error.message }) }
@@ -2535,7 +2646,10 @@ app.prepare().then(async () => {
           values.description = data.description
         }
 
-        const id = await odooCreate('crm.lead', values)
+        // v7.20: Filter out any fields that don't exist on crm.lead in the user's
+        // Odoo version (e.g. whatsapp_number is from a custom module — may not exist).
+        const safeValues = await buildSafeValues('crm.lead', values)
+        const id = await odooCreate('crm.lead', safeValues)
         console.log(`[Odoo] ✓ Created crm.lead#${id} (type=${leadType})`)
 
         // Post each message to the chatter (so it appears in the message thread too)
@@ -2563,7 +2677,7 @@ app.prepare().then(async () => {
         }
 
         callback({ success: true, id, postedMessages })
-        io.of('/odoo').emit('odoo:record:created', { model: 'crm.lead', id, values })
+        io.of('/odoo').emit('odoo:record:created', { model: 'crm.lead', id, values: safeValues })
       } catch (error) {
         console.error(`[Odoo] Lead/Opportunity creation FAILED:`, error.message)
         callback({ success: false, error: error.message })
@@ -2629,10 +2743,12 @@ app.prepare().then(async () => {
           }
         }
 
-        const id = await odooCreate('project.task', values)
+        // v7.20: Filter out fields that don't exist on project.task in this Odoo.
+        const safeValues = await buildSafeValues('project.task', values)
+        const id = await odooCreate('project.task', safeValues)
         console.log(`[Odoo] ✓ Created project.task#${id}`)
         callback({ success: true, id })
-        io.of('/odoo').emit('odoo:record:created', { model: 'project.task', id, values })
+        io.of('/odoo').emit('odoo:record:created', { model: 'project.task', id, values: safeValues })
       } catch (error) {
         console.error(`[Odoo] project.task creation FAILED:`, error.message)
         // Return a helpful error message to the frontend

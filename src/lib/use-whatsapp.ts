@@ -201,7 +201,7 @@ export function useWhatsApp() {
             const next = [...prev]
             // Preserve the _isDeviceContact flag if the existing conv had it
             const existing = next[idx]
-            next[idx] = { ...data.conversation, _isDeviceContact: (existing as any)?._isDeviceContact }
+            next[idx] = { ...data.conversation, _isDeviceContact: existing?._isDeviceContact }
             return sortConversations(next)
           }
           return sortConversations([data.conversation, ...prev])

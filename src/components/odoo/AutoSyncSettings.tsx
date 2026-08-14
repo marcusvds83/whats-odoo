@@ -153,7 +153,7 @@ export function AutoSyncSettingsPanel({
               <div>
                 <p className="text-sm font-medium">Criar Lead</p>
                 <p className="text-xs text-muted-foreground">
-                  Cria um lead no CRM automaticamente para novas conversas
+                  Cria uma oportunidade no CRM automaticamente para novas conversas. <strong>Desativado por padrão</strong> — use o botão "Criar Oportunidade" no painel lateral para criar manualmente, levando o histórico da conversa para o chatter e para o campo Notes.
                 </p>
               </div>
             </div>

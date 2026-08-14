@@ -343,12 +343,9 @@ export function ConversationList({
         ) : (
           <ContactsTabContent
             contacts={contacts}
-            conversations={conversations}
             loading={contactsLoading}
             selectedJid={selectedJid}
             onSelect={onSelect}
-            onStartConversation={onStartConversation}
-            onConversationStarted={handleConversationStarted}
             hasSearchQuery={!!searchQuery.trim()}
             available={!!onGetContacts}
           />
@@ -517,81 +514,31 @@ function ConversationsTabContent({
 }
 
 // ========== Contacts tab content ==========
+// v7.20: Simplified back to v7.16 behavior — clicking a contact just calls
+// onSelect(contact.jid). The unified Conversas list (server-side) already
+// includes device contacts that don't have a conversation, so the user can
+// click any contact there to start chatting. The Contatos tab is a
+// searchable phonebook view of the same contacts.
+//
+// The v7.18 onStartConversation flow (with spinner + per-contact error
+// states) was over-engineered and broke when the Odoo mobile field search
+// failed. Reverting to the simple onSelect approach is more robust.
 
 function ContactsTabContent({
   contacts,
-  conversations,
   loading,
   selectedJid,
   onSelect,
-  onStartConversation,
-  onConversationStarted,
   hasSearchQuery,
   available,
 }: {
   contacts: DeviceContact[]
-  conversations: ConversationListProps['conversations']
   loading: boolean
   selectedJid: string | null
   onSelect: (jid: string) => void
-  onStartConversation?: (phone: string, name?: string) => Promise<{ success: boolean; jid?: string; error?: string }>
-  onConversationStarted?: (jid: string) => void
   hasSearchQuery: boolean
   available: boolean
 }) {
-  // Track which contact is currently being started as a conversation
-  const [startingPhone, setStartingPhone] = useState<string | null>(null)
-  const [errorPhone, setErrorPhone] = useState<string | null>(null)
-  const [errorMsg, setErrorMsg] = useState<string>('')
-
-  // Build a quick lookup of existing conversation phones (normalized digits)
-  // so we can skip the network round-trip for contacts that already have a chat.
-  const existingConvPhones = useMemo(() => {
-    const set = new Set<string>()
-    for (const c of conversations) {
-      if (c.phone) set.add(c.phone.replace(/\D/g, ''))
-    }
-    return set
-  }, [conversations])
-
-  const handleContactClick = async (contact: DeviceContact) => {
-    // If there's already a conversation for this phone, just select it directly
-    // — no need to call startConversation (avoids unnecessary onWhatsApp check).
-    const phoneDigits = (contact.phone || '').replace(/\D/g, '')
-    if (existingConvPhones.has(phoneDigits)) {
-      onSelect(contact.jid)
-      return
-    }
-
-    // Otherwise, start a new conversation (verifies number on WhatsApp, creates in memory)
-    if (!onStartConversation) {
-      // Fallback: if startConversation isn't wired, just try to select directly
-      onSelect(contact.jid)
-      return
-    }
-
-    setStartingPhone(contact.phone)
-    setErrorPhone(null)
-    try {
-      const result = await onStartConversation(contact.phone, contact.name)
-      if (result.success && result.jid) {
-        // Conversation created — navigate to it (parent switches tab + selects)
-        onConversationStarted?.(result.jid)
-      } else {
-        setErrorPhone(contact.phone)
-        setErrorMsg(result.error || 'Não foi possível iniciar a conversa')
-        // Clear error after 4 seconds
-        setTimeout(() => setErrorPhone(null), 4000)
-      }
-    } catch (err: any) {
-      setErrorPhone(contact.phone)
-      setErrorMsg(err?.message || 'Erro ao iniciar conversa')
-      setTimeout(() => setErrorPhone(null), 4000)
-    } finally {
-      setStartingPhone(null)
-    }
-  }
-
   if (!available) {
     return (
       <div className="flex flex-col items-center justify-center py-16 px-4">
@@ -638,22 +585,14 @@ function ContactsTabContent({
     <div className="py-1">
       {contacts.map((contact) => {
         const isSelected = selectedJid === contact.jid
-        const isStarting = startingPhone === contact.phone
-        const hasError = errorPhone === contact.phone
-        const phoneDigits = (contact.phone || '').replace(/\D/g, '')
-        const hasExistingChat = existingConvPhones.has(phoneDigits)
-
         return (
-          <div
+          <button
             key={contact.jid}
-            onClick={() => !isStarting && handleContactClick(contact)}
+            onClick={() => onSelect(contact.jid)}
             className={cn(
-              'group w-full flex items-center gap-3 px-4 py-3 text-left transition-colors duration-150',
+              'w-full flex items-center gap-3 px-4 py-3 text-left transition-colors duration-150',
               'hover:bg-muted/60 focus-visible:bg-muted/60 focus-visible:outline-none',
-              isSelected ? 'bg-primary/8 border-l-2 border-l-primary' : 'border-l-2 border-l-transparent',
-              isStarting && 'opacity-60 cursor-wait',
-              !isStarting && 'cursor-pointer',
-              hasError && 'bg-destructive/5'
+              isSelected ? 'bg-primary/8 border-l-2 border-l-primary' : 'border-l-2 border-l-transparent'
             )}
           >
             <Avatar className="size-12 shrink-0">
@@ -666,45 +605,15 @@ function ContactsTabContent({
             <div className="flex-1 min-w-0">
               <div className="flex items-center gap-2">
                 <span className="text-sm font-medium truncate">{contact.name}</span>
-                {hasExistingChat && (
-                  <Badge variant="outline" className="text-[9px] px-1 py-0 h-4 bg-emerald-50 text-emerald-700 border-emerald-200 shrink-0">
-                    <MessageCircle className="size-2.5 mr-0.5" />
-                    chat
-                  </Badge>
-                )}
               </div>
               <div className="flex items-center gap-1 mt-0.5">
-                {isStarting ? (
-                  <span className="text-xs text-primary flex items-center gap-1">
-                    <Loader2 className="size-3 animate-spin" />
-                    Iniciando conversa...
-                  </span>
-                ) : hasError ? (
-                  <span className="text-xs text-destructive flex items-center gap-1 truncate">
-                    {errorMsg}
-                  </span>
-                ) : (
-                  <>
-                    <Phone className="size-3 text-muted-foreground/60" />
-                    <span className="text-xs text-muted-foreground">
-                      +{contact.phone}
-                    </span>
-                  </>
-                )}
+                <Phone className="size-3 text-muted-foreground/60" />
+                <span className="text-xs text-muted-foreground">
+                  +{contact.phone}
+                </span>
               </div>
             </div>
-
-            {/* Action icon: shows what clicking will do */}
-            <div className="shrink-0">
-              {isStarting ? (
-                <Loader2 className="size-4 text-primary animate-spin" />
-              ) : hasExistingChat ? (
-                <MessageCircle className="size-4 text-muted-foreground/40 group-hover:text-muted-foreground/70" />
-              ) : (
-                <MessageCircle className="size-4 text-muted-foreground/40 group-hover:text-primary" />
-              )}
-            </div>
-          </div>
+          </button>
         )
       })}
     </div>

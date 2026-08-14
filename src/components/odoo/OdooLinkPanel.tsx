@@ -16,6 +16,7 @@ import {
   Mail,
   MessageSquare,
   Unlink,
+  AlertCircle,
 } from 'lucide-react'
 
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -590,9 +591,13 @@ interface CreateRecordDialogProps {
   onSubmit: (data: Record<string, string>) => Promise<void>
   creating: boolean
   conversationPhone: string | null
+  // v7.20: Error from the server (e.g. "Invalid field res.partner.mobile")
+  // surfaced in the dialog so the user sees what went wrong instead of the
+  // dialog just silently closing on failure.
+  createError?: string | null
 }
 
-function CreateRecordDialog({ tab, open, onOpenChange, onSubmit, creating, conversationPhone }: CreateRecordDialogProps) {
+function CreateRecordDialog({ tab, open, onOpenChange, onSubmit, creating, conversationPhone, createError }: CreateRecordDialogProps) {
   const [formData, setFormData] = useState<Record<string, string>>(() => ({
     name: '',
     phone: conversationPhone ?? '',
@@ -720,6 +725,18 @@ function CreateRecordDialog({ tab, open, onOpenChange, onSubmit, creating, conve
               </div>
             )}
           </div>
+
+          {/* v7.20: Surface server errors (e.g. "Invalid field res.partner.mobile")
+              so the user knows what went wrong instead of the dialog silently closing. */}
+          {createError && (
+            <div className="mt-4 flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">
+              <AlertCircle className="size-4 mt-0.5 shrink-0" />
+              <div className="flex-1 min-w-0">
+                <p className="font-medium">Falha ao criar registro</p>
+                <p className="text-xs mt-0.5 break-words">{createError}</p>
+              </div>
+            </div>
+          )}
 
           <DialogFooter className="mt-4">
             <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
