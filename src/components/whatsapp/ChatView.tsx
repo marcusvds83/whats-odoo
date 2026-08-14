@@ -14,6 +14,8 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
+import { MediaMessage } from '@/components/whatsapp/MediaMessage'
+import { EmojiPicker } from '@/components/whatsapp/EmojiPicker'
 import {
   Send,
   Phone,
@@ -33,6 +35,8 @@ import {
   Link2,
   Trash2,
   RefreshCw,
+  Mic,
+  Smile,
 } from 'lucide-react'
 
 interface ChatViewProps {
@@ -49,10 +53,17 @@ interface ChatViewProps {
     fromMe: boolean
     textContent: string | null
     mediaType: string | null
+    mediaUrl?: string | null
+    mediaBase64?: string | null
+    fileName?: string | null
+    mimeType?: string | null
+    mediaDuration?: number | null
     timestamp: string
     status: string
   }>
   onSendMessage: (jid: string, text: string) => Promise<boolean>
+  // v7.22: Send media (image/audio/video/document)
+  onSendMedia?: (jid: string, file: File, caption?: string) => Promise<{ success: boolean; error?: string }>
   onMarkRead: (jid: string) => void
   // New in v7.9: pull history from Odoo
   odooConnected?: boolean
@@ -128,6 +139,7 @@ export function ChatView({
   conversation,
   messages,
   onSendMessage,
+  onSendMedia,
   onMarkRead,
   odooConnected,
   odooLinkedRecords,
@@ -138,6 +150,7 @@ export function ChatView({
 }: ChatViewProps) {
   const [inputText, setInputText] = useState('')
   const [isSending, setIsSending] = useState(false)
+  const [isSendingMedia, setIsSendingMedia] = useState(false)
   const [showScrollButton, setShowScrollButton] = useState(false)
   const [isPullingHistory, setIsPullingHistory] = useState(false)
   const [pullResult, setPullResult] = useState<{ added: number; skipped: number } | null>(null)
@@ -146,6 +159,9 @@ export function ChatView({
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const scrollViewportRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
+  const imageInputRef = useRef<HTMLInputElement>(null)
+  const audioInputRef = useRef<HTMLInputElement>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
 
   const scrollToBottom = useCallback((behavior: ScrollBehavior = 'smooth') => {
     messagesEndRef.current?.scrollIntoView({ behavior })
@@ -267,6 +283,59 @@ export function ChatView({
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() }
+  }
+
+  // v7.22: Handle media file selection (image/audio/document)
+  const handleFileSelect = async (file: File, caption?: string) => {
+    if (!conversation || !onSendMedia || isSendingMedia) return
+    setIsSendingMedia(true)
+    try {
+      const result = await onSendMedia(conversation.jid, file, caption)
+      if (!result.success) {
+        console.error('[ChatView] Failed to send media:', result.error)
+        // Could add a toast here, but the existing code uses console only
+      }
+    } finally {
+      setIsSendingMedia(false)
+    }
+  }
+
+  const handleImageSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (file) handleFileSelect(file)
+    // Reset input so same file can be selected again
+    e.target.value = ''
+  }
+
+  const handleAudioSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (file) handleFileSelect(file)
+    e.target.value = ''
+  }
+
+  const handleDocumentSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (file) handleFileSelect(file)
+    e.target.value = ''
+  }
+
+  // Insert emoji at cursor position in the input
+  const handleEmojiSelect = (emoji: string) => {
+    const input = inputRef.current
+    if (!input) {
+      setInputText(prev => prev + emoji)
+      return
+    }
+    const start = input.selectionStart ?? inputText.length
+    const end = input.selectionEnd ?? inputText.length
+    const next = inputText.slice(0, start) + emoji + inputText.slice(end)
+    setInputText(next)
+    // Restore cursor position after emoji
+    requestAnimationFrame(() => {
+      const pos = start + emoji.length
+      input.focus()
+      input.setSelectionRange(pos, pos)
+    })
   }
 
   const displayName = conversation?.name || conversation?.pushName || conversation?.phone || conversation?.jid?.split('@')[0] || ''
@@ -474,17 +543,20 @@ export function ChatView({
                         message.fromMe ? 'bg-emerald-600 text-white rounded-br-md' : 'bg-muted rounded-bl-md',
                         isConsecutive && (message.fromMe ? 'rounded-br-md' : 'rounded-bl-md')
                       )}>
+                        {/* v7.22: Render actual media (image/audio/video/document) inline */}
                         {message.mediaType && message.mediaType !== '' && (
-                          <div className={cn('flex items-center gap-2 mb-1 px-2 py-1.5 rounded-lg text-xs', message.fromMe ? 'bg-emerald-500/50' : 'bg-background/50')}>
-                            {getMediaIcon(message.mediaType)}
-                            <span className="font-medium">{getMediaLabel(message.mediaType)}</span>
-                          </div>
+                          <MediaMessage
+                            mediaType={message.mediaType}
+                            mediaUrl={message.mediaUrl}
+                            mediaBase64={message.mediaBase64}
+                            fileName={message.fileName}
+                            mimeType={message.mimeType}
+                            mediaDuration={message.mediaDuration}
+                            fromMe={message.fromMe}
+                          />
                         )}
                         {message.textContent && (
                           <p className="text-[13px] leading-relaxed whitespace-pre-wrap break-words">{message.textContent}</p>
-                        )}
-                        {message.mediaType && !message.textContent && (
-                          <p className="text-[13px] leading-relaxed italic opacity-70">{getMediaLabel(message.mediaType)}</p>
                         )}
                         <div className={cn('flex items-center gap-1 mt-0.5', message.fromMe ? 'justify-end' : 'justify-start')}>
                           <span className={cn('text-[10px]', message.fromMe ? 'text-white/60' : 'text-muted-foreground')}>
@@ -509,10 +581,98 @@ export function ChatView({
         )}
       </div>
 
+      {/* Hidden file inputs for media uploads */}
+      <input
+        ref={imageInputRef}
+        type="file"
+        accept="image/*"
+        className="hidden"
+        onChange={handleImageSelect}
+      />
+      <input
+        ref={audioInputRef}
+        type="file"
+        accept="audio/*"
+        className="hidden"
+        onChange={handleAudioSelect}
+      />
+      <input
+        ref={fileInputRef}
+        type="file"
+        className="hidden"
+        onChange={handleDocumentSelect}
+      />
+
       {/* Input — fixed */}
       <Separator />
-      <div className="shrink-0 px-4 py-3 bg-background">
-        <div className="flex items-center gap-2">
+      <div className="shrink-0 px-3 py-2 bg-background">
+        <div className="flex items-center gap-1">
+          {/* v7.22: Image upload button */}
+          {onSendMedia && (
+            <TooltipProvider delayDuration={300}>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="size-9 shrink-0 rounded-full text-muted-foreground hover:text-foreground"
+                    disabled={isSendingMedia}
+                    onClick={() => imageInputRef.current?.click()}
+                  >
+                    {isSendingMedia ? <Loader2 className="size-5 animate-spin" /> : <ImageIcon className="size-5" />}
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="top">Enviar imagem</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          )}
+
+          {/* v7.22: Audio upload button */}
+          {onSendMedia && (
+            <TooltipProvider delayDuration={300}>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="size-9 shrink-0 rounded-full text-muted-foreground hover:text-foreground"
+                    disabled={isSendingMedia}
+                    onClick={() => audioInputRef.current?.click()}
+                  >
+                    <Mic className="size-5" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="top">Enviar áudio</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          )}
+
+          {/* v7.22: Document upload button */}
+          {onSendMedia && (
+            <TooltipProvider delayDuration={300}>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="size-9 shrink-0 rounded-full text-muted-foreground hover:text-foreground"
+                    disabled={isSendingMedia}
+                    onClick={() => fileInputRef.current?.click()}
+                  >
+                    <Paperclip className="size-5" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="top">Enviar documento</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          )}
+
+          {/* v7.22: Emoji picker */}
+          <EmojiPicker onEmojiSelect={handleEmojiSelect} />
+
           <Input ref={inputRef} placeholder="Digite uma mensagem..." className="flex-1 h-10 text-sm" value={inputText} onChange={(e) => setInputText(e.target.value)} onKeyDown={handleKeyDown} disabled={isSending} />
           <Button size="icon" className="size-10 shrink-0 rounded-full bg-emerald-600 hover:bg-emerald-700 text-white" onClick={handleSend} disabled={!inputText.trim() || isSending}>
             {isSending ? <span className="size-4 border-2 border-white/30 border-t-white rounded-full animate-spin" /> : <Send className="size-4" />}

@@ -27,6 +27,17 @@ export interface WhatsAppMessage {
   fromMe: boolean
   textContent: string | null
   mediaType: string | null
+  // v7.22: Media payload — for images, audio, video, documents
+  // - mediaUrl: served URL (e.g. /media/<fileId>.jpg) for display in the browser
+  // - mediaBase64: optional base64 data URL (for small media / fallback)
+  // - fileName: original filename for documents
+  // - mimeType: MIME type for proper rendering
+  // - duration: audio/video duration in seconds (for display)
+  mediaUrl?: string | null
+  mediaBase64?: string | null
+  fileName?: string | null
+  mimeType?: string | null
+  mediaDuration?: number | null
   timestamp: string
   status: string
 }

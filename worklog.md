@@ -823,3 +823,37 @@ Stage Summary:
 - The Odoo chatter is now genuinely the durable conversation database — exactly
   what the user asked for: "ele vai ser nosso banco de dados".
 - Version: 7.21.0 — ready to push to origin/main for Render deploy.
+
+---
+Task ID: v7.22
+Agent: Main Agent
+Task: Implement media features (audio/image/emojis) + multi-user login + admin panel
+
+Work Log (Phase 1 — Media):
+- Added emoji-data.ts with 7 categories of WhatsApp-style emojis (~700+ emojis)
+- Created EmojiPicker.tsx with search, recent emojis (localStorage), category tabs
+- Added MediaMessage.tsx with inline image renderer, audio player (play/pause/seek), video player, document download link
+- Updated types.ts: WhatsAppMessage now has mediaUrl, mediaBase64, fileName, mimeType, mediaDuration
+- Updated use-whatsapp.ts: added sendMedia(jid, file, caption) using base64 transport
+- Updated ChatView.tsx:
+  - Renders MediaMessage for any message with mediaType
+  - Added hidden file inputs for image/audio/document upload
+  - Added toolbar buttons (image, mic, paperclip, emoji) before text input
+  - Emoji picker inserts at cursor position
+- Updated page.tsx to pass onSendMedia down to ChatView
+- Updated server.js:
+  - Added /media/<filename> HTTP route to serve stored media files
+  - Added MEDIA_DIR = DATA_DIR/media
+  - In messages.upsert handler: download media via baileys.downloadMediaMessage and save to MEDIA_DIR
+  - Extract metadata (mimetype, filename, duration) from imageMessage/audioMessage/etc
+  - Added socket handler 'whatsapp:send-media-base64': decodes base64, saves file, calls waSocket.sendMessage with appropriate type (image/audio/video/document)
+  - Audio is sent as PTT (push-to-talk) so it plays inline in WhatsApp
+- Added @radix-ui/react-popover dependency (was missing for EmojiPicker)
+- Build passes: npx next build ✓
+
+Stage Summary:
+- v7.22 Phase 1 (Media) complete — audio/image/video/document now render inline with player
+- Emoji picker with 700+ emojis in 7 categories + search + recent
+- File upload buttons (image/audio/document) added to chat input bar
+- All changes are additive — existing functionality preserved
+- Next phase: multi-user auth + admin panel (separate commit)

@@ -328,6 +328,39 @@ export function useWhatsApp() {
     })
   }, [])
 
+  // v7.22: Send media (image, audio, video, document)
+  // Accepts a File object — the hook converts to base64 and sends via socket.
+  // The server uses Baileys to upload the media to WhatsApp and stores it
+  // locally for display.
+  const sendMedia = useCallback((jid: string, file: File, caption?: string): Promise<{ success: boolean; error?: string }> => {
+    return new Promise((resolve) => {
+      // Convert file to base64
+      const reader = new FileReader()
+      reader.onload = () => {
+        const dataUrl = reader.result as string
+        // Strip the "data:<mime>;base64," prefix
+        const base64 = dataUrl.split(',')[1]
+        const mimeType = file.type || 'application/octet-stream'
+
+        // Determine media type from mime type
+        let type: 'image' | 'audio' | 'video' | 'document' = 'document'
+        if (mimeType.startsWith('image/')) type = 'image'
+        else if (mimeType.startsWith('audio/')) type = 'audio'
+        else if (mimeType.startsWith('video/')) type = 'video'
+
+        socketRef.current?.emit(
+          'whatsapp:send-media-base64',
+          { jid, type, base64, mimeType, fileName: file.name, caption },
+          (response: { success: boolean; error?: string }) => {
+            resolve(response)
+          }
+        )
+      }
+      reader.onerror = () => resolve({ success: false, error: 'Failed to read file' })
+      reader.readAsDataURL(file)
+    })
+  }, [])
+
   const markRead = useCallback((jid: string) => {
     socketRef.current?.emit('whatsapp:mark-read', { jid }, () => {})
   }, [])
@@ -496,6 +529,7 @@ export function useWhatsApp() {
     requestQR,
     loadMessages,
     sendMessage,
+    sendMedia,
     markRead,
     disconnect,
     getProfilePic,

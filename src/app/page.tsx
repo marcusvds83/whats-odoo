@@ -216,6 +216,7 @@ function ConversationsView({
   odooStatus,
   onSelectConversation,
   onSendMessage,
+  onSendMedia,
   onMarkRead,
   onToggleOdooPanel,
   onLinkConversation,
@@ -247,6 +248,7 @@ function ConversationsView({
   odooStatus: { connected: boolean }
   onSelectConversation: (jid: string) => void
   onSendMessage: (jid: string, text: string) => Promise<boolean>
+  onSendMedia?: (jid: string, file: File, caption?: string) => Promise<{ success: boolean; error?: string }>
   onMarkRead: (jid: string) => void
   onToggleOdooPanel: (show: boolean) => void
   onLinkConversation: any
@@ -311,6 +313,7 @@ function ConversationsView({
               conversation={selectedConversation}
               messages={currentMessages}
               onSendMessage={onSendMessage}
+              onSendMedia={onSendMedia}
               onMarkRead={onMarkRead}
               odooConnected={odooStatus.connected}
               odooLinkedRecords={linkedOdooRecords}
@@ -592,6 +595,7 @@ export default function HomePage() {
             odooStatus={odoo.status}
             onSelectConversation={handleSelectConversation}
             onSendMessage={wa.sendMessage}
+            onSendMedia={wa.sendMedia}
             onMarkRead={wa.markRead}
             onToggleOdooPanel={setShowOdooPanel}
             onLinkConversation={odoo.linkConversation}

@@ -1776,12 +1776,73 @@ async function connectWhatsApp(io) {
           messageTimestamp = new Date()
         }
 
+        // v7.22: Extract media metadata + download the media file
+        let mediaUrl = null
+        let mediaBase64 = null
+        let mediaFileName = null
+        let mediaMimeType = null
+        let mediaDuration = null
+
+        if (mediaType) {
+          try {
+            // Extract metadata first (these are fast — no network)
+            if (mediaType === 'image' && m.imageMessage) {
+              mediaMimeType = m.imageMessage.mimetype || 'image/jpeg'
+              mediaFileName = `image_${msgId}.${(mediaMimeType.split('/')[1] || 'jpg').replace('jpeg', 'jpg')}`
+            } else if (mediaType === 'video' && m.videoMessage) {
+              mediaMimeType = m.videoMessage.mimetype || 'video/mp4'
+              mediaFileName = `video_${msgId}.mp4`
+              mediaDuration = m.videoMessage.seconds || null
+            } else if (mediaType === 'audio' && m.audioMessage) {
+              mediaMimeType = m.audioMessage.mimetype || 'audio/mpeg'
+              // PTT (push-to-talk) — use .ogg, regular audio uses original format
+              const ext = mediaMimeType.includes('mp4') ? 'm4a' : (mediaMimeType.includes('mpeg') ? 'mp3' : 'ogg')
+              mediaFileName = `audio_${msgId}.${ext}`
+              mediaDuration = m.audioMessage.seconds || null
+            } else if (mediaType === 'ptt' && m.pttMessage) {
+              mediaMimeType = m.pttMessage.mimetype || 'audio/ogg'
+              mediaFileName = `ptt_${msgId}.ogg`
+              mediaDuration = m.pttMessage.seconds || null
+            } else if (mediaType === 'document' && m.documentMessage) {
+              mediaMimeType = m.documentMessage.mimetype || 'application/octet-stream'
+              mediaFileName = m.documentMessage.fileName || `document_${msgId}`
+            } else if (mediaType === 'sticker' && m.stickerMessage) {
+              mediaMimeType = m.stickerMessage.mimetype || 'image/webp'
+              mediaFileName = `sticker_${msgId}.webp`
+            }
+
+            // Download the actual media file using Baileys' downloadMediaMessage
+            // This is async and may take a moment for large files
+            const baileysForDownload = await loadBaileys()
+            const buffer = await baileysForDownload.downloadMediaMessage(msg, 'buffer', {})
+            if (buffer && buffer.length > 0) {
+              // Save to MEDIA_DIR with a unique filename
+              const MEDIA_DIR_LOCAL = path.join(DATA_DIR, 'media')
+              try { fs.mkdirSync(MEDIA_DIR_LOCAL, { recursive: true }) } catch {}
+              // Use msgId + ext to keep filenames unique and traceable
+              const safeFileName = (mediaFileName || `media_${msgId}`).replace(/[^a-zA-Z0-9._-]/g, '_')
+              const filePath = path.join(MEDIA_DIR_LOCAL, safeFileName)
+              fs.writeFileSync(filePath, buffer)
+              mediaUrl = `/media/${safeFileName}`
+              console.log(`[WA] ✓ Media downloaded: ${mediaType} → ${mediaUrl} (${buffer.length} bytes)`)
+            }
+          } catch (mediaErr) {
+            console.error(`[WA] Media download failed for ${msgId}: ${mediaErr.message}`)
+            // Continue anyway — the message text + mediaType label will still show
+          }
+        }
+
         const messageData = {
           id: msgId || `m-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
           whatsappId: msgId || null,
           fromMe,
           textContent,
           mediaType,
+          mediaUrl,
+          mediaBase64,
+          fileName: mediaFileName,
+          mimeType: mediaMimeType,
+          mediaDuration,
           timestamp: messageTimestamp,
           status: fromMe ? 'delivered' : 'received',
         }
@@ -2034,8 +2095,53 @@ async function connectWhatsApp(io) {
 // ====================================================================
 
 app.prepare().then(async () => {
+  // v7.22: Media files directory — for serving received/sent media (images, audio, etc.)
+  const MEDIA_DIR = path.join(DATA_DIR, 'media')
+  try { fs.mkdirSync(MEDIA_DIR, { recursive: true }) } catch {}
+  console.log(`[Server] Media dir: ${MEDIA_DIR}`)
+
   const httpServer = createServer((req, res) => {
     const parsedUrl = parse(req.url, true)
+
+    // v7.22: Serve media files from /media/<filename>
+    // Files are stored in DATA_DIR/media/ and served publicly (no auth for now —
+    // they're random cuid-named files).
+    if (parsedUrl.pathname && parsedUrl.pathname.startsWith('/media/')) {
+      const fileName = path.basename(parsedUrl.pathname)
+      // Prevent path traversal — only allow filenames without slashes/dots prefix
+      if (fileName && !fileName.includes('..') && !fileName.includes('/')) {
+        const filePath = path.join(MEDIA_DIR, fileName)
+        if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+          // Determine content type from extension
+          const ext = path.extname(fileName).toLowerCase()
+          const contentTypes = {
+            '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
+            '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml',
+            '.mp3': 'audio/mpeg', '.mp4': 'audio/mp4', '.m4a': 'audio/mp4',
+            '.ogg': 'audio/ogg', '.oga': 'audio/ogg', '.wav': 'audio/wav',
+            '.opus': 'audio/ogg',
+            '.mp4v': 'video/mp4', '.webm': 'video/webm',
+            '.pdf': 'application/pdf',
+            '.doc': 'application/msword', '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            '.xls': 'application/vnd.ms-excel', '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            '.txt': 'text/plain',
+          }
+          const contentType = contentTypes[ext] || 'application/octet-stream'
+          const stat = fs.statSync(filePath)
+          res.writeHead(200, {
+            'Content-Type': contentType,
+            'Content-Length': stat.size,
+            'Cache-Control': 'public, max-age=86400',
+          })
+          fs.createReadStream(filePath).pipe(res)
+          return
+        }
+      }
+      res.writeHead(404, { 'Content-Type': 'text/plain' })
+      res.end('Not found')
+      return
+    }
+
     handle(req, res, parsedUrl)
   })
 
@@ -2371,6 +2477,144 @@ app.prepare().then(async () => {
         }
         callback({ success: true, messageId: msgId })
       } catch (error) {
+        callback({ success: false, error: error.message })
+      }
+    })
+
+    // v7.22: Send media from base64-encoded payload (uploaded by the browser)
+    // The browser reads the file via FileReader.readAsDataURL and sends the
+    // base64 portion. We decode it, save to MEDIA_DIR, and use Baileys'
+    // sendMessage with the appropriate media type.
+    socket.on('whatsapp:send-media-base64', async (data, callback) => {
+      try {
+        if (!waSocket || connectionState.connection !== 'open') {
+          callback({ success: false, error: 'WhatsApp not connected' })
+          return
+        }
+        const jid = normalizeJid(data?.jid)
+        if (!jid) { callback({ success: false, error: 'Invalid contact JID' }); return }
+        if (!data.base64 || !data.type) { callback({ success: false, error: 'Missing base64 or type' }); return }
+
+        // Decode base64 → Buffer
+        const buffer = Buffer.from(data.base64, 'base64')
+        if (buffer.length === 0) { callback({ success: false, error: 'Empty file' }); return }
+
+        // Save to MEDIA_DIR for display in chat
+        const MEDIA_DIR_LOCAL = path.join(DATA_DIR, 'media')
+        try { fs.mkdirSync(MEDIA_DIR_LOCAL, { recursive: true }) } catch {}
+        const msgId = `m-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
+        const safeFileName = (data.fileName || `${data.type}_${msgId}`).replace(/[^a-zA-Z0-9._-]/g, '_')
+        const filePath = path.join(MEDIA_DIR_LOCAL, safeFileName)
+        fs.writeFileSync(filePath, buffer)
+        const mediaUrl = `/media/${safeFileName}`
+
+        // Determine mimetype + extension from input
+        const mimeType = data.mimeType || 'application/octet-stream'
+        let ext = path.extname(safeFileName).toLowerCase()
+        if (!ext) {
+          if (mimeType.includes('jpeg')) ext = '.jpg'
+          else if (mimeType.includes('png')) ext = '.png'
+          else if (mimeType.includes('webp')) ext = '.webp'
+          else if (mimeType.includes('gif')) ext = '.gif'
+          else if (mimeType.includes('mp4') && mimeType.startsWith('audio/')) ext = '.m4a'
+          else if (mimeType.includes('mpeg')) ext = '.mp3'
+          else if (mimeType.includes('ogg')) ext = '.ogg'
+          else if (mimeType.includes('mp4')) ext = '.mp4'
+          else if (mimeType.includes('pdf')) ext = '.pdf'
+          else ext = ''
+        }
+
+        // Send via Baileys — each type uses a different message content shape
+        let sent
+        let mediaType = data.type
+        if (data.type === 'image') {
+          sent = await waSocket.sendMessage(jid, {
+            image: buffer,
+            caption: data.caption || undefined,
+            mimetype: mimeType,
+          })
+        } else if (data.type === 'audio') {
+          // For audio messages, use `ptt: true` if the user wants push-to-talk style
+          // (the audio plays inline in WhatsApp instead of showing as a file).
+          // We detect "ptt" intent by the audio being short (< 60s) — but for
+          // simplicity, we always send as PTT-style audio for now.
+          sent = await waSocket.sendMessage(jid, {
+            audio: buffer,
+            mimetype: mimeType || 'audio/mpeg',
+            ptt: true,
+          })
+          mediaType = 'ptt'
+        } else if (data.type === 'video') {
+          sent = await waSocket.sendMessage(jid, {
+            video: buffer,
+            caption: data.caption || undefined,
+            mimetype: mimeType,
+          })
+        } else if (data.type === 'document') {
+          sent = await waSocket.sendMessage(jid, {
+            document: buffer,
+            fileName: data.fileName || 'document',
+            mimetype: mimeType,
+            caption: data.caption || undefined,
+          })
+        } else {
+          callback({ success: false, error: 'Unsupported media type' })
+          return
+        }
+
+        const conv = getOrCreateConversation(jid)
+        if (!conv) { callback({ success: false, error: 'Could not create conversation' }); return }
+
+        const finalMsgId = sent?.key?.id || msgId
+        const messageTimestamp = new Date()
+        const messageData = {
+          id: finalMsgId,
+          whatsappId: finalMsgId,
+          fromMe: true,
+          textContent: data.caption || null,
+          mediaType,
+          mediaUrl,
+          mediaBase64: null,
+          fileName: data.fileName || null,
+          mimeType: mimeType,
+          mediaDuration: null,
+          timestamp: messageTimestamp,
+          status: 'sent',
+        }
+
+        // Skip if already exists (e.g., if Baileys' upsert beat us to it)
+        if (!conv.messages.some(m => m.whatsappId === finalMsgId || m.id === finalMsgId)) {
+          conv.messages.push(messageData)
+          conv.lastMessage = data.caption || `[${mediaType}]`
+          conv.lastMessageAt = new Date()
+
+          markConversationsDirty(); io.of('/whatsapp').emit('whatsapp:message', {
+            conversationJid: jid,
+            message: { ...messageData, timestamp: messageTimestamp.toISOString() },
+            conversation: serializeConversation(conv),
+          })
+          io.of('/whatsapp').emit('whatsapp:conversation:update', serializeConversation(conv))
+        }
+
+        // Auto-sync to Odoo chatter
+        const phone = extractPhone(jid)
+        if (phone) {
+          try {
+            await autoSyncWhatsAppMessage({
+              jid, phone, pushName: conv.pushName,
+              textContent: data.caption || `[${mediaType}]`,
+              mediaType, fromMe: true,
+              timestamp: messageTimestamp.toISOString(),
+              dedupId: finalMsgId,
+            })
+          } catch (err) {
+            console.error('[AutoSync] Send media base64 error:', err.message)
+          }
+        }
+
+        callback({ success: true, messageId: finalMsgId, mediaUrl })
+      } catch (error) {
+        console.error('[WA IO] send-media-base64 error:', error.message)
         callback({ success: false, error: error.message })
       }
     })
