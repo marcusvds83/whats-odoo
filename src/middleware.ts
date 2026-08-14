@@ -1,5 +1,6 @@
 // ====================================================================
-// v7.25: Next.js middleware — protects all routes except public ones.
+// v7.27: Next.js middleware — protects all routes except public ones.
+// v7.27: Added debug logging to trace cookie presence + JWT verification.
 // v7.25: /admin is now a public admin login page (separate from /login).
 // v7.25: /api/auth/setup-admin is the emergency admin recovery endpoint.
 // Reads the whats_odoo_session cookie, verifies the JWT, and redirects
@@ -46,11 +47,13 @@ export async function middleware(req: NextRequest) {
     return NextResponse.next()
   }
 
-  // Check session cookie
+  // v7.27: debug logging — trace cookie presence on protected routes
   const cookieName = getSessionCookieName()
   const token = req.cookies.get(cookieName)?.value
+  const ts = new Date().toISOString()
 
   if (!token) {
+    console.warn(`[${ts}][middleware] NO COOKIE on ${pathname} — cookie names present: [${req.cookies.getAll().map(c => c.name).join(', ')}]`)
     // For API routes, return 401 JSON
     if (pathname.startsWith('/api/')) {
       return NextResponse.json({ success: false, error: 'Não autenticado' }, { status: 401 })
@@ -64,12 +67,18 @@ export async function middleware(req: NextRequest) {
   const session = await verifySession(token)
   if (!session) {
     // Invalid/expired token
+    console.warn(`[${ts}][middleware] INVALID/EXPIRED JWT on ${pathname} — tokenLen=${token.length}`)
     if (pathname.startsWith('/api/')) {
       return NextResponse.json({ success: false, error: 'Sessão expirada' }, { status: 401 })
     }
     const loginUrl = new URL('/login', req.url)
     loginUrl.searchParams.set('redirect', pathname)
     return NextResponse.redirect(loginUrl)
+  }
+
+  // v7.27: successful auth — log only /api/auth/me hits (to keep logs clean)
+  if (pathname === '/api/auth/me') {
+    console.log(`[${ts}][middleware] OK /api/auth/me — session.userId=${session.userId} role=${session.role}`)
   }
 
   // Admin-only API routes

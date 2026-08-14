@@ -61,6 +61,7 @@ function AdminLoginForm() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
+        credentials: 'same-origin',  // v7.27: ensure cookies are sent/received
       })
       const data = await res.json()
 
@@ -208,7 +209,7 @@ function AdminLoginForm() {
         </Card>
 
         <p className="text-xs text-slate-500 text-center mt-4">
-          v7.26 • Área administrativa
+          v7.27 • Área administrativa
         </p>
       </div>
     </div>

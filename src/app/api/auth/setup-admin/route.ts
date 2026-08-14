@@ -26,7 +26,7 @@
 
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
-import { hashPassword, signSession, buildSessionCookieHeader } from '@/lib/auth'
+import { hashPassword, signSession, setSessionCookie } from '@/lib/auth'
 import type { SessionPayload } from '@/lib/auth'
 
 export const runtime = 'nodejs'
@@ -121,7 +121,8 @@ export async function POST(req: NextRequest) {
         ? 'Conta existente promovida para admin e senha redefinida.'
         : 'Novo admin criado.',
     })
-    response.headers.set('Set-Cookie', buildSessionCookieHeader(token))
+    // v7.27: use response.cookies.set() for reliable cookie persistence on Next.js 16
+    setSessionCookie(response, token)
     return response
   } catch (err: any) {
     console.error(`[${ts}][setup-admin] error:`, err.message)

@@ -1,15 +1,18 @@
 // ====================================================================
-// v7.26: POST /api/auth/login
+// v7.27: POST /api/auth/login
 // Body: { email, password, requireAdmin?: boolean }
 //   - requireAdmin=true: only allow users with role='admin' (used by /admin page)
 // Returns: { success, user?: { id, email, name, role } }
 // Sets the whats_odoo_session cookie on success.
-// v7.26: Added detailed server-side logging for debugging login failures.
+// v7.27 FIX: Use response.cookies.set() instead of response.headers.set()
+//   ('Set-Cookie', ...) — the old approach silently dropped the cookie
+//   on Next.js 16, causing login to succeed server-side but the session
+//   never persisted in the browser.
 // ====================================================================
 
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
-import { verifyPassword, signSession, buildSessionCookieHeader } from '@/lib/auth'
+import { verifyPassword, signSession, setSessionCookie } from '@/lib/auth'
 import type { SessionPayload } from '@/lib/auth'
 
 export const runtime = 'nodejs'
@@ -68,7 +71,7 @@ export async function POST(req: NextRequest) {
     }
     const token = await signSession(payload)
 
-    console.log(`[${ts}][login] SUCCESS: issued session for email="${email}" role=${user.role}`)
+    console.log(`[${ts}][login] SUCCESS: issued session for email="${email}" role=${user.role} tokenLen=${token.length}`)
 
     const response = NextResponse.json({
       success: true,
@@ -79,7 +82,9 @@ export async function POST(req: NextRequest) {
         role: user.role,
       },
     })
-    response.headers.set('Set-Cookie', buildSessionCookieHeader(token))
+    // v7.27: use response.cookies.set() — the Next.js 16 recommended API.
+    setSessionCookie(response, token)
+    console.log(`[${ts}][login] Cookie set via response.cookies.set() — name=whats_odoo_session secure=${process.env.NODE_ENV === 'production'}`)
     return response
   } catch (err: any) {
     console.error(`[${ts}][login] ERROR:`, err.message, err.stack)

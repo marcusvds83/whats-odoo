@@ -51,6 +51,7 @@ function LoginForm() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
+        credentials: 'same-origin',  // v7.27: ensure cookies are sent/received
       })
       const data = await res.json()
 
@@ -206,7 +207,7 @@ export default function LoginPage() {
         </Suspense>
 
         <p className="text-xs text-muted-foreground text-center mt-4">
-          v7.26 • Multi-usuário
+          v7.27 • Multi-usuário
         </p>
       </div>
     </div>
