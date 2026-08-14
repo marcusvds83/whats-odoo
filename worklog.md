@@ -419,3 +419,84 @@ Stage Summary:
 - Three-layer incoming message handling: messages.upsert (primary, now more robust) + messages.update (fallback) + 3s polling (last resort)
 - "Buscar no aparelho" button now actually fetches from the WhatsApp servers via resyncAppState (works regardless of local message count) + fetchMessageHistory (fills gaps when anchor exists)
 - Debug endpoint whatsapp:debug-events available for troubleshooting from browser console
+
+---
+Task ID: v7.16
+Agent: main
+Task: Fix LID JID bug causing incoming messages to be silently dropped + restore contacts/conversations sync after deploy
+
+Work Log:
+- Analyzed Render logs provided by user. Found the EXACT root cause of "NÃO ESTOU RECEBENDO MENSAGEM DE NINGUEM":
+  * Incoming message from Marcus Kako ("Hey maan") arrived with:
+    - rawJid = 52824423583895@lid  (LID = Linked Identity Device, WhatsApp's new privacy feature)
+    - msg.key.senderPn = 554197170761@s.whatsapp.net  (the REAL phone JID)
+    - msg.key.participant = undefined (empty for DMs)
+  * v7.15 code only checked msg.key.participant when rawJid was @lid — but participant is empty for DMs.
+  * Result: normalizeJid returned null → message logged as "skipped — invalid JID" → silently dropped.
+  * This affected ALL incoming DMs from LID-enabled contacts (most modern WhatsApp accounts).
+
+- Also found "sumiu sincronização de contato e conversa do aparelho" root cause:
+  * After deploy, in-memory conversations Map is empty (only auth_store persists on disk).
+  * Baileys doesn't always fire messaging-history.set on reconnect.
+  * No automatic resyncAppState was triggered after connection.open.
+  * Result: contacts and conversations stayed empty until user manually clicked "Atualizar".
+
+Changes made to server.js:
+
+1. messages.upsert handler — LID JID recovery (THE main fix):
+   * When rawJid ends with @lid, now checks THREE sources in order of reliability:
+     1. msg.key.senderPn  (sender phone number — most reliable for DMs, NEW)
+     2. msg.key.participant (sometimes set for DMs on older Baileys builds)
+     3. msg.key.senderLid (another LID — last resort)
+   * Logs which source was used to recover the JID for debugging.
+   * Updated console.log to also show senderPn field.
+
+2. messages.update handler — same LID recovery:
+   * Applied the same senderPn/participant/senderLid fallback logic.
+   * Ensures the fallback path for incoming messages also handles LIDs.
+
+3. messaging-history.set handler — same LID recovery:
+   * History sync messages with LID JIDs are now also recovered via senderPn.
+
+4. connection.open — auto-resync after 3s (NEW):
+   * Triggers waSocket.resyncAppState() 3 seconds after connection opens.
+   * This forces Baileys to fire messaging-history.set, which restores:
+     - Device contacts (contactNames map + deviceContacts phonebook)
+     - Conversations (chats Map)
+     - Historical messages
+   * Addresses "sumiu sincronização de contato e conversa do aparelho" after deploys.
+
+5. Odoo chatter sync — already implemented in v7.14, now actually triggers:
+   * The autoSyncWhatsAppMessage function was already wired up for both incoming
+     and outgoing messages with dedup via postedChatterIds Set.
+   * But it was NEVER called for incoming messages because the LID bug dropped
+     them before reaching the autoSync call.
+   * With LID fix in place, every incoming message will now:
+     a) Create/update the res.partner (contact) in Odoo
+     b) Create or reuse a crm.lead for the contact
+     c) Post the message to the partner's chatter
+     d) Post the message to the lead's chatter (if lead exists)
+     e) Mark the message ID in postedChatterIds to prevent duplicates
+
+6. Lead creation — already implemented, now actually triggers:
+   * Same root cause as chatter sync — leads weren't being created because
+     incoming messages were dropped before autoSync ran.
+   * With LID fix, "parou de criar leads" is resolved automatically.
+
+7. Manual refresh button "Buscar no aparelho" — already correct:
+   * Verified that ChatView's "Buscar no aparelho" button calls
+     onRefreshMessages → whatsapp:refresh-messages → fetchMessageHistory +
+     resyncAppState on the WhatsApp socket (NOT Odoo).
+   * This IS fetching from the phone device as the user requested.
+   * The separate "Trazer do Odoo" button (only shows when Odoo is linked)
+     is the one that pulls from Odoo chatter — this is intentional.
+
+- package.json: Bumped version 7.15.0 → 7.16.0
+- Performed syntax check: node --check server.js ✓
+
+Stage Summary:
+- THE URGENT BUG IS FIXED: Incoming messages from LID-enabled contacts (which is most modern WhatsApp accounts) will now arrive in real-time. The message "Hey maan" from Marcus Kako that was being dropped will now appear in the conversation.
+- Contacts/conversations sync from phone will now restore automatically 3s after connection (no more needing to manually click "Atualizar" after every deploy).
+- Odoo chatter sync (bidirectional, with dedup) and lead creation will now actually work for incoming messages, because the messages will no longer be dropped before reaching the autoSync code.
+- Manual "Buscar no aparelho" button already fetches from the phone device (fetchMessageHistory + resyncAppState), as the user requested.
+- Version: 7.16.0

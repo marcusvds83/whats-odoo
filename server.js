@@ -835,6 +835,28 @@ async function connectWhatsApp(io) {
       } catch {}
 
       io.of('/whatsapp').emit('whatsapp:conversations', getSortedConversations())
+
+      // v7.16: Auto-resync app state 3s after connection to restore
+      // contacts/conversations that were lost from memory after a deploy
+      // or process restart. Baileys doesn't always fire messaging-history.set
+      // on reconnect, so we force it. This addresses "sumiu sincronização
+      // de contato e conversa do aparelho" after deploys.
+      setTimeout(() => {
+        try {
+          if (waSocket && connectionState.connection === 'open' &&
+              typeof waSocket.resyncAppState === 'function') {
+            console.log('[WA] Auto-resyncing app state after connection (restore contacts/conversations)')
+            waSocket.resyncAppState(
+              ['critical_block', 'critical_unblock_low', 'regular_high', 'regular_low', 'regular'],
+              false
+            ).then(() => console.log('[WA] Auto-resync complete')).catch(err =>
+              console.error('[WA] Auto-resync error:', err.message)
+            )
+          }
+        } catch (err) {
+          console.error('[WA] Auto-resync trigger failed:', err.message)
+        }
+      }, 3000)
     }
   })
 
@@ -887,7 +909,13 @@ async function connectWhatsApp(io) {
     let messagesProcessed = 0
     for (const msg of messages) {
       if (!msg.key) continue
-      const jid = normalizeJid(msg.key.remoteJid)
+      // v7.16: LID recovery for history sync messages
+      const rawJid = msg.key.remoteJid
+      let jid = normalizeJid(rawJid)
+      if (!jid && rawJid && rawJid.endsWith('@lid')) {
+        const candidate = msg.key.senderPn || msg.key.participant || msg.key.senderLid
+        if (candidate) jid = normalizeJid(candidate)
+      }
       if (!jid) continue
 
       const fromMe = msg.key.fromMe || false
@@ -979,20 +1007,32 @@ async function connectWhatsApp(io) {
 
         // *** CRITICAL: Normalize the JID ***
         // Baileys may deliver messages with the device suffix (e.g. 5511999888777:7@s.whatsapp.net).
-        // v7.15: Also try `msg.key.participant` if remoteJid is a LID (@lid).
+        // v7.16: WhatsApp now uses LID (Linked Identity Device) JIDs (e.g. 52824423583895@lid)
+        // for privacy — the actual phone JID is in `msg.key.senderPn` ("sender phone number").
+        // Older code only checked `msg.key.participant` which is empty for DMs, causing ALL
+        // incoming DMs from LID-enabled contacts to be silently dropped.
         const rawJid = msg.key.remoteJid
         let jid = normalizeJid(rawJid)
-        if (!jid && rawJid && rawJid.endsWith('@lid') && msg.key.participant) {
-          // LID format — DMs sometimes come through with @lid on newer Baileys builds.
-          // The participant field usually holds the canonical phone JID.
-          jid = normalizeJid(msg.key.participant)
-          if (jid) console.log(`[WA] Recovered JID from participant: ${jid} (rawLid=${rawJid})`)
+        if (!jid && rawJid && rawJid.endsWith('@lid')) {
+          // LID format — try multiple sources for the canonical phone JID,
+          // in order of reliability:
+          //   1. msg.key.senderPn  — sender phone number (set in DM LID contexts)
+          //   2. msg.key.participant — sometimes set for DMs on older Baileys builds
+          //   3. msg.key.senderLid — another LID (rarely helpful, last resort)
+          const candidate = msg.key.senderPn || msg.key.participant || msg.key.senderLid
+          if (candidate) {
+            jid = normalizeJid(candidate)
+            if (jid) {
+              const src = msg.key.senderPn ? 'senderPn' : (msg.key.participant ? 'participant' : 'senderLid')
+              console.log(`[WA] Recovered JID from ${src}: ${jid} (rawLid=${rawJid})`)
+            }
+          }
         }
 
         const fromMe = msg.key.fromMe || false
         const pushName = msg.pushName || null
 
-        console.log(`[WA] upsert msg: rawJid=${rawJid} → normalized=${jid} fromMe=${fromMe} id=${msg.key.id} participant=${msg.key.participant || 'n/a'} pushName=${pushName || 'n/a'}`)
+        console.log(`[WA] upsert msg: rawJid=${rawJid} → normalized=${jid} fromMe=${fromMe} id=${msg.key.id} senderPn=${msg.key.senderPn || 'n/a'} participant=${msg.key.participant || 'n/a'} pushName=${pushName || 'n/a'}`)
 
         if (rawJid === 'status@broadcast') {
           console.log(`[WA] upsert msg skipped — status broadcast`)
@@ -1173,7 +1213,14 @@ async function connectWhatsApp(io) {
     try {
       for (const update of updates || []) {
         if (!update.key || !update.key.id) continue
-        const jid = normalizeJid(update.key.remoteJid)
+        // v7.16: Same LID recovery logic as messages.upsert — when remoteJid is a
+        // @lid, the phone JID is in `senderPn` (or `participant` as fallback).
+        const rawJid = update.key.remoteJid
+        let jid = normalizeJid(rawJid)
+        if (!jid && rawJid && rawJid.endsWith('@lid')) {
+          const candidate = update.key.senderPn || update.key.participant || update.key.senderLid
+          if (candidate) jid = normalizeJid(candidate)
+        }
         if (!jid) continue
         const conv = conversations.get(jid)
         if (!conv) continue
