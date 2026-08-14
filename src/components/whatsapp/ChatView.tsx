@@ -32,6 +32,7 @@ import {
   Loader2,
   Link2,
   Trash2,
+  RefreshCw,
 } from 'lucide-react'
 
 interface ChatViewProps {
@@ -67,6 +68,8 @@ interface ChatViewProps {
   onInjectHistory?: (jid: string, messages: any[]) => Promise<{ success: boolean; added?: number; skipped?: number; error?: string }>
   // New in v7.12: delete conversation
   onDeleteConversation?: (jid: string) => void
+  // New in v7.14: manual refresh messages button
+  onRefreshMessages?: (jid: string) => Promise<{ success: boolean; count?: number; serverFetchAttempted?: boolean; error?: string }>
 }
 
 function formatMessageTime(dateStr: string): string {
@@ -131,12 +134,15 @@ export function ChatView({
   onFetchOdooHistory,
   onInjectHistory,
   onDeleteConversation,
+  onRefreshMessages,
 }: ChatViewProps) {
   const [inputText, setInputText] = useState('')
   const [isSending, setIsSending] = useState(false)
   const [showScrollButton, setShowScrollButton] = useState(false)
   const [isPullingHistory, setIsPullingHistory] = useState(false)
   const [pullResult, setPullResult] = useState<{ added: number; skipped: number } | null>(null)
+  const [isRefreshing, setIsRefreshing] = useState(false)
+  const [refreshResult, setRefreshResult] = useState<{ count: number; serverFetchAttempted: boolean } | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const scrollViewportRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
@@ -154,6 +160,7 @@ export function ChatView({
   // Reset pull result when conversation changes
   useEffect(() => {
     setPullResult(null)
+    setRefreshResult(null)
   }, [conversation?.jid])
 
   // Pull history from Odoo — used when the user comes back the next day
@@ -199,6 +206,32 @@ export function ChatView({
       setIsPullingHistory(false)
     }
   }, [conversation, odooLinkedRecords, onFetchOdooHistory, onInjectHistory])
+
+  // v7.14: Manual refresh messages — fetches latest messages from server cache
+  // AND triggers a fetchMessageHistory call in the background.
+  const handleRefreshMessages = useCallback(async () => {
+    if (!conversation || !onRefreshMessages) return
+    setIsRefreshing(true)
+    setRefreshResult(null)
+    try {
+      const result = await onRefreshMessages(conversation.jid)
+      if (result.success) {
+        setRefreshResult({
+          count: result.count || 0,
+          serverFetchAttempted: !!result.serverFetchAttempted,
+        })
+        setTimeout(() => setRefreshResult(null), 4000)
+      } else {
+        setRefreshResult({ count: 0, serverFetchAttempted: false })
+        setTimeout(() => setRefreshResult(null), 3000)
+      }
+    } catch (err) {
+      setRefreshResult({ count: 0, serverFetchAttempted: false })
+      setTimeout(() => setRefreshResult(null), 3000)
+    } finally {
+      setIsRefreshing(false)
+    }
+  }, [conversation, onRefreshMessages])
 
   // Track scroll position for scroll-to-bottom button
   useEffect(() => {
@@ -307,6 +340,52 @@ export function ChatView({
                 </TooltipContent>
               </Tooltip>
             </TooltipProvider>
+          )}
+
+          {/* v7.14: Refresh messages button — fetches latest messages from server cache */}
+          {onRefreshMessages && (
+            <TooltipProvider delayDuration={300}>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-8 gap-1.5 shrink-0 text-xs"
+                    disabled={isRefreshing}
+                    onClick={handleRefreshMessages}
+                  >
+                    {isRefreshing ? (
+                      <Loader2 className="size-3.5 animate-spin" />
+                    ) : (
+                      <RefreshCw className="size-3.5" />
+                    )}
+                    <span className="hidden sm:inline">
+                      {isRefreshing ? 'Atualizando...' : 'Atualizar'}
+                    </span>
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom" className="max-w-xs">
+                  <p>Busca as mensagens mais recentes desta conversa.</p>
+                  <p className="text-xs text-muted-foreground mt-1">
+                    Caso uma mensagem não tenha chegado automaticamente, clique aqui para forçar a busca.
+                  </p>
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          )}
+
+          {/* v7.14: Refresh result feedback */}
+          {refreshResult && (
+            <div className={cn(
+              'flex items-center gap-1.5 px-2 py-1 rounded-md text-[11px] shrink-0',
+              refreshResult.count > 0
+                ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                : 'bg-muted text-muted-foreground border'
+            )}>
+              <CheckCheck className="size-3" />
+              <span>{refreshResult.count} msgs</span>
+              {refreshResult.serverFetchAttempted && <span className="text-[9px] text-muted-foreground ml-1">(servidor)</span>}
+            </div>
           )}
 
           {/* Pull result feedback */}

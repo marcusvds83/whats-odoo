@@ -173,7 +173,7 @@ export function AutoSyncSettingsPanel({
               <div>
                 <p className="text-sm font-medium">Registrar Mensagens</p>
                 <p className="text-xs text-muted-foreground">
-                  Posta mensagens WhatsApp no chatter do Lead/Contato no Odoo
+                  Posta no chatter do contato (e do lead aberto) cada mensagem enviada/recebida. Nunca duplica.
                 </p>
               </div>
             </div>

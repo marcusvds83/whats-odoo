@@ -312,3 +312,72 @@ Stage Summary:
 - Delete conversation now also removes the contact from the Contacts tab (was only removing from Conversations)
 - All JIDs are now normalized to canonical form `<digits>@s.whatsapp.net` at every entry point (Baileys events and socket handlers), preventing future JID-mismatch bugs.
 - Version: 7.13.0
+
+---
+Task ID: FIX-V714
+Agent: main
+Task: Fix incoming messages (URGENT), add manual refresh button in chat, bidirectional Odoo chatter sync with dedup, real-time polling fallback
+
+Work Log:
+- URGENT ISSUE: User reported "tá indo mas não tá chegando" — outgoing messages work, incoming messages do NOT appear in chat view, even after v7.13 fixes. Also reported "parou de criar leads" — leads stopped being created (root cause: incoming messages not arriving → autoSync not triggered).
+- ROOT CAUSE HYPOTHESIS: Either `messages.upsert` event is not firing for incoming messages in some Baileys edge cases, OR the frontend socket handler is missing the event. To make this robust, I added THREE complementary mechanisms:
+
+1. **Auto-polling fallback (frontend)**: Every 5 seconds, the frontend polls the server's local message cache for the active conversation. If `messages.upsert` doesn't fire but the message IS in the server cache, polling will catch it. Uses `whatsapp:get-messages` (lightweight — just reads local Map).
+
+2. **`messages.update` fallback path (server)**: Some Baileys versions deliver certain incoming messages via `messages.update` (with a `message` field) instead of `messages.upsert`. Added inline processing of these as new messages — extracts text/media, stores in conversation, emits `whatsapp:message`, and triggers autoSync. Done inline (no re-emit) to avoid recursion.
+
+3. **Manual "Atualizar" button in chat view**: User can click to force a refresh. Calls new `whatsapp:refresh-messages` endpoint which:
+   - Returns local cached messages immediately
+   - Triggers `waSocket.fetchMessageHistory(50, anchorKey, anchorTs)` in the background (best-effort, non-blocking)
+   - After 2s, re-emits `whatsapp:messages:refreshed` with any newly-fetched messages
+   - Frontend merges these into the active chat (dedup by id)
+
+4. **Verbose logging in `messages.upsert`**: Added `>>>>>> messages.upsert EVENT <<<<<<` markers and logs `participant`, `pushName` for every message. If event doesn't fire at all, the user can confirm in server logs.
+
+- CHATTER SYNC REWRITE (autoSyncWhatsAppMessage):
+  * Added `postedChatterIds` Set to track which WhatsApp message IDs have been posted to Odoo chatter. Dedup key: `${jid}|${whatsappId}` (or content-based fallback).
+  * Now posts to chatter for BOTH incoming AND outgoing messages (was only incoming before — that's why chatter was empty for sent messages).
+  * For OUTGOING messages: looks up any ACTIVE lead by partner_id and posts to that lead's chatter too (was: nothing posted for outgoing).
+  * For INCOMING messages: ensures a lead exists (searches by `partner_id + type=lead + active=true`, no longer requires the `[WhatsApp]` prefix in name — so it reuses existing leads instead of creating duplicates).
+  * Added `phoneToActiveLeadCache` to cache the lead lookup for outgoing messages (avoid Odoo search on every send).
+  * Only adds to `postedChatterIds` AFTER a successful chatter post — guarantees no duplicates even if posting fails halfway.
+  * Capped `postedChatterIds` at 5000 entries (FIFO eviction) to prevent memory leak.
+  * Activity creation is still only for NEW leads (preserved from v7.13).
+  * Clear `postedChatterIds` and `phoneToActiveLeadCache` on logout/disconnect.
+
+- Added `dedupId` parameter to all autoSyncWhatsAppMessage call sites (messages.upsert, whatsapp:send-message, whatsapp:send-media, messages.update fallback) — passes the WhatsApp message ID so chatter dedup is reliable.
+
+- Added `whatsapp:debug-jid` endpoint — returns server-side state for a JID (hasConversation, messageCount, lastMessage, connectionState, totalConversations, totalPostedChatter). Useful for troubleshooting.
+
+- Frontend hook changes (use-whatsapp.ts):
+  * Extracted `normalizeJidForCompare` to module level (was inline in `whatsapp:message` handler) — now reused by `whatsapp:messages:refreshed` handler.
+  * Added `whatsapp:messages:refreshed` event listener — merges newly-fetched messages into active chat (dedup by id, sorted by timestamp).
+  * Added `refreshMessages(jid)` action — calls `whatsapp:refresh-messages` endpoint, replaces active chat messages on response.
+  * Added auto-polling effect: every 5s for the active conversation, calls `whatsapp:get-messages`. Only updates state if new messages found (avoids unnecessary re-renders). Cleared on conversation change.
+
+- ChatView.tsx changes:
+  * Added `RefreshCw` icon import.
+  * Added `onRefreshMessages` prop.
+  * Added `isRefreshing` + `refreshResult` state.
+  * Added `handleRefreshMessages` callback.
+  * Added "Atualizar" button in header (between "Trazer do Odoo" and "Excluir").
+  * Reset `refreshResult` on conversation change.
+
+- page.tsx changes:
+  * Added `onRefreshMessages` to ConversationsView props (type + destructuring).
+  * Passed `onRefreshMessages={wa.refreshMessages}` from HomePage.
+  * Passed `onRefreshMessages={onRefreshMessages}` from ConversationsView to ChatView.
+
+- AutoSyncSettings.tsx: Updated "Registrar Mensagens" description to "Posta no chatter do contato (e do lead aberto) cada mensagem enviada/recebida. Nunca duplica." (reflects new bidirectional + dedup behavior).
+
+- Version bump: 7.13.0 → 7.14.0 in package.json, start.sh banner, server.js header, page.tsx sidebar label.
+
+- Build test: `npx next build` ✓ succeeded.
+- Syntax check: `node --check server.js` ✓ succeeded.
+
+Stage Summary:
+- **Incoming messages now have THREE complementary paths**: (1) `messages.upsert` event (primary, with verbose logging), (2) `messages.update` fallback (catches edge cases where Baileys delivers via update instead of upsert), (3) frontend polling every 5s (catches any case where the message IS in server cache but the socket event didn't fire). Plus a manual "Atualizar" button for the user to force a refresh.
+- **Odoo chatter is now bidirectional**: every sent AND received message is posted to the partner's chatter. If there's an active lead for that partner, the message is also posted to the lead's chatter.
+- **Never duplicates**: `postedChatterIds` Set tracks every posted WhatsApp message ID. Dedup is checked FIRST (before any Odoo call). Set is capped at 5000 entries with FIFO eviction.
+- **Leads are no longer duplicated**: Search now uses `partner_id + type=lead + active=true` (no longer requires the `[WhatsApp]` prefix in name), so existing leads are reused.
+- Version: 7.14.0

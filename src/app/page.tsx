@@ -235,6 +235,7 @@ function ConversationsView({
   onCreateOdooContact,
   onDeleteConversation,
   onRefreshData,
+  onRefreshMessages,
 }: {
   conversations: any[]
   selectedJid: string | null
@@ -265,6 +266,7 @@ function ConversationsView({
   onCreateOdooContact?: (data: { name: string; phone?: string; mobile?: string; whatsapp?: string; email?: string }) => Promise<{ success: boolean; id?: number; error?: string }>
   onDeleteConversation?: (jid: string) => Promise<{ success: boolean; error?: string }>
   onRefreshData?: () => Promise<{ success: boolean; chatsFetched?: number; contactsFetched?: number; error?: string }>
+  onRefreshMessages?: (jid: string) => Promise<{ success: boolean; count?: number; serverFetchAttempted?: boolean; error?: string }>
 }) {
   // Build conversation history payload (for Odoo lead creation)
   const conversationHistory = useMemo(() => {
@@ -312,6 +314,7 @@ function ConversationsView({
               odooLinkedRecords={linkedOdooRecords}
               onFetchOdooHistory={onFetchOdooHistory}
               onInjectHistory={onInjectHistory}
+              onRefreshMessages={onRefreshMessages}
               onDeleteConversation={onDeleteConversation ? (jid) => {
                 // The actual delete is handled by the parent (wa.deleteConversation),
                 // here we just trigger the same confirmation flow as the list.
@@ -466,7 +469,7 @@ export default function HomePage() {
             {!sidebarCollapsed && (
               <div className="hidden lg:block min-w-0">
                 <p className="text-sm font-bold leading-tight truncate">Whats-Odoo</p>
-                <p className="text-[10px] text-muted-foreground">v7.13 Middleware</p>
+                <p className="text-[10px] text-muted-foreground">v7.14 Middleware</p>
               </div>
             )}
           </div>
@@ -556,6 +559,7 @@ export default function HomePage() {
             onCreateOdooContact={odoo.createContact}
             onDeleteConversation={wa.deleteConversation}
             onRefreshData={wa.refreshData}
+            onRefreshMessages={wa.refreshMessages}
           />
           </div>
         )}

@@ -1,5 +1,5 @@
 // ====================================================================
-// Whats-Odoo v7.13 — SINGLE-PROCESS SERVER
+// Whats-Odoo v7.14 — SINGLE-PROCESS SERVER
 // Everything in one process: Next.js + WhatsApp (Baileys) + Odoo (XML-RPC)
 // Designed for Render 512MB RAM
 // ====================================================================
@@ -60,6 +60,15 @@ let autoSyncSettings = {
 
 const modelFieldsCache = new Map()
 const phoneToPartnerCache = new Map()
+
+// Track which WhatsApp message IDs have already been posted to Odoo chatter.
+// Key format: `${jid}|${whatsappId}` — used to PREVENT DUPLICATES in chatter.
+// v7.14: We must NEVER duplicate what was posted to Odoo chatter.
+const postedChatterIds = new Set()
+
+// Track active lead IDs by phone — refreshed on every auto-sync.
+// Used so we can post messages to the lead's chatter too (in addition to partner).
+const phoneToActiveLeadCache = new Map()
 
 function makeXmlRpcClient(p) {
   const url = new URL(odooConfig.url)
@@ -212,13 +221,25 @@ async function autoSyncWhatsAppMessage(data) {
   const result = {
     partnerId: null, leadId: null, mailMessageId: null, activityId: null,
     created: { partner: false, lead: false }, errors: [],
+    chatterPosted: false, chatterLeadPosted: false,
   }
 
   if (!autoSyncSettings.enabled || !odooConfig.uid) return result
 
-  console.log(`[AutoSync] Processing message from ${data.phone}`)
+  // v7.14: NEVER duplicate chatter posts — check dedup set FIRST.
+  // We dedup by whatsappId (or fallback id) so the same message is never posted twice.
+  const dedupKey = data.dedupId
+    ? `${data.jid}|${data.dedupId}`
+    : `${data.jid}|${data.fromMe ? 'out' : 'in'}|${data.timestamp}|${(data.textContent || '').slice(0, 50)}`
+  if (postedChatterIds.has(dedupKey)) {
+    console.log(`[AutoSync] Skipping — already posted to chatter: ${dedupKey}`)
+    return result
+  }
+
+  console.log(`[AutoSync] Processing message from ${data.phone} (fromMe=${data.fromMe})`)
 
   try {
+    // ===== Step 1: Always ensure partner exists (for both sent AND received) =====
     if (autoSyncSettings.autoCreateContact) {
       const contactName = data.pushName || `WhatsApp ${data.phone}`
       const domain = ['|', ['phone', 'ilike', data.phone], ['mobile', 'ilike', data.phone]]
@@ -236,21 +257,27 @@ async function autoSyncWhatsAppMessage(data) {
       else phoneToPartnerCache.set(data.phone, { partnerId: partnerResult.id, leadId: null, leadCreated: false })
     }
 
+    // ===== Step 2: For INCOMING messages, ensure a lead exists =====
+    // v7.14: Only create leads for incoming messages (new prospect reaching out).
     if (autoSyncSettings.autoCreateLead && !data.fromMe && result.partnerId) {
       const cached = phoneToPartnerCache.get(data.phone)
       if (cached && cached.leadId && cached.leadCreated) {
         result.leadId = cached.leadId
       } else {
+        // Search for an EXISTING open lead for this partner (any name, not just our prefix)
+        // — this prevents creating duplicate leads if one already exists.
         const existingLeads = await odooSearch('crm.lead', [
           ['partner_id', '=', result.partnerId],
-          ['name', 'like', autoSyncSettings.leadPrefix],
           ['type', '=', 'lead'],
-        ], ['id', 'name'], 1)
+          ['active', '=', true],
+        ], ['id', 'name', 'stage_id'], 1)
 
         if (existingLeads && existingLeads.length > 0) {
           result.leadId = existingLeads[0].id
           if (cached) { cached.leadId = existingLeads[0].id; cached.leadCreated = true }
+          else phoneToPartnerCache.set(data.phone, { partnerId: result.partnerId, leadId: existingLeads[0].id, leadCreated: true })
         } else {
+          // No existing lead — create one with the WhatsApp prefix
           const leadName = `${autoSyncSettings.leadPrefix}${data.pushName || data.phone}`
           const leadValues = {
             name: leadName, type: 'lead', partner_id: result.partnerId, phone: data.phone,
@@ -269,28 +296,86 @@ async function autoSyncWhatsAppMessage(data) {
       }
     }
 
-    if (autoSyncSettings.autoPostMessages && !data.fromMe) {
-      const targetModel = result.leadId ? 'crm.lead' : (result.partnerId ? 'res.partner' : null)
-      const targetId = result.leadId || result.partnerId
-      if (targetModel && targetId) {
-        const direction = data.fromMe ? 'Enviada' : 'Recebida'
-        const mediaLabel = data.mediaType ? ` [${data.mediaType}]` : ''
-        const msgBody = data.textContent
-          ? `<p><strong>📱 WhatsApp ${direction}:</strong>${mediaLabel}</p><p>${escapeHtml(data.textContent)}</p>`
-          : `<p><strong>📱 WhatsApp ${direction}:</strong>${mediaLabel} [Mídia]</p>`
+    // ===== Step 2.5: For OUTGOING messages, find an active lead by phone (if any) =====
+    // v7.14: When user sends a message, if there's an open lead for this contact,
+    // we also want to post to that lead's chatter.
+    if (data.fromMe && result.partnerId) {
+      // Check cache first
+      let cachedLeadId = phoneToActiveLeadCache.get(data.phone)
+      if (!cachedLeadId) {
+        const cached = phoneToPartnerCache.get(data.phone)
+        if (cached && cached.leadId && cached.leadCreated) {
+          cachedLeadId = cached.leadId
+        } else {
+          // Search for any active lead for this partner
+          const existingLeads = await odooSearch('crm.lead', [
+            ['partner_id', '=', result.partnerId],
+            ['type', '=', 'lead'],
+            ['active', '=', true],
+          ], ['id'], 1)
+          if (existingLeads && existingLeads.length > 0) {
+            cachedLeadId = existingLeads[0].id
+            if (cached) { cached.leadId = cachedLeadId; cached.leadCreated = true }
+          }
+        }
+        if (cachedLeadId) {
+          phoneToActiveLeadCache.set(data.phone, cachedLeadId)
+          result.leadId = cachedLeadId
+        }
+      } else {
+        result.leadId = cachedLeadId
+      }
+    }
+
+    // ===== Step 3: ALWAYS post to chatter (incoming AND outgoing) =====
+    // v7.14: User requested "Atualizar o chatter no contato à cada mensagem enviada/recebida"
+    // We post to: (a) partner chatter ALWAYS, (b) lead chatter if there's an open lead.
+    if (autoSyncSettings.autoPostMessages && result.partnerId) {
+      const direction = data.fromMe ? 'Enviada' : 'Recebida'
+      const mediaLabel = data.mediaType ? ` [${data.mediaType}]` : ''
+      const tsLabel = `(${data.timestamp})`
+      const msgBody = data.textContent
+        ? `<p><strong>📱 WhatsApp ${direction}:</strong>${mediaLabel} ${tsLabel}</p><p>${escapeHtml(data.textContent)}</p>`
+        : `<p><strong>📱 WhatsApp ${direction}:</strong>${mediaLabel} ${tsLabel} [Mídia]</p>`
+
+      // (a) Always post to partner chatter
+      try {
+        result.mailMessageId = await odooPostMessage('res.partner', result.partnerId, msgBody)
+        result.chatterPosted = true
+        console.log(`[AutoSync] ✓ Posted to partner ${result.partnerId} chatter: ${direction}`)
+      } catch (error) {
+        result.errors.push(`Failed to post to partner chatter: ${error.message}`)
+      }
+
+      // (b) If there's an open lead, ALSO post to lead chatter (but only once per message)
+      if (result.leadId) {
         try {
-          result.mailMessageId = await odooPostMessage(targetModel, targetId, msgBody)
+          await odooPostMessage('crm.lead', result.leadId, msgBody)
+          result.chatterLeadPosted = true
+          console.log(`[AutoSync] ✓ Posted to lead ${result.leadId} chatter: ${direction}`)
         } catch (error) {
-          result.errors.push(`Failed to post message: ${error.message}`)
+          result.errors.push(`Failed to post to lead chatter: ${error.message}`)
         }
       }
     }
 
+    // ===== Step 4: Create activity ONLY for new leads =====
     if (autoSyncSettings.autoCreateActivity && result.created.lead && result.leadId) {
       try {
         result.activityId = await odooCreateActivity('crm.lead', result.leadId, 'Nova mensagem WhatsApp', `Contato ${data.pushName || data.phone} iniciou uma conversa via WhatsApp.\n\nMensagem: ${data.textContent || '[Mídia]'}`)
       } catch (error) {
         result.errors.push(`Failed to create activity: ${error.message}`)
+      }
+    }
+
+    // ===== Step 5: Mark this message as posted (for dedup) =====
+    // Only mark if at least one chatter post succeeded
+    if (result.chatterPosted || result.chatterLeadPosted) {
+      postedChatterIds.add(dedupKey)
+      // Cap the set size to prevent memory leak (keep last 5000 entries)
+      if (postedChatterIds.size > 5000) {
+        const firstKey = postedChatterIds.values().next().value
+        postedChatterIds.delete(firstKey)
       }
     }
   } catch (error) {
@@ -674,6 +759,8 @@ async function connectWhatsApp(io) {
         conversations.clear()
         contactNames.clear()
         deviceContacts.clear()
+        postedChatterIds.clear()
+        phoneToActiveLeadCache.clear()
         io.of('/whatsapp').emit('whatsapp:conversations', [])
       }
 
@@ -861,7 +948,7 @@ async function connectWhatsApp(io) {
 
   waSocket.ev.on('messages.upsert', async ({ messages, type }) => {
     // type can be 'notify' (new message) or 'append' (history sync)
-    console.log(`[WA] messages.upsert: ${messages?.length || 0} msgs (type=${type || 'n/a'})`)
+    console.log(`[WA] >>>>>> messages.upsert EVENT: ${messages?.length || 0} msgs (type=${type || 'n/a'}) <<<<<<`)
     for (const msg of messages || []) {
       if (!msg.key) {
         console.log('[WA] upsert msg skipped — no key')
@@ -876,9 +963,12 @@ async function connectWhatsApp(io) {
       const fromMe = msg.key.fromMe || false
       const pushName = msg.pushName || null
 
-      console.log(`[WA] upsert msg: rawJid=${rawJid} → normalized=${jid} fromMe=${fromMe} id=${msg.key.id}`)
+      console.log(`[WA] upsert msg: rawJid=${rawJid} → normalized=${jid} fromMe=${fromMe} id=${msg.key.id} participant=${msg.key.participant || 'n/a'} pushName=${pushName || 'n/a'}`)
 
-      if (rawJid === 'status@broadcast') continue
+      if (rawJid === 'status@broadcast') {
+        console.log(`[WA] upsert msg skipped — status broadcast`)
+        continue
+      }
       if (!jid) {
         console.log(`[WA] upsert msg skipped — invalid JID: ${rawJid}`)
         continue
@@ -999,6 +1089,7 @@ async function connectWhatsApp(io) {
         autoSyncWhatsAppMessage({
           jid, phone, pushName: conv.pushName, textContent, mediaType, fromMe,
           timestamp: messageTimestamp.toISOString(),
+          dedupId: msgId,  // v7.14: dedup key for chatter
         }).then(result => {
           if (result.partnerId || result.leadId) {
             io.of('/whatsapp').emit('whatsapp:odoo-sync', {
@@ -1013,6 +1104,9 @@ async function connectWhatsApp(io) {
   })
 
   // Handle message status updates (sent → delivered → read)
+  // v7.14: ALSO used as a fallback to capture incoming messages that might
+  // come through `messages.update` instead of `messages.upsert` in some
+  // Baileys edge cases (e.g. when receiving from a new device).
   waSocket.ev.on('messages.update', async (updates) => {
     try {
       for (const update of updates || []) {
@@ -1023,6 +1117,73 @@ async function connectWhatsApp(io) {
         if (!conv) continue
 
         const existing = conv.messages.find(m => m.whatsappId === update.key.id || m.id === update.key.id)
+
+        // v7.14: If the message doesn't exist locally AND the update has a
+        // message body, treat this as a new incoming message (fallback path).
+        // This catches the edge case where `messages.upsert` doesn't fire.
+        if (!existing && update.message) {
+          console.log(`[WA] messages.update: found NEW message not in upsert — id=${update.key.id} jid=${jid}`)
+          // Process it inline (do NOT re-emit to avoid recursion)
+          try {
+            const m = update.message
+            const textContent =
+              m.conversation ||
+              m.extendedTextMessage?.text ||
+              m.imageMessage?.caption ||
+              m.videoMessage?.caption ||
+              m.documentMessage?.caption || null
+            let mediaType = null
+            if (m.imageMessage) mediaType = 'image'
+            else if (m.videoMessage) mediaType = 'video'
+            else if (m.audioMessage) mediaType = 'audio'
+            else if (m.pttMessage) mediaType = 'ptt'
+            else if (m.documentMessage) mediaType = 'document'
+            else if (m.stickerMessage) mediaType = 'sticker'
+            if (!textContent && !mediaType) continue
+
+            const fromMe = update.key.fromMe || false
+            const msgId = update.key.id
+            if (conv.messages.some(mm => mm.whatsappId === msgId || mm.id === msgId)) continue
+
+            let ts
+            try {
+              const tsv = typeof update.messageTimestamp === 'number'
+                ? update.messageTimestamp
+                : (update.messageTimestamp?.low || update.messageTimestamp || Math.floor(Date.now() / 1000))
+              ts = new Date(tsv * 1000)
+              if (isNaN(ts.getTime())) ts = new Date()
+            } catch { ts = new Date() }
+
+            const messageData = {
+              id: msgId, whatsappId: msgId, fromMe, textContent, mediaType,
+              timestamp: ts, status: fromMe ? 'delivered' : 'received',
+            }
+            conv.messages.push(messageData)
+            conv.lastMessage = textContent || (mediaType ? `[${mediaType}]` : '')
+            conv.lastMessageAt = new Date()
+            if (!fromMe) conv.unreadCount++
+            console.log(`[WA] ✓ (via update) New message stored in ${jid} fromMe=${fromMe}`)
+
+            io.of('/whatsapp').emit('whatsapp:message', {
+              conversationJid: jid,
+              message: { ...messageData, timestamp: ts.toISOString() },
+              conversation: serializeConversation(conv),
+            })
+            io.of('/whatsapp').emit('whatsapp:conversation:update', serializeConversation(conv))
+
+            const phone = extractPhone(jid)
+            if (phone) {
+              autoSyncWhatsAppMessage({
+                jid, phone, pushName: conv.pushName, textContent, mediaType, fromMe,
+                timestamp: ts.toISOString(), dedupId: msgId,
+              }).catch(err => console.error('[AutoSync] Error:', err.message))
+            }
+          } catch (err) {
+            console.error('[WA] fallback message processing failed:', err.message)
+          }
+          continue
+        }
+
         if (!existing) continue
 
         let newStatus = existing.status
@@ -1179,6 +1340,112 @@ app.prepare().then(async () => {
       callback({ messages })
     })
 
+    // ===== v7.14: Manual refresh messages for a conversation =====
+    // Called by the "Atualizar" button in the chat view OR by the auto-polling
+    // mechanism. Re-emits the local conversation's messages to the requesting
+    // client. If Baileys has a `fetchMessageHistory` method and we have a recent
+    // message to anchor to, also tries to fetch the latest messages from the
+    // WhatsApp servers (best-effort, non-blocking).
+    socket.on('whatsapp:refresh-messages', async (data, callback) => {
+      try {
+        const jid = normalizeJid(data?.jid)
+        if (!jid) {
+          callback({ success: false, error: 'Invalid JID', messages: [] })
+          return
+        }
+        const conv = conversations.get(jid)
+        if (!conv) {
+          callback({ success: false, error: 'Conversation not found', messages: [] })
+          return
+        }
+
+        console.log(`[WA] Refresh messages requested for ${jid} (local count: ${conv.messages.length})`)
+
+        // Best-effort: try to fetch the latest message history from WhatsApp servers.
+        // This is non-blocking — we still return the local messages immediately.
+        // Baileys' fetchMessageHistory requires an "anchor" message key + timestamp.
+        // We use the most recent local message as the anchor. If there are no local
+        // messages, we skip the server fetch (it would need an anchor anyway).
+        let serverFetchAttempted = false
+        let serverFetchOk = false
+        if (waSocket && connectionState.connection === 'open' && typeof waSocket.fetchMessageHistory === 'function' && conv.messages.length > 0) {
+          serverFetchAttempted = true
+          try {
+            const lastMsg = conv.messages[conv.messages.length - 1]
+            const anchorKey = {
+              remoteJid: jid,
+              fromMe: lastMsg.fromMe,
+              id: lastMsg.whatsappId || lastMsg.id,
+            }
+            const anchorTs = lastMsg.timestamp instanceof Date
+              ? Math.floor(lastMsg.timestamp.getTime() / 1000)
+              : Math.floor(new Date(lastMsg.timestamp).getTime() / 1000)
+            // Fire-and-forget — the result will come back via messaging-history.set / messages.upsert
+            waSocket.fetchMessageHistory(50, anchorKey, anchorTs)
+              .then(() => {
+                console.log(`[WA] fetchMessageHistory completed for ${jid}`)
+                // After a brief delay (to let the events fire), re-emit messages to all clients
+                setTimeout(() => {
+                  const c = conversations.get(jid)
+                  if (c) {
+                    const msgs = c.messages.slice(-200).map(m => ({
+                      ...m,
+                      timestamp: m.timestamp instanceof Date ? m.timestamp.toISOString() : m.timestamp,
+                    }))
+                    io.of('/whatsapp').emit('whatsapp:messages:refreshed', { jid, messages: msgs })
+                  }
+                }, 2000)
+              })
+              .catch(err => console.error(`[WA] fetchMessageHistory error:`, err.message))
+            serverFetchOk = true
+          } catch (err) {
+            console.error(`[WA] fetchMessageHistory trigger failed:`, err.message)
+          }
+        }
+
+        // Return local messages immediately
+        const messages = conv.messages.slice(-200).map(m => ({
+          ...m,
+          timestamp: m.timestamp instanceof Date ? m.timestamp.toISOString() : m.timestamp,
+        }))
+        callback({
+          success: true,
+          messages,
+          count: messages.length,
+          serverFetchAttempted,
+          serverFetchOk,
+        })
+      } catch (error) {
+        console.error('[WA] refresh-messages error:', error.message)
+        callback({ success: false, error: error.message, messages: [] })
+      }
+    })
+
+    // ===== v7.14: Debug endpoint — get server-side state for a JID =====
+    // Used to troubleshoot "messages not arriving" issues.
+    socket.on('whatsapp:debug-jid', (data, callback) => {
+      try {
+        const jid = normalizeJid(data?.jid)
+        const conv = jid ? conversations.get(jid) : null
+        callback({
+          success: true,
+          jid,
+          normalizedJid: jid,
+          hasConversation: !!conv,
+          messageCount: conv ? conv.messages.length : 0,
+          lastMessage: conv?.lastMessage || null,
+          lastMessageAt: conv?.lastMessageAt ? conv.lastMessageAt.toISOString() : null,
+          connectionState: connectionState.connection,
+          waSocketExists: !!waSocket,
+          totalConversations: conversations.size,
+          totalContacts: deviceContacts.size,
+          totalPostedChatter: postedChatterIds.size,
+        })
+      } catch (error) {
+        callback({ success: false, error: error.message })
+      }
+    })
+
     socket.on('whatsapp:send-message', async (data, callback) => {
       try {
         if (!waSocket || connectionState.connection !== 'open') {
@@ -1227,7 +1494,7 @@ app.prepare().then(async () => {
         const phone = extractPhone(jid)
         if (phone) {
           try {
-            await autoSyncWhatsAppMessage({ jid, phone, pushName: conv.pushName, textContent: data.text, mediaType: null, fromMe: true, timestamp: new Date().toISOString() })
+            await autoSyncWhatsAppMessage({ jid, phone, pushName: conv.pushName, textContent: data.text, mediaType: null, fromMe: true, timestamp: new Date().toISOString(), dedupId: msgId })
           } catch (err) {
             console.error('[AutoSync] Send error:', err.message)
           }
@@ -1275,6 +1542,16 @@ app.prepare().then(async () => {
           message: { ...messageData, timestamp: messageTimestamp.toISOString() },
           conversation: serializeConversation(conv),
         })
+
+        // v7.14: also sync media to Odoo chatter (with dedup)
+        const phone = extractPhone(jid)
+        if (phone) {
+          try {
+            await autoSyncWhatsAppMessage({ jid, phone, pushName: conv.pushName, textContent: data.caption || null, mediaType: data.type, fromMe: true, timestamp: messageTimestamp.toISOString(), dedupId: msgId })
+          } catch (err) {
+            console.error('[AutoSync] Send media error:', err.message)
+          }
+        }
         callback({ success: true, messageId: msgId })
       } catch (error) {
         callback({ success: false, error: error.message })
@@ -1304,6 +1581,8 @@ app.prepare().then(async () => {
           conversations.clear()
           contactNames.clear()
           deviceContacts.clear()
+          postedChatterIds.clear()
+          phoneToActiveLeadCache.clear()
           io.of('/whatsapp').emit('whatsapp:status', { connected: false, reason: 'logged_out', hasSession: false })
           io.of('/whatsapp').emit('whatsapp:conversations', [])
           callback({ success: true })
