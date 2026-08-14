@@ -48,6 +48,10 @@ import {
   Database,
   CheckCircle2,
   AlertCircle,
+  FlaskConical,
+  Dices,
+  Eye,
+  EyeOff,
 } from 'lucide-react'
 import { useOdoo } from '@/lib/use-odoo'
 
@@ -109,6 +113,20 @@ export function UsersPanel() {
     failed: Array<{ userId: string; email: string; error: string }>
     at: string
   } | null>(null)
+  // v7.26: Test-login state
+  const [testLoginUser, setTestLoginUser] = useState<UserRow | null>(null)
+  const [testLoginPassword, setTestLoginPassword] = useState('')
+  const [testLoginResult, setTestLoginResult] = useState<null | {
+    found: boolean
+    isActive: boolean
+    role: string
+    passwordOk: boolean
+    hashPrefix: string
+    hashLength: number
+    providedHashPreview: string
+  }>(null)
+  const [isTestingLogin, setIsTestingLogin] = useState(false)
+  const [showPassword, setShowPassword] = useState(false)
 
   const loadUsers = useCallback(async () => {
     setIsLoading(true)
@@ -229,6 +247,65 @@ export function UsersPanel() {
       setError(err.message)
     } finally {
       setIsSaving(false)
+    }
+  }
+
+  // v7.26: Generate a random strong password and put it into the edit form
+  const generatePassword = () => {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789!@#$%&*'
+    let pwd = ''
+    const arr = new Uint32Array(12)
+    crypto.getRandomValues(arr)
+    for (let i = 0; i < 12; i++) pwd += chars[arr[i] % chars.length]
+    setEditState(s => ({ ...s, password: pwd }))
+    setShowPassword(true)
+  }
+
+  // v7.26: Test a user's password without impersonating them
+  const handleTestLogin = async () => {
+    if (!testLoginUser || !testLoginPassword) return
+    setIsTestingLogin(true)
+    setTestLoginResult(null)
+    try {
+      const res = await fetch(`/api/users/${testLoginUser.id}/test-login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: testLoginPassword }),
+      })
+      const data = await res.json()
+      if (data.success) {
+        setTestLoginResult({
+          found: data.found,
+          isActive: data.isActive,
+          role: data.role,
+          passwordOk: data.passwordOk,
+          hashPrefix: data.hashPrefix,
+          hashLength: data.hashLength,
+          providedHashPreview: data.providedHashPreview,
+        })
+      } else {
+        setTestLoginResult({
+          found: false,
+          isActive: false,
+          role: '?',
+          passwordOk: false,
+          hashPrefix: 'error: ' + (data.error || 'unknown'),
+          hashLength: 0,
+          providedHashPreview: '',
+        })
+      }
+    } catch (err: any) {
+      setTestLoginResult({
+        found: false,
+        isActive: false,
+        role: '?',
+        passwordOk: false,
+        hashPrefix: 'fetch error: ' + err.message,
+        hashLength: 0,
+        providedHashPreview: '',
+      })
+    } finally {
+      setIsTestingLogin(false)
     }
   }
 
@@ -399,6 +476,19 @@ export function UsersPanel() {
                           variant="ghost"
                           size="icon"
                           className="size-8"
+                          onClick={() => {
+                            setTestLoginUser(user)
+                            setTestLoginPassword('')
+                            setTestLoginResult(null)
+                          }}
+                          title="Testar login"
+                        >
+                          <FlaskConical className="size-4" />
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="size-8"
                           onClick={() => handleEdit(user)}
                           title="Editar"
                         >
@@ -422,6 +512,95 @@ export function UsersPanel() {
           )}
         </CardContent>
       </Card>
+
+      {/* v7.26: Test-login dialog */}
+      <Dialog open={!!testLoginUser} onOpenChange={(o) => { if (!o) setTestLoginUser(null) }}>
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <FlaskConical className="size-5 text-amber-600" />
+              Testar login
+            </DialogTitle>
+            <DialogDescription>
+              {testLoginUser && (
+                <>Verificar senha de <strong>{testLoginUser.email}</strong> sem fazer login como este usuário.</>
+              )}
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-3 py-2">
+            <div className="space-y-1.5">
+              <Label htmlFor="test-pwd" className="flex items-center gap-1">
+                <Key className="size-3" />
+                Senha para testar
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="size-6 p-0 ml-auto"
+                  onClick={() => setShowPassword(s => !s)}
+                  title={showPassword ? 'Ocultar' : 'Mostrar'}
+                >
+                  {showPassword ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
+                </Button>
+              </Label>
+              <Input
+                id="test-pwd"
+                type={showPassword ? 'text' : 'password'}
+                value={testLoginPassword}
+                onChange={(e) => setTestLoginPassword(e.target.value)}
+                placeholder="Digite a senha que o usuário está tentando usar"
+                className="font-mono"
+                onKeyDown={(e) => { if (e.key === 'Enter' && testLoginPassword) handleTestLogin() }}
+              />
+            </div>
+
+            <Button
+              onClick={handleTestLogin}
+              disabled={isTestingLogin || !testLoginPassword}
+              className="w-full"
+            >
+              {isTestingLogin ? <Loader2 className="size-4 mr-1.5 animate-spin" /> : <FlaskConical className="size-4 mr-1.5" />}
+              Testar senha
+            </Button>
+
+            {testLoginResult && (
+              <div className={`rounded-md border p-3 text-sm space-y-1 ${
+                testLoginResult.passwordOk
+                  ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
+                  : 'bg-red-50 border-red-200 text-red-900'
+              }`}>
+                <div className="flex items-center gap-2 font-medium">
+                  {testLoginResult.passwordOk
+                    ? <><CheckCircle2 className="size-4" /> Senha correta! Login deve funcionar.</>
+                    : <><AlertCircle className="size-4" /> Senha incorreta.</>}
+                </div>
+                <div className="text-xs space-y-0.5 mt-2 font-mono">
+                  <div>Usuário encontrado: <strong>{testLoginResult.found ? 'sim' : 'não'}</strong></div>
+                  <div>Ativo: <strong>{testLoginResult.isActive ? 'sim' : 'não'}</strong></div>
+                  <div>Role: <strong>{testLoginResult.role}</strong></div>
+                  <div>Hash armazenado (prefix): <code>{testLoginResult.hashPrefix}</code></div>
+                  <div>Hash length: <strong>{testLoginResult.hashLength}</strong> chars</div>
+                  {testLoginResult.providedHashPreview && (
+                    <div>Novo hash da senha digitada (prefix): <code>{testLoginResult.providedHashPreview}</code></div>
+                  )}
+                </div>
+                {!testLoginResult.passwordOk && testLoginResult.found && (
+                  <div className="text-xs mt-2 p-2 bg-amber-50 border border-amber-200 rounded">
+                    <strong>Sugestão:</strong> Edite o usuário, clique no botão <Dices className="size-3 inline" /> para gerar uma senha forte,
+                    salve, copie a senha e envie ao usuário. Use esta tela novamente para confirmar.
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div className="text-xs text-muted-foreground">
+              <p>Este teste não faz login — apenas verifica se a senha bate com o hash armazenado.</p>
+              <p>Também registra logs no servidor (timestamp + email + resultado) para diagnóstico.</p>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
         <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
@@ -465,15 +644,41 @@ export function UsersPanel() {
                 <Label htmlFor="edit-password" className="flex items-center gap-1">
                   <Key className="size-3" />
                   {editState.id ? 'Nova senha (opcional)' : 'Senha *'}
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="size-6 p-0 ml-auto"
+                    onClick={generatePassword}
+                    title="Gerar senha forte"
+                  >
+                    <Dices className="size-3.5" />
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="size-6 p-0"
+                    onClick={() => setShowPassword(s => !s)}
+                    title={showPassword ? 'Ocultar' : 'Mostrar'}
+                  >
+                    {showPassword ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
+                  </Button>
                 </Label>
                 <Input
                   id="edit-password"
-                  type="password"
+                  type={showPassword ? 'text' : 'password'}
                   value={editState.password}
                   onChange={(e) => setEditState(s => ({ ...s, password: e.target.value }))}
                   placeholder={editState.id ? 'Deixe em branco para manter' : 'Mínimo 6 caracteres'}
                   required={!editState.id}
+                  className="font-mono"
                 />
+                {editState.password && showPassword && (
+                  <p className="text-xs text-emerald-600">
+                    Senha gerada: <code className="font-mono bg-muted px-1 rounded">{editState.password}</code>
+                  </p>
+                )}
               </div>
               <div className="space-y-1.5">
                 <Label htmlFor="edit-phone">Telefone WhatsApp</Label>

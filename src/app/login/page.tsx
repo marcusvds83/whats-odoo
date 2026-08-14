@@ -206,7 +206,7 @@ export default function LoginPage() {
         </Suspense>
 
         <p className="text-xs text-muted-foreground text-center mt-4">
-          v7.25 • Multi-usuário
+          v7.26 • Multi-usuário
         </p>
       </div>
     </div>
