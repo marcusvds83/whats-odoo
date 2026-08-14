@@ -11,6 +11,9 @@ datasource db {
 // The first user created becomes the admin (role = "admin").
 // Regular users (role = "user") can be created/managed by the admin via
 // the "Usuários" tab in the settings page.
+//
+// v7.23: Each user has their OWN WhatsApp socket, conversations, and Odoo
+// connection. See UserSession in src/server/user-session.js.
 model User {
   id           String   @id @default(cuid())
   email        String   @unique // Login email (also used as display name fallback)
@@ -30,6 +33,10 @@ model User {
   isActive     Boolean  @default(true) // Admin can deactivate users
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
+
+  // v7.23: Per-user relations — each user owns their conversations and WA sessions
+  conversations    Conversation[]
+  whatsappSessions WhatsAppSession[]
 }
 
 model OdooConfig {
@@ -53,6 +60,9 @@ model WhatsAppSession {
   isActive  Boolean  @default(true)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+  // v7.23: Owner of this WhatsApp session (nullable for legacy rows)
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
 }
 
 model Conversation {
@@ -75,6 +85,9 @@ model Conversation {
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
   messages       Message[]
+  // v7.23: Owner of this conversation (nullable for legacy rows)
+  userId         String?
+  user           User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
 }
 
 model Message {

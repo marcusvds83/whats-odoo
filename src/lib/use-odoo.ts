@@ -35,6 +35,17 @@ export interface AutoSyncResult {
   errors: string[]
 }
 
+/**
+ * v7.23: Read the JWT session token from the whats_odoo_session cookie.
+ * The server's socket.io auth middleware (src/lib/auth-edge.cjs) verifies
+ * this token and attaches the user's UserSession to the socket.
+ */
+function getSessionToken(): string | null {
+  if (typeof document === 'undefined') return null
+  const match = document.cookie.match(/(?:^|;\s*)whats_odoo_session=([^;]+)/)
+  return match ? decodeURIComponent(match[1]) : null
+}
+
 export function useOdoo() {
   const socketRef = useRef<Socket | null>(null)
   const [status, setStatus] = useState<OdooStatus>({ connected: false })
@@ -65,6 +76,9 @@ export function useOdoo() {
       reconnectionAttempts: 10,
       reconnectionDelay: 2000,
       timeout: 15000,
+      // v7.23: pass the JWT in the socket.io handshake so the server can
+      // authenticate the user and route events to their own UserSession.
+      auth: { token: getSessionToken() },
     })
 
     socketRef.current = socket
@@ -72,6 +86,19 @@ export function useOdoo() {
     socket.on('connect', () => {
       console.log('[Odoo] Socket connected')
       setIsConnected(true)
+    })
+
+    // v7.23: Redirect to /login if the server rejects the socket (token
+    // expired / invalid / user inactive).
+    socket.on('connect_error', (err: Error & { message?: string; data?: any }) => {
+      console.error('[Odoo] Socket connect_error:', err.message)
+      setIsConnected(false)
+      const reason = err?.data?.message || err?.message || ''
+      if (reason === 'unauthorized' || reason === 'user_inactive' || reason === 'not_authenticated') {
+        if (typeof window !== 'undefined') {
+          window.location.href = '/login'
+        }
+      }
     })
 
     socket.on('disconnect', () => {

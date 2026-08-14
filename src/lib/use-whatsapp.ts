@@ -64,6 +64,21 @@ function normalizeJidForCompare(j: string | null | undefined): string | null {
   return `${user}@s.whatsapp.net`
 }
 
+/**
+ * v7.23: Read the JWT session token from the whats_odoo_session cookie.
+ * Used to authenticate the socket.io handshake — the server verifies the
+ * token in the attachUser middleware (src/server/user-session.js +
+ * src/lib/auth-edge.cjs) and routes events to the user's UserSession only.
+ *
+ * Returns null during SSR (no document available) — the hook only runs
+ * client-side, so this is fine.
+ */
+function getSessionToken(): string | null {
+  if (typeof document === 'undefined') return null
+  const match = document.cookie.match(/(?:^|;\s*)whats_odoo_session=([^;]+)/)
+  return match ? decodeURIComponent(match[1]) : null
+}
+
 export function useWhatsApp() {
   const socketRef = useRef<Socket | null>(null)
   const [status, setStatus] = useState<WhatsAppStatus & { hasSession?: boolean }>({ connected: false })
@@ -108,6 +123,9 @@ export function useWhatsApp() {
       reconnectionDelay: 2000,
       reconnectionDelayMax: 10000,
       timeout: 15000,
+      // v7.23: pass the JWT in the socket.io handshake so the server can
+      // authenticate the user and route events to their own UserSession.
+      auth: { token: getSessionToken() },
     })
 
     socketRef.current = socket
@@ -115,6 +133,20 @@ export function useWhatsApp() {
     socket.on('connect', () => {
       console.log('[WhatsApp] Socket connected')
       setIsConnected(true)
+    })
+
+    // v7.23: If the server rejects the socket (token expired / invalid /
+    // user inactive), redirect to /login. Without this, the socket would
+    // silently retry forever and the user would see an empty UI.
+    socket.on('connect_error', (err: Error & { message?: string; data?: any }) => {
+      console.error('[WhatsApp] Socket connect_error:', err.message)
+      setIsConnected(false)
+      const reason = err?.data?.message || err?.message || ''
+      if (reason === 'unauthorized' || reason === 'user_inactive' || reason === 'not_authenticated') {
+        if (typeof window !== 'undefined') {
+          window.location.href = '/login'
+        }
+      }
     })
 
     socket.on('disconnect', () => {
