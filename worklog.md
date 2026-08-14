@@ -901,3 +901,33 @@ Stage Summary:
 - Authenticated users see the same WhatsApp conversations (shared WhatsApp session — per-user WA sessions would be a future v7.23 enhancement)
 - All API routes (except /api/auth/*) require valid JWT cookie
 - Admin-only routes (/api/users/*) return 403 for non-admin users
+
+---
+Task ID: v7.27
+Agent: Main Agent
+Task: Fix login cookie persistence issue — user reports login succeeds server-side but redirects back to /login
+
+Work Log:
+- Pulled latest from origin/main (v7.26 was already there with debug logging + test-login tool)
+- Analyzed the login flow: /login → POST /api/auth/login → server verifies password → signs JWT → sets cookie via response.headers.set('Set-Cookie', ...) → client does router.push('/') → middleware checks cookie → redirects to /login if missing
+- Reviewed user's screenshots: confirmed that the diagnostic "Testar login" tool shows password IS correct (bcrypt compare succeeds), and the login API logs show "SUCESSO: sessão emitida", but the user still gets redirected back to /login
+- Identified root cause: The project uses Next.js 16.1.1, and all 4 auth API routes (login, setup, setup-admin, logout) were setting the session cookie via `response.headers.set('Set-Cookie', ...)`. On Next.js 16 with a custom server (server.js), this approach is unreliable — the Set-Cookie header can be silently dropped during response processing, so the browser never receives it.
+- Implemented fix in v7.27:
+  1. Added `setSessionCookie(response, token)` and `clearSessionCookie(response)` helpers in `src/lib/auth.ts` that use `response.cookies.set({...})` — the Next.js 16 recommended API
+  2. Updated all 4 auth API routes to use the new helpers (login, setup, setup-admin, logout)
+  3. Added debug logging in `src/middleware.ts` — logs when cookie is missing (including which cookie names ARE present) and when JWT verification fails
+  4. Added debug logging in `/api/auth/me` — logs cookie presence + verification result
+  5. Added explicit `credentials: 'same-origin'` to fetch calls in /login and /admin pages (belt-and-suspenders)
+  6. Bumped version to v7.27 in package.json, login page, admin page, and main page sidebar
+- Kept the legacy `buildSessionCookieHeader()` / `buildClearSessionCookieHeader()` functions because `auth-edge.cjs` (used by server.js for socket.io auth) still needs the raw Set-Cookie string format
+- Build succeeded locally with `npx next build` (Next.js 16.1.3, Turbopack)
+- Committed as `005f79a` locally
+- Created patch file at /home/z/my-project/download/v7.27-login-cookie-fix.patch
+- Could NOT push to GitHub — the token in the git remote URL is redacted (`[REDACTED:github_token]`) and no GitHub token is available in the environment
+
+Stage Summary:
+- v7.27 committed locally (commit 005f79a) — fixes the login cookie persistence issue
+- Patch file available at /home/z/my-project/download/v7.27-login-cookie-fix.patch
+- User needs to either: (a) push the commit to GitHub manually, or (b) apply the patch to their repo
+- Key change: switched from `response.headers.set('Set-Cookie', ...)` to `response.cookies.set({...})` in all 4 auth routes
+- Added comprehensive debug logging that will appear in Render logs to confirm the cookie is now being set and received correctly

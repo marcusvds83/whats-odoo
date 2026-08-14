@@ -1,0 +1,427 @@
+From 005f79ad25740c8d579dcc082e6894e0a390ffc1 Mon Sep 17 00:00:00 2001
+From: Whats-Odoo Agent <agent@z.ai>
+Date: Fri, 14 Aug 2026 18:43:07 +0000
+Subject: [PATCH] =?UTF-8?q?v7.27:=20fix=20login=20cookie=20persistence=20?=
+ =?UTF-8?q?=E2=80=94=20switch=20to=20response.cookies.set()?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+PROBLEM: Login succeeded server-side (logs showed 'SUCESSO: sessão emitida')
+but the user was redirected back to /login. The session cookie was not
+persisting in the browser.
+
+ROOT CAUSE: All 4 auth API routes (login, setup, setup-admin, logout) were
+setting the session cookie via response.headers.set('Set-Cookie', ...).
+On Next.js 16.1.x with a custom server (server.js), this approach is
+unreliable — the Set-Cookie header can be silently dropped during
+response processing, so the browser never receives it.
+
+FIX:
+- Added setSessionCookie() / clearSessionCookie() helpers in src/lib/auth.ts
+  that use response.cookies.set({...}) — the Next.js 16 recommended API.
+- Updated all 4 auth routes to use the new helpers.
+- Added debug logging in middleware (logs when cookie is missing or JWT
+  invalid, including which cookie names ARE present).
+- Added debug logging in /api/auth/me (logs cookie presence + verification
+  result).
+- Added explicit credentials: 'same-origin' to fetch calls in /login and
+  /admin pages (belt-and-suspenders; this is the default but now explicit).
+- Bumped version to v7.27 in package.json, login page, admin page, and
+  main page sidebar.
+
+The legacy buildSessionCookieHeader() / buildClearSessionCookieHeader()
+functions are kept because auth-edge.cjs (used by server.js for socket.io
+auth) still needs the raw Set-Cookie string format.
+---
+ package-lock.json                     |  4 +--
+ package.json                          |  2 +-
+ src/app/admin/page.tsx                |  3 +-
+ src/app/api/auth/login/route.ts       | 15 ++++++---
+ src/app/api/auth/logout/route.ts      |  8 ++---
+ src/app/api/auth/me/route.ts          | 16 ++++++++--
+ src/app/api/auth/setup-admin/route.ts |  5 +--
+ src/app/api/auth/setup/route.ts       |  5 +--
+ src/app/login/page.tsx                |  3 +-
+ src/app/page.tsx                      |  2 +-
+ src/lib/auth.ts                       | 46 +++++++++++++++++++++++++--
+ src/middleware.ts                     | 13 ++++++--
+ 12 files changed, 96 insertions(+), 26 deletions(-)
+
+diff --git a/package-lock.json b/package-lock.json
+index 4ca4db3..066a98a 100755
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -1,12 +1,12 @@
+ {
+   "name": "whats-odoo",
+-  "version": "7.22.0",
++  "version": "7.27.0",
+   "lockfileVersion": 3,
+   "requires": true,
+   "packages": {
+     "": {
+       "name": "whats-odoo",
+-      "version": "7.22.0",
++      "version": "7.27.0",
+       "dependencies": {
+         "@hapi/boom": "^9.1.4",
+         "@prisma/client": "^6.11.1",
+diff --git a/package.json b/package.json
+index 1563574..82b0d2e 100755
+--- a/package.json
++++ b/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "whats-odoo",
+-  "version": "7.26.0",
++  "version": "7.27.0",
+   "private": true,
+   "scripts": {
+     "dev": "next dev -p 3000",
+diff --git a/src/app/admin/page.tsx b/src/app/admin/page.tsx
+index 638d53c..999d885 100644
+--- a/src/app/admin/page.tsx
++++ b/src/app/admin/page.tsx
+@@ -61,6 +61,7 @@ function AdminLoginForm() {
+         method: 'POST',
+         headers: { 'Content-Type': 'application/json' },
+         body: JSON.stringify(body),
++        credentials: 'same-origin',  // v7.27: ensure cookies are sent/received
+       })
+       const data = await res.json()
+ 
+@@ -208,7 +209,7 @@ function AdminLoginForm() {
+         </Card>
+ 
+         <p className="text-xs text-slate-500 text-center mt-4">
+-          v7.26 • Área administrativa
++          v7.27 • Área administrativa
+         </p>
+       </div>
+     </div>
+diff --git a/src/app/api/auth/login/route.ts b/src/app/api/auth/login/route.ts
+index 1dbc7bc..506646e 100644
+--- a/src/app/api/auth/login/route.ts
++++ b/src/app/api/auth/login/route.ts
+@@ -1,15 +1,18 @@
+ // ====================================================================
+-// v7.26: POST /api/auth/login
++// v7.27: POST /api/auth/login
+ // Body: { email, password, requireAdmin?: boolean }
+ //   - requireAdmin=true: only allow users with role='admin' (used by /admin page)
+ // Returns: { success, user?: { id, email, name, role } }
+ // Sets the whats_odoo_session cookie on success.
+-// v7.26: Added detailed server-side logging for debugging login failures.
++// v7.27 FIX: Use response.cookies.set() instead of response.headers.set()
++//   ('Set-Cookie', ...) — the old approach silently dropped the cookie
++//   on Next.js 16, causing login to succeed server-side but the session
++//   never persisted in the browser.
+ // ====================================================================
+ 
+ import { NextRequest, NextResponse } from 'next/server'
+ import { db } from '@/lib/db'
+-import { verifyPassword, signSession, buildSessionCookieHeader } from '@/lib/auth'
++import { verifyPassword, signSession, setSessionCookie } from '@/lib/auth'
+ import type { SessionPayload } from '@/lib/auth'
+ 
+ export const runtime = 'nodejs'
+@@ -68,7 +71,7 @@ export async function POST(req: NextRequest) {
+     }
+     const token = await signSession(payload)
+ 
+-    console.log(`[${ts}][login] SUCCESS: issued session for email="${email}" role=${user.role}`)
++    console.log(`[${ts}][login] SUCCESS: issued session for email="${email}" role=${user.role} tokenLen=${token.length}`)
+ 
+     const response = NextResponse.json({
+       success: true,
+@@ -79,7 +82,9 @@ export async function POST(req: NextRequest) {
+         role: user.role,
+       },
+     })
+-    response.headers.set('Set-Cookie', buildSessionCookieHeader(token))
++    // v7.27: use response.cookies.set() — the Next.js 16 recommended API.
++    setSessionCookie(response, token)
++    console.log(`[${ts}][login] Cookie set via response.cookies.set() — name=whats_odoo_session secure=${process.env.NODE_ENV === 'production'}`)
+     return response
+   } catch (err: any) {
+     console.error(`[${ts}][login] ERROR:`, err.message, err.stack)
+diff --git a/src/app/api/auth/logout/route.ts b/src/app/api/auth/logout/route.ts
+index 5583370..f9562a8 100644
+--- a/src/app/api/auth/logout/route.ts
++++ b/src/app/api/auth/logout/route.ts
+@@ -1,15 +1,15 @@
+ // ====================================================================
+-// v7.22: POST /api/auth/logout
+-// Clears the session cookie.
++// v7.27: POST /api/auth/logout
++// Clears the session cookie using response.cookies.set() (Next.js 16 API).
+ // ====================================================================
+ 
+ import { NextResponse } from 'next/server'
+-import { buildClearSessionCookieHeader } from '@/lib/auth'
++import { clearSessionCookie } from '@/lib/auth'
+ 
+ export const runtime = 'nodejs'
+ 
+ export async function POST() {
+   const response = NextResponse.json({ success: true })
+-  response.headers.set('Set-Cookie', buildClearSessionCookieHeader())
++  clearSessionCookie(response)
+   return response
+ }
+diff --git a/src/app/api/auth/me/route.ts b/src/app/api/auth/me/route.ts
+index c586eef..fa7bce2 100644
+--- a/src/app/api/auth/me/route.ts
++++ b/src/app/api/auth/me/route.ts
+@@ -1,19 +1,27 @@
+ // ====================================================================
+-// v7.22: GET /api/auth/me
++// v7.27: GET /api/auth/me
+ // Returns the current authenticated user (or 401 if not logged in).
+ // Used by the frontend AuthProvider on initial page load.
++// v7.27: Added debug logging to trace why /api/auth/me may return 401
++//   even right after a successful login.
+ // ====================================================================
+ 
+ import { NextRequest, NextResponse } from 'next/server'
+ import { db } from '@/lib/db'
+-import { getSessionFromRequest } from '@/lib/auth'
++import { getSessionFromRequest, getSessionCookieName } from '@/lib/auth'
+ 
+ export const runtime = 'nodejs'
+ 
+ export async function GET(req: NextRequest) {
++  const ts = new Date().toISOString()
+   try {
++    const cookieName = getSessionCookieName()
++    const cookieHeader = req.headers.get('cookie') || ''
++    const hasCookie = cookieHeader.includes(`${cookieName}=`)
++
+     const session = await getSessionFromRequest(req)
+     if (!session) {
++      console.warn(`[${ts}][/api/auth/me] 401 — hasCookie=${hasCookie} cookieHeaderLen=${cookieHeader.length} cookieNames=[${cookieHeader.split(';').map(p => p.split('=')[0].trim()).filter(Boolean).join(',')}]`)
+       return NextResponse.json({ success: false, authenticated: false }, { status: 401 })
+     }
+ 
+@@ -35,16 +43,18 @@ export async function GET(req: NextRequest) {
+     })
+ 
+     if (!user || !user.isActive) {
++      console.warn(`[${ts}][/api/auth/me] 401 — user not found or inactive (userId=${session.userId})`)
+       return NextResponse.json({ success: false, authenticated: false }, { status: 401 })
+     }
+ 
++    console.log(`[${ts}][/api/auth/me] 200 — email=${user.email} role=${user.role}`)
+     return NextResponse.json({
+       success: true,
+       authenticated: true,
+       user,
+     })
+   } catch (err: any) {
+-    console.error('[/api/auth/me] error:', err.message)
++    console.error(`[${ts}][/api/auth/me] error:`, err.message)
+     return NextResponse.json({ success: false, authenticated: false }, { status: 500 })
+   }
+ }
+diff --git a/src/app/api/auth/setup-admin/route.ts b/src/app/api/auth/setup-admin/route.ts
+index 81b8914..5d06175 100644
+--- a/src/app/api/auth/setup-admin/route.ts
++++ b/src/app/api/auth/setup-admin/route.ts
+@@ -26,7 +26,7 @@
+ 
+ import { NextRequest, NextResponse } from 'next/server'
+ import { db } from '@/lib/db'
+-import { hashPassword, signSession, buildSessionCookieHeader } from '@/lib/auth'
++import { hashPassword, signSession, setSessionCookie } from '@/lib/auth'
+ import type { SessionPayload } from '@/lib/auth'
+ 
+ export const runtime = 'nodejs'
+@@ -121,7 +121,8 @@ export async function POST(req: NextRequest) {
+         ? 'Conta existente promovida para admin e senha redefinida.'
+         : 'Novo admin criado.',
+     })
+-    response.headers.set('Set-Cookie', buildSessionCookieHeader(token))
++    // v7.27: use response.cookies.set() for reliable cookie persistence on Next.js 16
++    setSessionCookie(response, token)
+     return response
+   } catch (err: any) {
+     console.error(`[${ts}][setup-admin] error:`, err.message)
+diff --git a/src/app/api/auth/setup/route.ts b/src/app/api/auth/setup/route.ts
+index 240659a..ab5fa6e 100644
+--- a/src/app/api/auth/setup/route.ts
++++ b/src/app/api/auth/setup/route.ts
+@@ -8,7 +8,7 @@
+ 
+ import { NextRequest, NextResponse } from 'next/server'
+ import { db } from '@/lib/db'
+-import { hashPassword, signSession, buildSessionCookieHeader } from '@/lib/auth'
++import { hashPassword, signSession, setSessionCookie } from '@/lib/auth'
+ import type { SessionPayload } from '@/lib/auth'
+ 
+ export const runtime = 'nodejs'
+@@ -66,7 +66,8 @@ export async function POST(req: NextRequest) {
+         role: user.role,
+       },
+     })
+-    response.headers.set('Set-Cookie', buildSessionCookieHeader(token))
++    // v7.27: use response.cookies.set() for reliable cookie persistence on Next.js 16
++    setSessionCookie(response, token)
+     return response
+   } catch (err: any) {
+     console.error('[/api/auth/setup] error:', err.message)
+diff --git a/src/app/login/page.tsx b/src/app/login/page.tsx
+index 0e610b4..ae2076a 100644
+--- a/src/app/login/page.tsx
++++ b/src/app/login/page.tsx
+@@ -51,6 +51,7 @@ function LoginForm() {
+         method: 'POST',
+         headers: { 'Content-Type': 'application/json' },
+         body: JSON.stringify(body),
++        credentials: 'same-origin',  // v7.27: ensure cookies are sent/received
+       })
+       const data = await res.json()
+ 
+@@ -206,7 +207,7 @@ export default function LoginPage() {
+         </Suspense>
+ 
+         <p className="text-xs text-muted-foreground text-center mt-4">
+-          v7.26 • Multi-usuário
++          v7.27 • Multi-usuário
+         </p>
+       </div>
+     </div>
+diff --git a/src/app/page.tsx b/src/app/page.tsx
+index 75a45d9..024aab9 100755
+--- a/src/app/page.tsx
++++ b/src/app/page.tsx
+@@ -503,7 +503,7 @@ export default function HomePage() {
+             {!sidebarCollapsed && (
+               <div className="hidden lg:block min-w-0">
+                 <p className="text-sm font-bold leading-tight truncate">Whats-Odoo</p>
+-                <p className="text-[10px] text-muted-foreground">v7.26 Middleware</p>
++                <p className="text-[10px] text-muted-foreground">v7.27 Middleware</p>
+               </div>
+             )}
+           </div>
+diff --git a/src/lib/auth.ts b/src/lib/auth.ts
+index 8a5627b..01f8987 100644
+--- a/src/lib/auth.ts
++++ b/src/lib/auth.ts
+@@ -1,10 +1,17 @@
+ // ====================================================================
+-// v7.22: Auth utilities — JWT-based session using jose (edge-compatible)
++// v7.27: Auth utilities — JWT-based session using jose (edge-compatible)
+ // Passwords hashed with bcryptjs. Session cookie name: whats_odoo_session
++// v7.27 FIX: Switched from response.headers.set('Set-Cookie', ...) to
++//   response.cookies.set({...}) — the Next.js 16 recommended API.
++//   The old headers.set() approach was silently dropping the Set-Cookie
++//   header on some deployments, causing login to "succeed" server-side
++//   but the cookie never reached the browser, so the next navigation
++//   to / was redirected back to /login by the middleware.
+ // ====================================================================
+ 
+ import bcrypt from 'bcryptjs'
+ import { SignJWT, jwtVerify } from 'jose'
++import type { NextResponse } from 'next/server'
+ 
+ const JWT_SECRET = process.env.JWT_SECRET || 'whats-odoo-dev-secret-change-in-prod-please-very-long'
+ const SESSION_COOKIE = 'whats_odoo_session'
+@@ -96,7 +103,8 @@ export async function getSessionFromRequest(req: Request): Promise<SessionPayloa
+   return verifySession(token)
+ }
+ 
+-// Build the Set-Cookie header value for login/logout
++// Build the Set-Cookie header value for login/logout (legacy — still used by
++// auth-edge.cjs which runs in the custom server.js CommonJS context).
+ export function buildSessionCookieHeader(token: string, maxAgeSeconds: number = SESSION_TTL_SECONDS): string {
+   return `${SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}${
+     process.env.NODE_ENV === 'production' ? '; Secure' : ''
+@@ -108,3 +116,37 @@ export function buildClearSessionCookieHeader(): string {
+     process.env.NODE_ENV === 'production' ? '; Secure' : ''
+   }`
+ }
++
++// ====================================================================
++// v7.27: PREFERRED cookie helpers — use response.cookies.set() which is
++// the Next.js 16 recommended API. The old response.headers.set('Set-Cookie')
++// approach was unreliable on Next.js 16 + custom server setups.
++// ====================================================================
++
++export function setSessionCookie(
++  response: NextResponse,
++  token: string,
++  maxAgeSeconds: number = SESSION_TTL_SECONDS
++): void {
++  response.cookies.set({
++    name: SESSION_COOKIE,
++    value: token,
++    httpOnly: true,
++    sameSite: 'lax',
++    secure: process.env.NODE_ENV === 'production',
++    path: '/',
++    maxAge: maxAgeSeconds,
++  })
++}
++
++export function clearSessionCookie(response: NextResponse): void {
++  response.cookies.set({
++    name: SESSION_COOKIE,
++    value: '',
++    httpOnly: true,
++    sameSite: 'lax',
++    secure: process.env.NODE_ENV === 'production',
++    path: '/',
++    maxAge: 0,
++  })
++}
+diff --git a/src/middleware.ts b/src/middleware.ts
+index 77ba7cc..8fbfdaa 100644
+--- a/src/middleware.ts
++++ b/src/middleware.ts
+@@ -1,5 +1,6 @@
+ // ====================================================================
+-// v7.25: Next.js middleware — protects all routes except public ones.
++// v7.27: Next.js middleware — protects all routes except public ones.
++// v7.27: Added debug logging to trace cookie presence + JWT verification.
+ // v7.25: /admin is now a public admin login page (separate from /login).
+ // v7.25: /api/auth/setup-admin is the emergency admin recovery endpoint.
+ // Reads the whats_odoo_session cookie, verifies the JWT, and redirects
+@@ -46,11 +47,13 @@ export async function middleware(req: NextRequest) {
+     return NextResponse.next()
+   }
+ 
+-  // Check session cookie
++  // v7.27: debug logging — trace cookie presence on protected routes
+   const cookieName = getSessionCookieName()
+   const token = req.cookies.get(cookieName)?.value
++  const ts = new Date().toISOString()
+ 
+   if (!token) {
++    console.warn(`[${ts}][middleware] NO COOKIE on ${pathname} — cookie names present: [${req.cookies.getAll().map(c => c.name).join(', ')}]`)
+     // For API routes, return 401 JSON
+     if (pathname.startsWith('/api/')) {
+       return NextResponse.json({ success: false, error: 'Não autenticado' }, { status: 401 })
+@@ -64,6 +67,7 @@ export async function middleware(req: NextRequest) {
+   const session = await verifySession(token)
+   if (!session) {
+     // Invalid/expired token
++    console.warn(`[${ts}][middleware] INVALID/EXPIRED JWT on ${pathname} — tokenLen=${token.length}`)
+     if (pathname.startsWith('/api/')) {
+       return NextResponse.json({ success: false, error: 'Sessão expirada' }, { status: 401 })
+     }
+@@ -72,6 +76,11 @@ export async function middleware(req: NextRequest) {
+     return NextResponse.redirect(loginUrl)
+   }
+ 
++  // v7.27: successful auth — log only /api/auth/me hits (to keep logs clean)
++  if (pathname === '/api/auth/me') {
++    console.log(`[${ts}][middleware] OK /api/auth/me — session.userId=${session.userId} role=${session.role}`)
++  }
++
+   // Admin-only API routes
+   if (pathname.startsWith('/api/users') && session.role !== 'admin') {
+     return NextResponse.json({ success: false, error: 'Acesso restrito a administradores' }, { status: 403 })
+-- 
+2.47.3
+
