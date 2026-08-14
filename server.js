@@ -1,5 +1,5 @@
 // ====================================================================
-// Whats-Odoo v7.12 — SINGLE-PROCESS SERVER
+// Whats-Odoo v7.13 — SINGLE-PROCESS SERVER
 // Everything in one process: Next.js + WhatsApp (Baileys) + Odoo (XML-RPC)
 // Designed for Render 512MB RAM
 // ====================================================================
@@ -346,30 +346,50 @@ const deviceContacts = new Map()
 
 let syncState = { isSyncing: false, progress: 0, totalChats: 0, totalContacts: 0, totalMessages: 0 }
 
+// ========== JID Normalization ==========
+// Baileys can deliver JIDs in several forms:
+//   5511999888777@s.whatsapp.net            — canonical DM
+//   5511999888777:7@s.whatsapp.net          — DM with device suffix (multi-device send)
+//   5511999888777:7:3@s.whatsapp.net        — DM with device + agent suffix
+//   5511999888777@lid                        — Linked Identity (newer protocol)
+// We normalize everything to canonical form: <digits>@s.whatsapp.net
+function normalizeJid(jid) {
+  if (!jid || typeof jid !== 'string') return null
+  const atIdx = jid.indexOf('@')
+  if (atIdx < 0) return null
+  const server = jid.slice(atIdx + 1)
+  if (server !== 's.whatsapp.net') return null
+  const userCombined = jid.slice(0, atIdx)
+  // Strip :device and _agent suffixes — keep only the phone digits
+  const user = userCombined.split(':')[0].split('_')[0]
+  if (!/^\d{7,}$/.test(user)) return null
+  return `${user}@s.whatsapp.net`
+}
+
 function isValidPhoneJid(jid) {
-  if (!jid || !jid.endsWith('@s.whatsapp.net')) return false
-  const numPart = jid.split('@')[0]
-  return /^\d{7,}$/.test(numPart)
+  return normalizeJid(jid) !== null
 }
 
 function extractPhone(jid) {
-  if (!isValidPhoneJid(jid)) return null
-  return jid.split('@')[0]
+  const normalized = normalizeJid(jid)
+  return normalized ? normalized.split('@')[0] : null
 }
 
+// Compatibility alias — many call sites use jidNormalizedUser()
 function jidNormalizedUser(jid) {
-  // Simplified — just return the jid as-is for our cache key
-  return jid ? jid.split(':')[0] : jid
+  return normalizeJid(jid) || jid
 }
 
 function getOrCreateConversation(jid, pushName) {
-  if (!isValidPhoneJid(jid)) return null
-  const cachedName = contactNames.get(jidNormalizedUser(jid)) || null
-  const phone = extractPhone(jid)
+  // Always normalize first — Baileys may send 5511999888777:7@s.whatsapp.net
+  const normalizedJid = normalizeJid(jid)
+  if (!normalizedJid) return null
+  const cachedName = contactNames.get(normalizedJid) || null
+  const phone = extractPhone(normalizedJid)
 
-  if (!conversations.has(jid)) {
-    conversations.set(jid, {
-      jid,
+  if (!conversations.has(normalizedJid)) {
+    conversations.set(normalizedJid, {
+      jid: normalizedJid,
       name: cachedName || pushName || null,
       phone,
       pushName: pushName || null,
@@ -380,7 +400,7 @@ function getOrCreateConversation(jid, pushName) {
       messages: [],
     })
   }
-  const conv = conversations.get(jid)
+  const conv = conversations.get(normalizedJid)
   if (cachedName) {
     conv.name = cachedName
   } else if (pushName && !conv.name) {
@@ -391,10 +411,10 @@ function getOrCreateConversation(jid, pushName) {
   // incoming messages appear in the Contacts tab too)
   const displayName = cachedName || pushName || phone
   if (phone) {
-    if (!deviceContacts.has(jid)) {
-      deviceContacts.set(jid, { jid, phone, name: displayName, avatarUrl: null })
+    if (!deviceContacts.has(normalizedJid)) {
+      deviceContacts.set(normalizedJid, { jid: normalizedJid, phone, name: displayName, avatarUrl: null })
     } else if (cachedName) {
-      deviceContacts.get(jid).name = cachedName
+      deviceContacts.get(normalizedJid).name = cachedName
     }
   }
 
@@ -460,17 +480,18 @@ function getSortedConversations() {
 }
 
 function updateConversationName(jid, contactName) {
-  if (!isValidPhoneJid(jid)) return
-  contactNames.set(jidNormalizedUser(jid), contactName)
+  const normalizedJid = normalizeJid(jid)
+  if (!normalizedJid) return
+  contactNames.set(normalizedJid, contactName)
   // Also track in deviceContacts phonebook
-  const phone = extractPhone(jid)
-  const existing = deviceContacts.get(jid)
+  const phone = extractPhone(normalizedJid)
+  const existing = deviceContacts.get(normalizedJid)
   if (existing) {
     existing.name = contactName
   } else if (phone) {
-    deviceContacts.set(jid, { jid, phone, name: contactName, avatarUrl: null })
+    deviceContacts.set(normalizedJid, { jid: normalizedJid, phone, name: contactName, avatarUrl: null })
   }
-  const conv = conversations.get(jid)
+  const conv = conversations.get(normalizedJid)
   if (conv) conv.name = contactName
 }
 
@@ -728,9 +749,17 @@ async function connectWhatsApp(io) {
     })
 
     let validContactsCount = 0
-    for (const [jid, contact] of Object.entries(contacts)) {
-      if (isValidPhoneJid(jid) && contact?.name) {
-        contactNames.set(jidNormalizedUser(jid), contact.name)
+    for (const [rawJid, contact] of Object.entries(contacts)) {
+      const jid = normalizeJid(rawJid)
+      if (jid && contact?.name) {
+        contactNames.set(jid, contact.name)
+        // Also populate deviceContacts phonebook so phone contacts show up
+        const phone = extractPhone(jid)
+        if (phone) {
+          const existing = deviceContacts.get(jid)
+          if (existing) existing.name = contact.name
+          else deviceContacts.set(jid, { jid, phone, name: contact.name, avatarUrl: null })
+        }
         validContactsCount++
       }
     }
@@ -738,16 +767,17 @@ async function connectWhatsApp(io) {
 
     let chatsProcessed = 0
     for (const chat of chats) {
-      if (!isValidPhoneJid(chat.id)) continue
-      const contactName = contactNames.get(jidNormalizedUser(chat.id)) || null
-      if (!conversations.has(chat.id)) {
-        conversations.set(chat.id, {
-          jid: chat.id, name: contactName, phone: extractPhone(chat.id),
+      const jid = normalizeJid(chat.id)
+      if (!jid) continue
+      const contactName = contactNames.get(jid) || null
+      if (!conversations.has(jid)) {
+        conversations.set(jid, {
+          jid, name: contactName, phone: extractPhone(jid),
           pushName: null, avatarUrl: null, lastMessage: null,
           lastMessageAt: null, unreadCount: chat.unreadCount || 0, messages: [],
         })
       } else {
-        const conv = conversations.get(chat.id)
+        const conv = conversations.get(jid)
         if (contactName) conv.name = contactName
       }
       chatsProcessed++
@@ -757,23 +787,32 @@ async function connectWhatsApp(io) {
     let messagesProcessed = 0
     for (const msg of messages) {
       if (!msg.key) continue
-      const jid = msg.key.remoteJid
-      if (!isValidPhoneJid(jid)) continue
+      const jid = normalizeJid(msg.key.remoteJid)
+      if (!jid) continue
 
       const fromMe = msg.key.fromMe || false
+      // Unwrap nested message types (ephemeral, viewOnce)
+      let m = msg.message
+      if (m?.ephemeralMessage?.message) m = m.ephemeralMessage.message
+      else if (m?.viewOnceMessage?.message) m = m.viewOnceMessage.message
+      else if (m?.viewOnceMessageV2?.message) m = m.viewOnceMessageV2.message
+      else if (m?.documentWithCaptionMessage?.message) m = m.documentWithCaptionMessage.message
+      if (!m) continue
+
       const textContent =
-        msg.message?.conversation ||
-        msg.message?.extendedTextMessage?.text ||
-        msg.message?.imageMessage?.caption ||
-        msg.message?.videoMessage?.caption ||
-        msg.message?.documentMessage?.caption || null
+        m.conversation ||
+        m.extendedTextMessage?.text ||
+        m.imageMessage?.caption ||
+        m.videoMessage?.caption ||
+        m.documentMessage?.caption || null
 
       let mediaType = null
-      if (msg.message?.imageMessage) mediaType = 'image'
-      else if (msg.message?.videoMessage) mediaType = 'video'
-      else if (msg.message?.audioMessage) mediaType = 'audio'
-      else if (msg.message?.documentMessage) mediaType = 'document'
-      else if (msg.message?.stickerMessage) mediaType = 'sticker'
+      if (m.imageMessage) mediaType = 'image'
+      else if (m.videoMessage) mediaType = 'video'
+      else if (m.audioMessage) mediaType = 'audio'
+      else if (m.pttMessage) mediaType = 'ptt'
+      else if (m.documentMessage) mediaType = 'document'
+      else if (m.stickerMessage) mediaType = 'sticker'
 
       if (!textContent && !mediaType) continue
 
@@ -824,39 +863,74 @@ async function connectWhatsApp(io) {
     // type can be 'notify' (new message) or 'append' (history sync)
     console.log(`[WA] messages.upsert: ${messages?.length || 0} msgs (type=${type || 'n/a'})`)
     for (const msg of messages || []) {
-      if (!msg.key) continue
-      const jid = msg.key.remoteJid
+      if (!msg.key) {
+        console.log('[WA] upsert msg skipped — no key')
+        continue
+      }
+      // *** CRITICAL: Normalize the JID ***
+      // Baileys may deliver messages with the device suffix (e.g. 5511999888777:7@s.whatsapp.net).
+      // If we don't normalize, isValidPhoneJid rejects it and the message is silently dropped,
+      // which is exactly why incoming replies never showed in the chat view.
+      const rawJid = msg.key.remoteJid
+      const jid = normalizeJid(rawJid)
       const fromMe = msg.key.fromMe || false
       const pushName = msg.pushName || null
 
-      if (jid === 'status@broadcast') continue
-      if (!isValidPhoneJid(jid)) continue
+      console.log(`[WA] upsert msg: rawJid=${rawJid} → normalized=${jid} fromMe=${fromMe} id=${msg.key.id}`)
+
+      if (rawJid === 'status@broadcast') continue
+      if (!jid) {
+        console.log(`[WA] upsert msg skipped — invalid JID: ${rawJid}`)
+        continue
+      }
 
       const conv = getOrCreateConversation(jid, fromMe ? undefined : pushName)
-      if (!conv) continue
+      if (!conv) {
+        console.log(`[WA] upsert msg skipped — could not create conversation for ${jid}`)
+        continue
+      }
+
+      // *** Unwrap nested message types ***
+      // Disappearing messages come wrapped in `ephemeralMessage.message.*`
+      // View-once messages come wrapped in `viewOnceMessage.message.*` / `viewOnceMessageV2.message.*`
+      // Without unwrapping, text extraction fails and the message is silently dropped.
+      let m = msg.message
+      if (m?.ephemeralMessage?.message) m = m.ephemeralMessage.message
+      else if (m?.viewOnceMessage?.message) m = m.viewOnceMessage.message
+      else if (m?.viewOnceMessageV2?.message) m = m.viewOnceMessageV2.message
+      else if (m?.documentWithCaptionMessage?.message) m = m.documentWithCaptionMessage.message
+
+      if (!m) {
+        console.log(`[WA] upsert msg skipped — no message body (protocol/receipt)`)
+        continue
+      }
 
       const textContent =
-        msg.message?.conversation ||
-        msg.message?.extendedTextMessage?.text ||
-        msg.message?.imageMessage?.caption ||
-        msg.message?.videoMessage?.caption ||
-        msg.message?.documentMessage?.caption ||
-        msg.message?.templateMessage?.hydratedFourRowTemplate?.hydratedContentText ||
-        msg.message?.templateMessage?.hydratedTemplate?.hydratedContentText ||
-        msg.message?.buttonsMessage?.contentText ||
-        msg.message?.listMessage?.description || null
+        m.conversation ||
+        m.extendedTextMessage?.text ||
+        m.imageMessage?.caption ||
+        m.videoMessage?.caption ||
+        m.documentMessage?.caption ||
+        m.templateMessage?.hydratedFourRowTemplate?.hydratedContentText ||
+        m.templateMessage?.hydratedTemplate?.hydratedContentText ||
+        m.buttonsMessage?.contentText ||
+        m.listMessage?.description ||
+        m.buttonsResponseMessage?.selectedButtonId ||
+        m.listResponseMessage?.title ||
+        m.listResponseMessage?.description ||
+        null
 
       let mediaType = null
-      if (msg.message?.imageMessage) mediaType = 'image'
-      else if (msg.message?.videoMessage) mediaType = 'video'
-      else if (msg.message?.audioMessage) mediaType = 'audio'
-      else if (msg.message?.pttMessage) mediaType = 'ptt'
-      else if (msg.message?.documentMessage) mediaType = 'document'
-      else if (msg.message?.stickerMessage) mediaType = 'sticker'
+      if (m.imageMessage) mediaType = 'image'
+      else if (m.videoMessage) mediaType = 'video'
+      else if (m.audioMessage) mediaType = 'audio'
+      else if (m.pttMessage) mediaType = 'ptt'
+      else if (m.documentMessage) mediaType = 'document'
+      else if (m.stickerMessage) mediaType = 'sticker'
 
       // Skip protocol/reaction messages with no actual content
       if (!textContent && !mediaType) {
-        console.log(`[WA] Skipping message ${msg.key.id} — no text/media`)
+        console.log(`[WA] upsert msg skipped — no text/media (msg keys: ${Object.keys(m).join(',')})`)
         continue
       }
 
@@ -867,7 +941,7 @@ async function connectWhatsApp(io) {
         continue
       }
 
-      // Robust timestamp handling — Baileys can give number (seconds) or undefined
+      // Robust timestamp handling — Baileys can give number (seconds) or Long object
       let messageTimestamp
       try {
         const ts = typeof msg.messageTimestamp === 'number'
@@ -894,7 +968,7 @@ async function connectWhatsApp(io) {
       conv.lastMessageAt = new Date()
       if (!fromMe) conv.unreadCount++
 
-      console.log(`[WA] New message in ${jid} fromMe=${fromMe}: ${textContent ? textContent.slice(0, 40) : `[${mediaType}]`}`)
+      console.log(`[WA] ✓ New message stored in ${jid} fromMe=${fromMe}: ${textContent ? textContent.slice(0, 40) : `[${mediaType}]`}`)
 
       // Try to fetch profile picture in background (don't block)
       if (!conv.avatarUrl) {
@@ -907,6 +981,7 @@ async function connectWhatsApp(io) {
       }
 
       // Emit to all clients — the frontend's currentJidRef will decide if it appends to the active chat
+      // *** IMPORTANT: Use the normalized JID here so the frontend can match it ***
       io.of('/whatsapp').emit('whatsapp:message', {
         conversationJid: jid,
         message: {
@@ -942,8 +1017,8 @@ async function connectWhatsApp(io) {
     try {
       for (const update of updates || []) {
         if (!update.key || !update.key.id) continue
-        const jid = update.key.remoteJid
-        if (!isValidPhoneJid(jid)) continue
+        const jid = normalizeJid(update.key.remoteJid)
+        if (!jid) continue
         const conv = conversations.get(jid)
         if (!conv) continue
 
@@ -1000,17 +1075,18 @@ async function connectWhatsApp(io) {
 
   waSocket.ev.on('chats.upsert', async (chats) => {
     for (const chat of chats) {
-      if (!isValidPhoneJid(chat.id)) continue
-      if (!conversations.has(chat.id)) {
-        const contactName = contactNames.get(jidNormalizedUser(chat.id)) || null
-        conversations.set(chat.id, {
-          jid: chat.id, name: contactName, phone: extractPhone(chat.id),
+      const jid = normalizeJid(chat.id)
+      if (!jid) continue
+      if (!conversations.has(jid)) {
+        const contactName = contactNames.get(jid) || null
+        conversations.set(jid, {
+          jid, name: contactName, phone: extractPhone(jid),
           pushName: null, avatarUrl: null, lastMessage: null,
           lastMessageAt: null, unreadCount: chat.unreadCount || 0, messages: [],
         })
       } else {
-        const conv = conversations.get(chat.id)
-        const contactName = contactNames.get(jidNormalizedUser(chat.id))
+        const conv = conversations.get(jid)
+        const contactName = contactNames.get(jid)
         if (contactName) conv.name = contactName
       }
     }
@@ -1019,8 +1095,9 @@ async function connectWhatsApp(io) {
 
   waSocket.ev.on('chats.update', async (updates) => {
     for (const update of updates) {
-      if (!isValidPhoneJid(update.id)) continue
-      const conv = conversations.get(update.id)
+      const jid = normalizeJid(update.id)
+      if (!jid) continue
+      const conv = conversations.get(jid)
       if (conv) {
         if (update.unreadCount !== undefined) conv.unreadCount = update.unreadCount
         if (update.t) conv.lastMessageAt = new Date((update.t) * 1000)
@@ -1091,7 +1168,8 @@ app.prepare().then(async () => {
     })
 
     socket.on('whatsapp:get-messages', (data, callback) => {
-      const conv = conversations.get(data.jid)
+      const jid = normalizeJid(data?.jid)
+      const conv = jid ? conversations.get(jid) : null
       if (!conv) { callback({ messages: [] }); return }
       // Serialize timestamps to ISO strings for socket transport
       const messages = conv.messages.slice(-200).map(m => ({
@@ -1107,13 +1185,14 @@ app.prepare().then(async () => {
           callback({ success: false, error: 'WhatsApp not connected' })
           return
         }
-        if (!isValidPhoneJid(data.jid)) {
+        const jid = normalizeJid(data?.jid)
+        if (!jid) {
           callback({ success: false, error: 'Invalid contact JID' })
           return
         }
 
-        const sent = await waSocket.sendMessage(data.jid, { text: data.text })
-        const conv = getOrCreateConversation(data.jid)
+        const sent = await waSocket.sendMessage(jid, { text: data.text })
+        const conv = getOrCreateConversation(jid)
         if (!conv) { callback({ success: false, error: 'Could not create conversation' }); return }
 
         const msgId = sent?.key?.id || `m-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
@@ -1135,7 +1214,7 @@ app.prepare().then(async () => {
           conv.lastMessageAt = new Date()
 
           io.of('/whatsapp').emit('whatsapp:message', {
-            conversationJid: data.jid,
+            conversationJid: jid,
             message: {
               ...messageData,
               timestamp: messageTimestamp.toISOString(),
@@ -1145,10 +1224,10 @@ app.prepare().then(async () => {
           io.of('/whatsapp').emit('whatsapp:conversation:update', serializeConversation(conv))
         }
 
-        const phone = extractPhone(data.jid)
+        const phone = extractPhone(jid)
         if (phone) {
           try {
-            await autoSyncWhatsAppMessage({ jid: data.jid, phone, pushName: conv.pushName, textContent: data.text, mediaType: null, fromMe: true, timestamp: new Date().toISOString() })
+            await autoSyncWhatsAppMessage({ jid, phone, pushName: conv.pushName, textContent: data.text, mediaType: null, fromMe: true, timestamp: new Date().toISOString() })
           } catch (err) {
             console.error('[AutoSync] Send error:', err.message)
           }
@@ -1162,16 +1241,17 @@ app.prepare().then(async () => {
     socket.on('whatsapp:send-media', async (data, callback) => {
       try {
         if (!waSocket || connectionState.connection !== 'open') { callback({ success: false, error: 'WhatsApp not connected' }); return }
-        if (!isValidPhoneJid(data.jid)) { callback({ success: false, error: 'Invalid contact JID' }); return }
+        const jid = normalizeJid(data?.jid)
+        if (!jid) { callback({ success: false, error: 'Invalid contact JID' }); return }
 
         let sent
-        if (data.type === 'image') sent = await waSocket.sendMessage(data.jid, { image: { url: data.url }, caption: data.caption })
-        else if (data.type === 'document') sent = await waSocket.sendMessage(data.jid, { document: { url: data.url }, fileName: data.fileName || 'document', mimetype: data.mimeType, caption: data.caption })
-        else if (data.type === 'video') sent = await waSocket.sendMessage(data.jid, { video: { url: data.url }, caption: data.caption })
-        else if (data.type === 'audio') sent = await waSocket.sendMessage(data.jid, { audio: { url: data.url }, mimetype: data.mimeType || 'audio/mp4' })
+        if (data.type === 'image') sent = await waSocket.sendMessage(jid, { image: { url: data.url }, caption: data.caption })
+        else if (data.type === 'document') sent = await waSocket.sendMessage(jid, { document: { url: data.url }, fileName: data.fileName || 'document', mimetype: data.mimeType, caption: data.caption })
+        else if (data.type === 'video') sent = await waSocket.sendMessage(jid, { video: { url: data.url }, caption: data.caption })
+        else if (data.type === 'audio') sent = await waSocket.sendMessage(jid, { audio: { url: data.url }, mimetype: data.mimeType || 'audio/mp4' })
         else { callback({ success: false, error: 'Unsupported media type' }); return }
 
-        const conv = getOrCreateConversation(data.jid)
+        const conv = getOrCreateConversation(jid)
         if (!conv) { callback({ success: false, error: 'Could not create conversation' }); return }
 
         const msgId = sent?.key?.id || `m-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
@@ -1191,7 +1271,7 @@ app.prepare().then(async () => {
         conv.lastMessageAt = new Date()
 
         io.of('/whatsapp').emit('whatsapp:message', {
-          conversationJid: data.jid,
+          conversationJid: jid,
           message: { ...messageData, timestamp: messageTimestamp.toISOString() },
           conversation: serializeConversation(conv),
         })
@@ -1204,9 +1284,11 @@ app.prepare().then(async () => {
     socket.on('whatsapp:mark-read', async (data, callback) => {
       try {
         if (!waSocket || connectionState.connection !== 'open') { callback({ success: false, error: 'WhatsApp not connected' }); return }
-        const conv = conversations.get(data.jid)
+        const jid = normalizeJid(data?.jid)
+        if (!jid) { callback({ success: false, error: 'Invalid JID' }); return }
+        const conv = conversations.get(jid)
         if (conv) { conv.unreadCount = 0; io.of('/whatsapp').emit('whatsapp:conversation:update', serializeConversation(conv)) }
-        await waSocket.readMessages([{ remoteJid: data.jid, id: '' }])
+        await waSocket.readMessages([{ remoteJid: jid, id: '' }])
         callback({ success: true })
       } catch (error) { callback({ success: false, error: error.message }) }
     })
@@ -1234,8 +1316,10 @@ app.prepare().then(async () => {
     socket.on('whatsapp:get-profile-pic', async (data, callback) => {
       try {
         if (!waSocket || connectionState.connection !== 'open') { callback({ success: false, error: 'WhatsApp not connected' }); return }
-        const url = await waSocket.profilePictureUrl(data.jid, 'image').catch(() => null)
-        const conv = conversations.get(data.jid)
+        const jid = normalizeJid(data?.jid)
+        if (!jid) { callback({ success: false, url: null }); return }
+        const url = await waSocket.profilePictureUrl(jid, 'image').catch(() => null)
+        const conv = conversations.get(jid)
         if (conv && url) conv.avatarUrl = url
         callback({ success: true, url })
       } catch { callback({ success: false, url: null }) }
@@ -1271,28 +1355,30 @@ app.prepare().then(async () => {
           return
         }
 
-        const jid = normalizePhoneToJid(data.phone)
-        if (!jid) {
+        const proposedJid = normalizePhoneToJid(data.phone)
+        if (!proposedJid) {
           callback({ success: false, error: 'Invalid phone number' })
           return
         }
 
         // Check if the number is on WhatsApp
-        let realJid = jid
+        let realJid = proposedJid
         try {
-          const result = await waSocket.onWhatsApp(jid)
+          const result = await waSocket.onWhatsApp(proposedJid)
           if (result && result.length > 0) {
             if (!result[0].exists) {
               callback({ success: false, error: 'Phone number is not on WhatsApp' })
               return
             }
-            realJid = result[0].jid || jid
+            // *** Normalize the JID returned by onWhatsApp ***
+            // Baileys may return 5511999888777:7@s.whatsapp.net — we need the canonical form
+            realJid = normalizeJid(result[0].jid) || proposedJid
           }
         } catch (err) {
           console.error('[WA] onWhatsApp check failed:', err.message)
         }
 
-        // Get or create conversation
+        // Get or create conversation (uses normalized JID internally)
         const conv = getOrCreateConversation(realJid, data.name || null)
         if (!conv) {
           callback({ success: false, error: 'Could not create conversation' })
@@ -1384,7 +1470,8 @@ app.prepare().then(async () => {
     // or content+timestamp). Used by the "Pull from Odoo" button on the chat header.
     socket.on('whatsapp:inject-history', (data, callback) => {
       try {
-        const conv = conversations.get(data.jid)
+        const jid = normalizeJid(data?.jid)
+        const conv = jid ? conversations.get(jid) : null
         if (!conv) {
           callback({ success: false, error: 'Conversation not found' })
           return
@@ -1449,21 +1536,33 @@ app.prepare().then(async () => {
     // The conversation will reappear if the contact sends a new message.
     socket.on('whatsapp:delete-conversation', (data, callback) => {
       try {
-        if (!data?.jid) { callback({ success: false, error: 'jid required' }); return }
-        const existed = conversations.delete(data.jid)
-        console.log(`[WA] Deleted conversation ${data.jid} (existed=${existed})`)
+        const jid = normalizeJid(data?.jid)
+        if (!jid) { callback({ success: false, error: 'valid jid required' }); return }
+        const existed = conversations.delete(jid)
+        // Also remove from deviceContacts so it disappears from the Contacts tab too
+        deviceContacts.delete(jid)
+        console.log(`[WA] Deleted conversation ${jid} (existed=${existed})`)
         io.of('/whatsapp').emit('whatsapp:conversations', getSortedConversations())
-        io.of('/whatsapp').emit('whatsapp:conversation:deleted', { jid: data.jid })
+        io.of('/whatsapp').emit('whatsapp:conversation:deleted', { jid })
         callback({ success: true })
       } catch (error) {
         callback({ success: false, error: error.message })
       }
     })
 
-    // ===== Refresh data: re-fetch chats, contacts, and profile pics from phone =====
-    // Triggered by the user clicking the "Refresh" button. Pulls the latest
-    // chat list and contacts from Baileys, updates lastMessageAt/unreadCount,
-    // and re-emits the conversations list.
+    // ===== Refresh data: re-sync app state, fetch profile pics, re-emit lists =====
+    // Triggered by the user clicking the "Refresh" button.
+    //
+    // IMPORTANT: Baileys does NOT expose getChats() or getContacts() on the WASocket.
+    // The previous implementation called those non-existent methods and silently
+    // failed with 0 results — which is why the refresh button "did nothing".
+    //
+    // The correct way to refresh is:
+    //   1. Call waSocket.resyncAppState() to trigger a fresh history sync
+    //      (this fires messaging-history.set with the latest chats/contacts/messages)
+    //   2. Fetch profile pictures for conversations that don't have one yet
+    //      (limit to 15 to avoid rate-limiting)
+    //   3. Re-emit the current conversations and contacts lists to all clients
     socket.on('whatsapp:refresh-data', async (data, callback) => {
       try {
         if (!waSocket || connectionState.connection !== 'open') {
@@ -1471,72 +1570,67 @@ app.prepare().then(async () => {
           return
         }
 
-        console.log('[WA] Manual refresh requested — re-fetching chats & contacts')
+        console.log('[WA] Manual refresh requested — re-syncing app state & fetching profile pics')
 
-        // 1. Re-fetch all chats from phone (history sync)
-        let chatsFetched = 0
+        // 1. Trigger a fresh app-state resync (fires messaging-history.set asynchronously)
+        let resyncTriggered = false
         try {
-          const allChats = await waSocket.getChats()
-          for (const chat of allChats || []) {
-            if (!isValidPhoneJid(chat.id)) continue
-            chatsFetched++
-            const conv = getOrCreateConversation(chat.id)
-            if (conv) {
-              if (chat.name && !conv.name) conv.name = chat.name
-              if (chat.unreadCount !== undefined) conv.unreadCount = chat.unreadCount
-              if (chat.lastMessage) {
-                conv.lastMessage = chat.lastMessage.message ||
-                  (chat.lastMessage.message?.conversation) ||
-                  (chat.lastMessage.message?.extendedTextMessage?.text) ||
-                  conv.lastMessage
-                if (chat.lastMessage.messageTimestamp) {
-                  conv.lastMessageAt = new Date(chat.lastMessage.messageTimestamp * 1000)
-                }
-              }
-            }
+          if (typeof waSocket.resyncAppState === 'function') {
+            // Resync all app state collections in the background
+            waSocket.resyncAppState(['critical_block', 'critical_unblock_low', 'regular_high', 'regular_low', 'regular'], false)
+              .then(() => console.log('[WA] resyncAppState complete'))
+              .catch(err => console.error('[WA] resyncAppState error:', err.message))
+            resyncTriggered = true
+          } else {
+            console.log('[WA] resyncAppState not available on this socket')
           }
         } catch (err) {
-          console.error('[WA] getChats failed:', err.message)
+          console.error('[WA] resyncAppState trigger failed:', err.message)
         }
 
-        // 2. Re-fetch all contacts from phone
-        let contactsFetched = 0
-        try {
-          const allContacts = await waSocket.getContacts()
-          for (const contact of allContacts || []) {
-            if (!contact.id || !isValidPhoneJid(contact.id)) continue
-            if (contact.name || contact.notify || contact.verifiedName) {
-              const name = contact.name || contact.notify || contact.verifiedName
-              updateConversationName(contact.id, name)
-              contactsFetched++
-            }
-          }
-        } catch (err) {
-          console.error('[WA] getContacts failed:', err.message)
-        }
-
-        // 3. Try to fetch profile pictures for conversations that don't have one yet
-        // (limit to 10 to avoid rate-limiting)
+        // 2. Fetch profile pictures for conversations that don't have one yet
+        // (limit to 15 to avoid rate-limiting — WhatsApp will block if we hit it too fast)
         let picsFetched = 0
+        const picPromises = []
         for (const [jid, conv] of conversations.entries()) {
-          if (picsFetched >= 10) break
+          if (picsFetched >= 15) break
           if (conv.avatarUrl) continue
-          try {
-            const picUrl = await waSocket.profilePictureUrl(jid, 'image').catch(() => null)
-            if (picUrl) { conv.avatarUrl = picUrl; picsFetched++ }
-          } catch {}
+          picsFetched++
+          // Use a Promise chain so all fetches happen in parallel
+          picPromises.push(
+            waSocket.profilePictureUrl(jid, 'image')
+              .then(picUrl => {
+                if (picUrl) {
+                  conv.avatarUrl = picUrl
+                  io.of('/whatsapp').emit('whatsapp:conversation:update', serializeConversation(conv))
+                }
+              })
+              .catch(() => {})
+          )
         }
+        // Wait for all pic fetches to complete (with a 10s timeout)
+        await Promise.race([
+          Promise.allSettled(picPromises),
+          new Promise(resolve => setTimeout(resolve, 10000)),
+        ])
 
-        // 4. Emit updated conversations list
+        // 3. Re-emit the current conversations and contacts lists
         io.of('/whatsapp').emit('whatsapp:conversations', getSortedConversations())
 
-        console.log(`[WA] Refresh complete: ${chatsFetched} chats, ${contactsFetched} contacts, ${picsFetched} pics`)
+        // 4. Compute counts for the response
+        const totalConversations = conversations.size
+        const totalContacts = deviceContacts.size
+
+        console.log(`[WA] Refresh complete: resyncTriggered=${resyncTriggered}, picsFetched=${picsFetched}, totalConversations=${totalConversations}, totalContacts=${totalContacts}`)
+
         callback({
           success: true,
-          chatsFetched,
-          contactsFetched,
+          resyncTriggered,
           picsFetched,
-          totalConversations: conversations.size,
+          chatsFetched: totalConversations,   // for backwards-compat with frontend prop name
+          contactsFetched: totalContacts,     // for backwards-compat with frontend prop name
+          totalConversations,
+          totalContacts,
         })
       } catch (error) {
         callback({ success: false, error: error.message })

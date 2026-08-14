@@ -147,9 +147,25 @@ export function useWhatsApp() {
       // Use the ref so we always see the latest currentJid even though this
       // handler is registered once on mount. Without this, sent/incoming
       // messages would never be appended to the active chat view.
-      // Normalize JIDs (strip any ":xx" suffix) for the comparison to be safe.
-      const normalizeJid = (j: string | null | undefined) => (j ? j.split(':')[0] : j)
-      const isActive = normalizeJid(data.conversationJid) === normalizeJid(currentJidRef.current)
+      // *** CRITICAL: Normalize JIDs to canonical form <digits>@s.whatsapp.net
+      // before comparing. Baileys may send JIDs with a :N device suffix
+      // (e.g. 5511999888777:7@s.whatsapp.net) which would NOT match the
+      // canonical JID stored in the conversations list, causing incoming
+      // messages to never be appended to the active chat view.
+      const normalizeJid = (j: string | null | undefined): string | null => {
+        if (!j) return null
+        const atIdx = j.indexOf('@')
+        if (atIdx < 0) return null
+        const server = j.slice(atIdx + 1)
+        if (server !== 's.whatsapp.net') return null
+        const userCombined = j.slice(0, atIdx)
+        const user = userCombined.split(':')[0].split('_')[0]
+        if (!/^\d{7,}$/.test(user)) return null
+        return `${user}@s.whatsapp.net`
+      }
+      const normalizedIncoming = normalizeJid(data.conversationJid)
+      const normalizedCurrent = normalizeJid(currentJidRef.current)
+      const isActive = normalizedIncoming !== null && normalizedIncoming === normalizedCurrent
 
       if (isActive) {
         setCurrentMessages(prev => {

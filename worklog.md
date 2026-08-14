@@ -250,3 +250,65 @@ Stage Summary:
 - Delete conversation: button appears on hover in list (with confirmation) + button in chat header
 - Refresh button in conversation list header re-fetches chats, contacts, and missing profile pictures from phone
 - Version: 7.12.0
+
+---
+Task ID: FIX-V713
+Agent: main
+Task: Fix incoming messages not appearing + refresh button not fetching contacts
+
+Work Log:
+- ROOT CAUSE ANALYSIS: Found that the local `isValidPhoneJid`, `extractPhone`, and `jidNormalizedUser` functions in server.js were BROKEN for JIDs with the `:N` device suffix (e.g. `5511999888777:7@s.whatsapp.net`). When a contact replies from a non-primary device, Baileys delivers the message with this suffix, and the old `isValidPhoneJid` check (`/^\d{7,}$/.test(jid.split('@')[0])`) returned false because the numPart was `5511999888777:7` (colon and digit). The message was silently dropped at the `if (!isValidPhoneJid(jid)) continue` line in `messages.upsert`, which is exactly why outgoing messages worked (we send to the canonical JID) but incoming replies never showed.
+- Also found that the local `jidNormalizedUser` was inconsistent: for `5511999888777@s.whatsapp.net` it returned the full JID, but for `5511999888777:7@s.whatsapp.net` it returned just `5511999888777` (without `@s.whatsapp.net`). This caused JID key mismatches in the `conversations`, `contactNames`, and `deviceContacts` Maps.
+- Also found that the refresh button's handler called `waSocket.getChats()` and `waSocket.getContacts()` which DON'T EXIST on the Baileys WASocket — they silently failed (returned undefined), so the for loops didn't iterate and the refresh returned success with 0 chats / 0 contacts fetched. The user correctly observed "não trouxe os contatos e conversas do celular".
+- Also found that the frontend's `normalizeJid` in `use-whatsapp.ts` had the same colon-stripping bug — for a JID with `:N` suffix, it returned just the digits (without `@s.whatsapp.net`), which would never match the canonical JID stored in the conversations list.
+- ALSO found that messages wrapped in `ephemeralMessage.message`, `viewOnceMessage.message`, or `viewOnceMessageV2.message` (disappearing messages, view-once content) were being skipped because text extraction looked at `msg.message?.conversation` etc., not at the unwrapped inner message. Added an unwrap step.
+- ALSO found that messages wrapped in `documentWithCaptionMessage.message` were being skipped. Added unwrap for that too.
+
+Fixes applied to server.js:
+- Added a single canonical `normalizeJid(jid)` function that always returns `<digits>@s.whatsapp.net` or null. Strips `:device` and `_agent` suffixes, validates digits ≥ 7, requires `@s.whatsapp.net` server.
+- Rewrote `isValidPhoneJid` to delegate to `normalizeJid`.
+- Rewrote `extractPhone` to use `normalizeJid`.
+- Rewrote `jidNormalizedUser` as a thin compatibility alias for `normalizeJid`.
+- Rewrote `getOrCreateConversation` to normalize the JID at entry and use the normalized form as the Map key.
+- Rewrote `updateConversationName` to normalize the JID at entry.
+- Updated `messages.upsert` handler:
+  * Normalize the JID at entry (rawJid → jid)
+  * Skip if jid is null with explicit log
+  * Unwrap ephemeralMessage / viewOnceMessage / viewOnceMessageV2 / documentWithCaptionMessage before text extraction
+  * Skip if no message body with explicit log
+  * Log every step (rawJid, normalized, fromMe, id, stored, skipped reasons)
+  * Use the normalized JID for all Map lookups, message emit, and Odoo sync
+- Updated `messaging-history.set` handler:
+  * Normalize JIDs for contacts, chats, and messages loops
+  * Also populate deviceContacts phonebook from history sync contacts (so phone contacts appear in the Contacts tab even before any conversation)
+  * Unwrap nested message types before text extraction
+- Updated `chats.upsert`, `chats.update`, `contacts.update` handlers to normalize JIDs.
+- Updated `messages.update` handler to normalize JIDs.
+- Updated all socket handlers (`whatsapp:get-messages`, `whatsapp:send-message`, `whatsapp:send-media`, `whatsapp:mark-read`, `whatsapp:get-profile-pic`, `whatsapp:inject-history`, `whatsapp:delete-conversation`, `whatsapp:start-conversation`) to normalize the incoming JID at entry.
+- Completely rewrote `whatsapp:refresh-data` handler:
+  * Removed the broken `waSocket.getChats()` / `waSocket.getContacts()` calls (these methods do not exist on WASocket)
+  * Now calls `waSocket.resyncAppState(['critical_block', 'critical_unblock_low', 'regular_high', 'regular_low', 'regular'], false)` to trigger a fresh history sync in the background (this fires `messaging-history.set` asynchronously, which repopulates chats/contacts/messages)
+  * Fetches profile pictures in parallel for up to 15 conversations missing one (was 10, sequential; now 15, parallel with 10s timeout)
+  * Re-emits the current conversations list
+  * Returns counts (resyncTriggered, picsFetched, totalConversations, totalContacts) plus backwards-compat fields (chatsFetched, contactsFetched)
+- Updated `whatsapp:delete-conversation` to also remove from `deviceContacts` so deleted contacts disappear from the Contacts tab too.
+- Updated `whatsapp:start-conversation` to normalize the JID returned by `waSocket.onWhatsApp()` (Baileys may return the `:N` suffixed form).
+
+Fixes applied to src/lib/use-whatsapp.ts:
+- Rewrote the inline `normalizeJid` helper inside the `whatsapp:message` handler to use the same canonical form as the server: extracts user portion (strips `:device` and `_agent`), requires `@s.whatsapp.net`, validates digits ≥ 7. This fixes the JID comparison bug that was preventing incoming messages from being appended to the active chat view.
+
+Version bump:
+- package.json: 7.12.0 → 7.13.0
+- start.sh banner: v7.12 → v7.13
+- server.js header: v7.12 → v7.13
+- src/app/page.tsx sidebar label: v7.12 → v7.13 Middleware
+- npx next build: ✓ succeeded
+- node --check server.js: ✓ succeeded
+
+Stage Summary:
+- Incoming messages from contacts now appear in the conversation view (root cause: JID normalization was rejecting `:N` suffixed JIDs from Baileys, silently dropping the message)
+- Disappearing messages and view-once messages now also appear (root cause: nested message types weren't being unwrapped before text extraction)
+- Refresh button now actually does something useful: triggers `resyncAppState` to re-sync app state with the phone, fetches missing profile pictures in parallel, and re-emits the conversations/contacts lists. Previously it called non-existent `getChats()` / `getContacts()` methods and silently did nothing.
+- Delete conversation now also removes the contact from the Contacts tab (was only removing from Conversations)
+- All JIDs are now normalized to canonical form `<digits>@s.whatsapp.net` at every entry point (Baileys events and socket handlers), preventing future JID-mismatch bugs.
+- Version: 7.13.0
