@@ -310,6 +310,25 @@ export function useOdoo() {
     })
   }, [])
 
+  // v7.24 (R6): Admin-only — dump every active user's WA creds + conversation
+  // state to Odoo chatter. Used by the "Backup de dados no Odoo" button in
+  // the admin UsersPanel. Should be triggered manually BEFORE any deploy
+  // (in addition to the automatic SIGTERM-triggered backup).
+  const backupAllToOdoo = useCallback((): Promise<{
+    success: boolean
+    backed?: number
+    total?: number
+    failed?: Array<{ userId: string; email: string; error: string }>
+    details?: Array<{ userId: string; email: string; success: boolean; chunksPosted?: number; error?: string }>
+    error?: string
+  }> => {
+    return new Promise((resolve) => {
+      socketRef.current?.emit('admin:backup-to-odoo', {}, (response: any) => {
+        resolve(response)
+      })
+    })
+  }, [])
+
   // ===== Sales =====
   const searchSales = useCallback((query?: string, limit?: number): Promise<{ success: boolean; data?: OdooSale[]; error?: string }> => {
     return new Promise((resolve) => {
@@ -435,6 +454,8 @@ export function useOdoo() {
     // v7.21: Sync all + status
     syncAllHistory,
     getSyncStatus,
+    // v7.24 (R6): Admin-only backup of all user sessions to Odoo chatter
+    backupAllToOdoo,
     // Sales
     searchSales,
     createSale,

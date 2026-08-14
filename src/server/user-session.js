@@ -302,6 +302,114 @@ class UserSession {
     }
   }
 
+  // v7.24 (R6): Pre-deploy backup — dump this user's WA creds + conversation
+  // state to Odoo chatter so the data survives even if the disk is wiped
+  // during a Render deploy. Posted as a mail.message on a designated
+  // res.partner (the user's own partner if findable, otherwise partner 1).
+  //
+  // Format: subject `[BACKUP-CREDS] User <email> — <timestamp>`, body is
+  // JSON-stringified { creds, conversations }. If the JSON is too large
+  // (>600 KB per chunk — Odoo's chatter body limit is ~1MB), it's split
+  // into N chunks posted as separate messages with subject suffix `[1/N]`.
+  //
+  // Returns: { success, chunksPosted, partnerId, error? }
+  async backupToOdoo() {
+    if (!this.odooConfig.uid) {
+      return { success: false, chunksPosted: 0, error: 'Odoo not authenticated' }
+    }
+    try {
+      // Persist current state to disk first (so the backup reflects the
+      // latest conversations, not the last periodic save).
+      this.persistConversationsToDisk()
+
+      // Read creds.json
+      const credsPath = path.join(this.authFolder, 'creds.json')
+      let credsJson = null
+      try {
+        if (fs.existsSync(credsPath)) {
+          credsJson = JSON.parse(fs.readFileSync(credsPath, 'utf8'))
+        }
+      } catch (err) {
+        console.warn(`[Backup:${this.userId}] Could not read creds.json:`, err.message)
+      }
+
+      // Read conv_state_<userId>.json
+      let convState = null
+      try {
+        if (fs.existsSync(this.stateFile)) {
+          convState = JSON.parse(fs.readFileSync(this.stateFile, 'utf8'))
+        }
+      } catch (err) {
+        console.warn(`[Backup:${this.userId}] Could not read conv state:`, err.message)
+      }
+
+      // Build the JSON payload
+      const payload = JSON.stringify({
+        userId: this.userId,
+        email: this.user.email,
+        backedUpAt: new Date().toISOString(),
+        version: '7.24',
+        creds: credsJson,
+        conversations: convState,
+      })
+
+      // Find a partner to post to. Strategy: look up res.partner by the
+      // user's email; if not found, fall back to partner id 1
+      // (Administrator in most Odoo installs).
+      let backupPartnerId = 1
+      try {
+        const partners = await this.odooExecuteKw('res.partner', 'search_read', [
+          [['email', '=', this.user.email]],
+        ], { fields: ['id', 'name'], limit: 1 })
+        if (partners && partners.length > 0) {
+          backupPartnerId = partners[0].id
+        } else {
+          // Fall back: try admin user's partner (res.users where login = 'admin')
+          const adminUsers = await this.odooExecuteKw('res.users', 'search_read', [
+            [['login', '=', 'admin']],
+          ], { fields: ['partner_id'], limit: 1 })
+          if (adminUsers && adminUsers.length > 0 && adminUsers[0].partner_id) {
+            backupPartnerId = adminUsers[0].partner_id[0]
+          }
+        }
+      } catch (err) {
+        console.warn(`[Backup:${this.userId}] Partner lookup failed, using id=1:`, err.message)
+      }
+
+      // Split into chunks of ~600 KB (base64 expansion + Odoo overhead
+      // means 600 KB raw → ~800 KB on the wire, safely under 1 MB).
+      const CHUNK_SIZE = 600_000
+      const chunks = []
+      for (let i = 0; i < payload.length; i += CHUNK_SIZE) {
+        chunks.push(payload.slice(i, i + CHUNK_SIZE))
+      }
+      if (chunks.length === 0) chunks.push('')
+
+      const tsLabel = new Date().toISOString()
+      const subject = `[BACKUP-CREDS] User ${this.user.email} — ${tsLabel}`
+      const total = chunks.length
+
+      for (let i = 0; i < chunks.length; i++) {
+        const partNum = i + 1
+        const body = `<div><strong>${subject}</strong> [${partNum}/${total}]<br/>` +
+          `<em>Backup dos dados de conexão e conversas — não editar.</em>` +
+          `<pre style="font-size:10px; white-space:pre-wrap; word-break:break-all;">${escapeHtml(chunks[i])}</pre></div>`
+        try {
+          await this.odooPostMessage('res.partner', backupPartnerId, body)
+        } catch (err) {
+          console.error(`[Backup:${this.userId}] Chunk ${partNum}/${total} failed:`, err.message)
+          return { success: false, chunksPosted: i, partnerId: backupPartnerId, error: err.message }
+        }
+      }
+
+      console.log(`[Backup:${this.userId}] ✓ Posted ${total} chunk(s) to partner ${backupPartnerId}`)
+      return { success: true, chunksPosted: total, partnerId: backupPartnerId }
+    } catch (err) {
+      console.error(`[Backup:${this.userId}] Error:`, err.message)
+      return { success: false, chunksPosted: 0, error: err.message }
+    }
+  }
+
   // ------------------------------------------------------------------
   // Persistence — conversations/contacts/messages to per-user JSON file
   // ------------------------------------------------------------------
@@ -634,6 +742,69 @@ class UserSession {
     })
   }
 
+  // v7.24 (R7): Post a message to Odoo chatter WITH media attachments.
+  // Uploads the media as an ir.attachment (base64), then includes it in
+  // the mail.message via attachment_ids. The body also gets a media
+  // indicator line (🎙️ Áudio / 🖼️ Imagem / 📄 Documento / 🎬 Vídeo).
+  // Emojis in the text content are preserved (UTF-8 is native to XML-RPC).
+  //
+  // mediaOpts: { mediaBase64, mimeType, fileName, mediaType } | null
+  // Returns: { mailMessageId, attachmentIds }
+  async odooPostMessageWithMedia(model, recordId, body, mediaOpts = null) {
+    const attachmentIds = []
+
+    if (mediaOpts && mediaOpts.mediaBase64 && mediaOpts.mimeType) {
+      try {
+        const safeName = mediaOpts.fileName || `midia-${Date.now()}`
+        const attachmentId = await this.odooExecuteKw('ir.attachment', 'create', [{
+          name: safeName,
+          datas: mediaOpts.mediaBase64,
+          mimetype: mediaOpts.mimeType,
+          res_model: model,
+          res_id: recordId,
+        }])
+        if (attachmentId) {
+          attachmentIds.push(attachmentId)
+          console.log(`[Odoo:${this.userId}] ✓ Attachment uploaded: ${safeName} (id=${attachmentId})`)
+        }
+      } catch (err) {
+        console.error(`[Odoo:${this.userId}] Attachment create failed:`, err.message)
+      }
+    }
+
+    // Build the mail.message payload. attachment_ids uses the Odoo
+    // command tuple [6, 0, ids] = "replace the list with these ids".
+    const kwargs = {
+      body,
+      message_type: 'comment',
+      subtype_xmlid: 'mail.mt_comment',
+    }
+    if (attachmentIds.length > 0) {
+      kwargs.attachment_ids = [[6, 0, attachmentIds]]
+    }
+
+    const mailMessageId = await this.odooExecuteKw(model, 'message_post', [recordId], kwargs)
+    return { mailMessageId, attachmentIds }
+  }
+
+  // v7.24 (R7): Build the chatter body for a WhatsApp message that may
+  // include media. Preserves emojis in the text content (no HTML escape
+  // of UTF-8 emoji characters — only escapes HTML metacharacters).
+  buildChatterBody(direction, timestamp, textContent, mediaOpts = null) {
+    const tsLabel = new Date(timestamp).toLocaleString('pt-BR')
+    let mediaLine = ''
+    if (mediaOpts) {
+      const t = mediaOpts.mediaType
+      if (t === 'audio') mediaLine = '🎙️ Áudio<br/>'
+      else if (t === 'image') mediaLine = '🖼️ Imagem<br/>'
+      else if (t === 'document') mediaLine = `📄 ${escapeHtml(mediaOpts.fileName || 'Documento')}<br/>`
+      else if (t === 'video') mediaLine = '🎬 Vídeo<br/>'
+      else if (t === 'sticker') mediaLine = '🏷️ Sticker<br/>'
+    }
+    const textHtml = textContent ? `<span>${escapeHtml(textContent)}</span>` : ''
+    return `<div><strong>📱 WhatsApp ${direction}:</strong> ${tsLabel}<br/>${mediaLine}${textHtml}</div>`
+  }
+
   async findWhatsAppActivityType() {
     try {
       const types = await this.odooExecuteKw('mail.activity.type', 'search_read', [[['name', 'ilike', 'WhatsApp']]], { fields: ['id', 'name'], limit: 1 })
@@ -783,25 +954,40 @@ class UserSession {
       // ===== Step 3: ALWAYS post to chatter (incoming AND outgoing) =====
       if (this.autoSyncSettings.autoPostMessages && result.partnerId) {
         const direction = data.fromMe ? 'Enviada' : 'Recebida'
-        const mediaLabel = data.mediaType ? ` [${data.mediaType}]` : ''
-        const tsLabel = `(${data.timestamp})`
-        const msgBody = data.textContent
-          ? `<p><strong>📱 WhatsApp ${direction}:</strong>${mediaLabel} ${tsLabel}</p><p>${escapeHtml(data.textContent)}</p>`
-          : `<p><strong>📱 WhatsApp ${direction}:</strong>${mediaLabel} ${tsLabel} [Mídia]</p>`
+
+        // v7.24 (R7): Build the chatter body via the shared helper, which
+        // includes a media indicator line (🎙️/🖼️/📄/🎬) when media is
+        // present and preserves emoji characters in the text content.
+        const mediaOpts = (data.mediaBase64 && data.mimeType)
+          ? { mediaBase64: data.mediaBase64, mimeType: data.mimeType, fileName: data.fileName, mediaType: data.mediaType }
+          : (data.mediaType ? { mediaType: data.mediaType, fileName: data.fileName } : null)
+        const msgBody = this.buildChatterBody(direction, data.timestamp, data.textContent, mediaOpts)
 
         try {
-          result.mailMessageId = await this.odooPostMessage('res.partner', result.partnerId, msgBody)
+          // v7.24 (R7): Use the media-aware post method when we have base64
+          // data — it will upload the media as an ir.attachment and link it
+          // to the mail.message. Falls back to plain text post otherwise.
+          if (data.mediaBase64 && data.mimeType) {
+            const r = await this.odooPostMessageWithMedia('res.partner', result.partnerId, msgBody, mediaOpts)
+            result.mailMessageId = r.mailMessageId
+          } else {
+            result.mailMessageId = await this.odooPostMessage('res.partner', result.partnerId, msgBody)
+          }
           result.chatterPosted = true
-          console.log(`[AutoSync:${this.userId}] ✓ Posted to partner ${result.partnerId} chatter: ${direction}`)
+          console.log(`[AutoSync:${this.userId}] ✓ Posted to partner ${result.partnerId} chatter: ${direction}${data.mediaBase64 ? ' (with media)' : ''}`)
         } catch (error) {
           result.errors.push(`Failed to post to partner chatter: ${error.message}`)
         }
 
         if (result.leadId) {
           try {
-            await this.odooPostMessage('crm.lead', result.leadId, msgBody)
+            if (data.mediaBase64 && data.mimeType) {
+              await this.odooPostMessageWithMedia('crm.lead', result.leadId, msgBody, mediaOpts)
+            } else {
+              await this.odooPostMessage('crm.lead', result.leadId, msgBody)
+            }
             result.chatterLeadPosted = true
-            console.log(`[AutoSync:${this.userId}] ✓ Posted to lead ${result.leadId} chatter: ${direction}`)
+            console.log(`[AutoSync:${this.userId}] ✓ Posted to lead ${result.leadId} chatter: ${direction}${data.mediaBase64 ? ' (with media)' : ''}`)
           } catch (error) {
             result.errors.push(`Failed to post to lead chatter: ${error.message}`)
           }
@@ -1629,7 +1815,16 @@ class UserSession {
                 const filePath = path.join(this.mediaDir, safeFileName)
                 fs.writeFileSync(filePath, buffer)
                 mediaUrl = `/media/${safeFileName}`
-                console.log(`[WA:${this.userId}] ✓ Media downloaded: ${mediaType} → ${mediaUrl} (${buffer.length} bytes)`)
+                // v7.24 (R7): Also compute the base64 string so the message
+                // can be uploaded to Odoo chatter as an ir.attachment.
+                // Cap at ~1.5 MB (base64 ~2 MB) to avoid bloating memory —
+                // larger media will still have the file URL on disk, but
+                // won't be attached to Odoo chatter (only the media-line
+                // indicator is posted).
+                if (buffer.length < 1_500_000) {
+                  mediaBase64 = buffer.toString('base64')
+                }
+                console.log(`[WA:${this.userId}] ✓ Media downloaded: ${mediaType} → ${mediaUrl} (${buffer.length} bytes, base64=${mediaBase64 ? 'yes' : 'skipped'})`)
               }
             } catch (mediaErr) {
               console.error(`[WA:${this.userId}] Media download failed for ${msgId}: ${mediaErr.message}`)
@@ -1686,6 +1881,10 @@ class UserSession {
               jid, phone, pushName: conv.pushName, textContent, mediaType, fromMe,
               timestamp: messageTimestamp.toISOString(),
               dedupId: msgId,
+              // v7.24 (R7): pass media data so it can be uploaded to Odoo chatter
+              mediaBase64,
+              mimeType: mediaMimeType,
+              fileName: mediaFileName,
             }).then(result => {
               if (result.partnerId || result.leadId) {
                 this.emitWA('whatsapp:odoo-sync', {
@@ -1777,6 +1976,8 @@ class UserSession {
                 this.autoSyncWhatsAppMessage({
                   jid, phone, pushName: conv.pushName, textContent, mediaType, fromMe,
                   timestamp: ts.toISOString(), dedupId: msgId,
+                  // v7.24 (R7): media data not available in this fallback path
+                  mediaBase64: null, mimeType: null, fileName: null,
                 }).catch(err => console.error(`[AutoSync:${this.userId}] Error:`, err.message))
               }
             } catch (err) {
@@ -2114,7 +2315,14 @@ class UserSession {
       const phone = extractPhone(jid)
       if (phone) {
         try {
-          await this.autoSyncWhatsAppMessage({ jid, phone, pushName: conv.pushName, textContent: data.text, mediaType: null, fromMe: true, timestamp: new Date().toISOString(), dedupId: msgId })
+          await this.autoSyncWhatsAppMessage({
+            jid, phone, pushName: conv.pushName,
+            textContent: data.text, mediaType: null,
+            fromMe: true, timestamp: new Date().toISOString(),
+            dedupId: msgId,
+            // v7.24 (R7): text-only message — no media fields
+            mediaBase64: null, mimeType: null, fileName: null,
+          })
         } catch (err) {
           console.error(`[AutoSync:${this.userId}] Send error:`, err.message)
         }
@@ -2162,7 +2370,27 @@ class UserSession {
       const phone = extractPhone(jid)
       if (phone) {
         try {
-          await this.autoSyncWhatsAppMessage({ jid, phone, pushName: conv.pushName, textContent: data.caption || null, mediaType: data.type, fromMe: true, timestamp: messageTimestamp.toISOString(), dedupId: msgId })
+          // v7.24 (R7): Read the file back as base64 so it can be attached
+          // to Odoo chatter. The file was just written to disk by the
+          // caller (onSendMedia). If the read fails, we still post the
+          // text-only chatter message.
+          let outgoingB64 = null
+          try {
+            const fpath = data.url?.replace(/^\/media\//, this.mediaDir + '/')
+            if (fpath && fs.existsSync(fpath)) {
+              const buf = fs.readFileSync(fpath)
+              if (buf.length < 1_500_000) outgoingB64 = buf.toString('base64')
+            }
+          } catch {}
+          await this.autoSyncWhatsAppMessage({
+            jid, phone, pushName: conv.pushName,
+            textContent: data.caption || null, mediaType: data.type,
+            fromMe: true, timestamp: messageTimestamp.toISOString(),
+            dedupId: msgId,
+            mediaBase64: outgoingB64,
+            mimeType: data.mimeType || null,
+            fileName: data.fileName || null,
+          })
         } catch (err) {
           console.error(`[AutoSync:${this.userId}] Send media error:`, err.message)
         }
@@ -2259,12 +2487,19 @@ class UserSession {
       const phone = extractPhone(jid)
       if (phone) {
         try {
+          // v7.24 (R7): Pass the base64 data straight through — it's
+          // already in memory, no need to re-read from disk. Cap at
+          // 1.5 MB to avoid Odoo XML-RPC payload limits.
+          const outgoingB64 = (buffer.length < 1_500_000) ? data.base64 : null
           await this.autoSyncWhatsAppMessage({
             jid, phone, pushName: conv.pushName,
             textContent: data.caption || `[${mediaType}]`,
             mediaType, fromMe: true,
             timestamp: messageTimestamp.toISOString(),
             dedupId: finalMsgId,
+            mediaBase64: outgoingB64,
+            mimeType,
+            fileName: data.fileName || null,
           })
         } catch (err) {
           console.error(`[AutoSync:${this.userId}] Send media base64 error:`, err.message)
@@ -3002,6 +3237,31 @@ class SessionManager {
       try { s.stop() } catch {}
     }
     this.sessions.clear()
+  }
+
+  // v7.24 (R6): Backup ALL active user sessions to Odoo chatter before
+  // a deploy. Iterates every UserSession and calls backupToOdoo() on it.
+  // Returns: { backed: number, failed: [{userId, email, error}], total: number }
+  async backupAllToOdoo() {
+    const result = { backed: 0, failed: [], total: 0, details: [] }
+    const entries = Array.from(this.sessions.entries())
+    result.total = entries.length
+    console.log(`[SessionManager] Backup all → ${entries.length} session(s)`)
+    for (const [userId, s] of entries) {
+      try {
+        const r = await s.backupToOdoo()
+        result.details.push({ userId, email: s.user.email, ...r })
+        if (r.success) {
+          result.backed++
+        } else {
+          result.failed.push({ userId, email: s.user.email, error: r.error || 'unknown' })
+        }
+      } catch (err) {
+        result.failed.push({ userId, email: s.user?.email || '?', error: err.message })
+      }
+    }
+    console.log(`[SessionManager] Backup complete: ${result.backed}/${result.total} ok, ${result.failed.length} failed`)
+    return result
   }
 }
 

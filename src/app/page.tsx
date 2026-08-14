@@ -222,6 +222,7 @@ function ConversationsView({
   onSelectConversation,
   onSendMessage,
   onSendMedia,
+  onSendMediaBase64,
   onMarkRead,
   onToggleOdooPanel,
   onLinkConversation,
@@ -254,6 +255,7 @@ function ConversationsView({
   onSelectConversation: (jid: string) => void
   onSendMessage: (jid: string, text: string) => Promise<boolean>
   onSendMedia?: (jid: string, file: File, caption?: string) => Promise<{ success: boolean; error?: string }>
+  onSendMediaBase64?: (jid: string, opts: { type: 'image' | 'audio' | 'video' | 'document'; base64: string; mimeType: string; fileName?: string; caption?: string }) => Promise<{ success: boolean; error?: string }>
   onMarkRead: (jid: string) => void
   onToggleOdooPanel: (show: boolean) => void
   onLinkConversation: any
@@ -319,6 +321,7 @@ function ConversationsView({
               messages={currentMessages}
               onSendMessage={onSendMessage}
               onSendMedia={onSendMedia}
+              onSendMediaBase64={onSendMediaBase64}
               onMarkRead={onMarkRead}
               odooConnected={odooStatus.connected}
               odooLinkedRecords={linkedOdooRecords}
@@ -500,7 +503,7 @@ export default function HomePage() {
             {!sidebarCollapsed && (
               <div className="hidden lg:block min-w-0">
                 <p className="text-sm font-bold leading-tight truncate">Whats-Odoo</p>
-                <p className="text-[10px] text-muted-foreground">v7.23 Middleware</p>
+                <p className="text-[10px] text-muted-foreground">v7.24 Middleware</p>
               </div>
             )}
           </div>
@@ -652,6 +655,7 @@ export default function HomePage() {
             onSelectConversation={handleSelectConversation}
             onSendMessage={wa.sendMessage}
             onSendMedia={wa.sendMedia}
+            onSendMediaBase64={wa.sendMediaBase64}
             onMarkRead={wa.markRead}
             onToggleOdooPanel={setShowOdooPanel}
             onLinkConversation={odoo.linkConversation}

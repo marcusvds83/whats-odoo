@@ -107,16 +107,46 @@ function persistAllSessions() {
   }
 }
 
-process.on('SIGTERM', () => {
-  console.log('[Server] SIGTERM — persisting all user sessions to disk...')
+// v7.24 (R6): Pre-deploy backup — dump every active user's WA creds +
+// conversation state to Odoo chatter before the process is killed.
+// This runs synchronously in the SIGTERM handler so the deploy waits
+// for the backup to complete (Render's grace period is ~30s, which is
+// enough for 1-3 users; for more users the admin should also trigger a
+// manual backup via the "Backup de dados no Odoo" button BEFORE pushing
+// new code).
+async function backupAllSessionsToOdoo() {
+  if (!sessionManager) return { backed: 0, failed: [], total: 0 }
+  try {
+    console.log('[Server] SIGTERM — backing up all user sessions to Odoo chatter...')
+    const result = await sessionManager.backupAllToOdoo()
+    console.log(`[Server] Backup result: ${result.backed}/${result.total} ok, ${result.failed.length} failed`)
+    return result
+  } catch (err) {
+    console.error('[Server] Backup error:', err.message)
+    return { backed: 0, failed: [{ error: err.message }], total: 0 }
+  }
+}
+
+let shuttingDown = false
+async function gracefulShutdown(signal) {
+  if (shuttingDown) return
+  shuttingDown = true
+  console.log(`[Server] ${signal} received — starting graceful shutdown...`)
+  try {
+    // R6: backup to Odoo first (best-effort, 10s timeout per session)
+    await Promise.race([
+      backupAllSessionsToOdoo(),
+      new Promise(r => setTimeout(r, 10_000)),
+    ])
+  } catch {}
   persistAllSessions()
   if (sessionManager) sessionManager.stopAll()
-})
-process.on('SIGINT', () => {
-  console.log('[Server] SIGINT — persisting all user sessions to disk...')
-  persistAllSessions()
-  if (sessionManager) sessionManager.stopAll()
-})
+  console.log(`[Server] ${signal} shutdown complete`)
+  process.exit(0)
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'))
+process.on('SIGINT', () => gracefulShutdown('SIGINT'))
 
 // ====================================================================
 // MAIN SERVER — Next.js + Socket.io (single process)
@@ -326,6 +356,22 @@ app.prepare().then(async () => {
 
     socket.on('odoo:users:search', (data, callback) => s.onUsersSearch(data, callback))
 
+    // v7.24 (R6): Admin-triggered backup of ALL active user sessions to
+    // Odoo chatter. Only admins can call this — non-admins get a 403.
+    socket.on('admin:backup-to-odoo', async (data, callback) => {
+      try {
+        if (s.user.role !== 'admin') {
+          callback?.({ success: false, error: 'Acesso restrito a administradores' })
+          return
+        }
+        const result = await sessionManager.backupAllToOdoo()
+        callback?.({ success: true, ...result })
+      } catch (err) {
+        console.error('[Admin IO] backup-to-odoo error:', err.message)
+        callback?.({ success: false, error: err.message })
+      }
+    })
+
     socket.on('disconnect', () => console.log(`[Odoo IO] Client disconnected: ${socket.id} (user=${s.user.email})`))
   })
 
@@ -341,17 +387,12 @@ app.prepare().then(async () => {
     console.log(`[Server] Odoo namespace: /odoo (auth required)`)
     console.log(`[Server] Per-user auth folder pattern: data/auth_<userId>/`)
     console.log(`[Server] Per-user state file pattern: data/conv_state_<userId>.json`)
+    console.log(`[Server] v7.24: Pre-deploy backup to Odoo enabled (SIGTERM triggers backupAllToOdoo)`)
   })
 
-  process.on('SIGTERM', () => {
-    console.log('[Server] SIGTERM received, shutting down...')
-    if (sessionManager) sessionManager.stopAll()
-    httpServer.close(() => process.exit(0))
-  })
-
-  process.on('SIGINT', () => {
-    console.log('[Server] SIGINT received, shutting down...')
-    if (sessionManager) sessionManager.stopAll()
-    httpServer.close(() => process.exit(0))
-  })
+  // v7.24 (R6): Note — the SIGTERM/SIGINT handlers are already registered
+  // above (see gracefulShutdown). They call backupAllSessionsToOdoo() with
+  // a 10s timeout, then persistAllSessions() + sessionManager.stopAll().
+  // The httpServer is closed by process.exit(0) inside gracefulShutdown.
+  // No duplicate handlers here.
 })

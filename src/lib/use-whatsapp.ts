@@ -393,6 +393,23 @@ export function useWhatsApp() {
     })
   }, [])
 
+  // v7.24: Send media directly from base64 (used by screenshot capture +
+  // mic recording flows that already have base64 data, no File object).
+  const sendMediaBase64 = useCallback((
+    jid: string,
+    opts: { type: 'image' | 'audio' | 'video' | 'document'; base64: string; mimeType: string; fileName?: string; caption?: string }
+  ): Promise<{ success: boolean; error?: string }> => {
+    return new Promise((resolve) => {
+      socketRef.current?.emit(
+        'whatsapp:send-media-base64',
+        { jid, ...opts },
+        (response: { success: boolean; error?: string }) => {
+          resolve(response)
+        }
+      )
+    })
+  }, [])
+
   const markRead = useCallback((jid: string) => {
     socketRef.current?.emit('whatsapp:mark-read', { jid }, () => {})
   }, [])
@@ -562,6 +579,7 @@ export function useWhatsApp() {
     loadMessages,
     sendMessage,
     sendMedia,
+    sendMediaBase64,
     markRead,
     disconnect,
     getProfilePic,

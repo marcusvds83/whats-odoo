@@ -45,7 +45,11 @@ import {
   RefreshCw,
   Key,
   ExternalLink,
+  Database,
+  CheckCircle2,
+  AlertCircle,
 } from 'lucide-react'
+import { useOdoo } from '@/lib/use-odoo'
 
 interface UserRow {
   id: string
@@ -95,6 +99,16 @@ export function UsersPanel() {
   const [dialogOpen, setDialogOpen] = useState(false)
   const [editState, setEditState] = useState<EditState>(EMPTY_EDIT)
   const [isSaving, setIsSaving] = useState(false)
+  // v7.24 (R6): pre-deploy backup state
+  const odoo = useOdoo()
+  const [isBackingUp, setIsBackingUp] = useState(false)
+  const [backupResult, setBackupResult] = useState<{
+    success: boolean
+    backed: number
+    total: number
+    failed: Array<{ userId: string; email: string; error: string }>
+    at: string
+  } | null>(null)
 
   const loadUsers = useCallback(async () => {
     setIsLoading(true)
@@ -117,6 +131,44 @@ export function UsersPanel() {
   useEffect(() => {
     loadUsers()
   }, [loadUsers])
+
+  // v7.24 (R6): Backup all active user sessions to Odoo chatter.
+  // Should be triggered manually BEFORE any deploy.
+  const handleBackupToOdoo = useCallback(async () => {
+    if (isBackingUp) return
+    setIsBackingUp(true)
+    setBackupResult(null)
+    try {
+      const r = await odoo.backupAllToOdoo()
+      if (r.success) {
+        setBackupResult({
+          success: true,
+          backed: r.backed || 0,
+          total: r.total || 0,
+          failed: r.failed || [],
+          at: new Date().toISOString(),
+        })
+      } else {
+        setBackupResult({
+          success: false,
+          backed: r.backed || 0,
+          total: r.total || 0,
+          failed: r.failed || [{ userId: '-', email: '-', error: r.error || 'Falha desconhecida' }],
+          at: new Date().toISOString(),
+        })
+      }
+    } catch (err: any) {
+      setBackupResult({
+        success: false,
+        backed: 0,
+        total: 0,
+        failed: [{ userId: '-', email: '-', error: err.message }],
+        at: new Date().toISOString(),
+      })
+    } finally {
+      setIsBackingUp(false)
+    }
+  }, [isBackingUp, odoo])
 
   const handleCreate = () => {
     setEditState(EMPTY_EDIT)
@@ -215,12 +267,47 @@ export function UsersPanel() {
             <RefreshCw className={`size-4 mr-1.5 ${isLoading ? 'animate-spin' : ''}`} />
             Atualizar
           </Button>
+          {/* v7.24 (R6): Pre-deploy backup button */}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleBackupToOdoo}
+            disabled={isBackingUp || !odoo.isConnected}
+            title={odoo.isConnected ? 'Salva credenciais e conversas de todos os usuários no chatter do Odoo (use antes de deploy)' : 'Conecte ao Odoo primeiro'}
+          >
+            {isBackingUp ? <Loader2 className="size-4 mr-1.5 animate-spin" /> : <Database className="size-4 mr-1.5" />}
+            {isBackingUp ? 'Backup em andamento…' : 'Backup no Odoo'}
+          </Button>
           <Button size="sm" onClick={handleCreate} className="bg-emerald-600 hover:bg-emerald-700 text-white">
             <UserPlus className="size-4 mr-1.5" />
             Novo Usuário
           </Button>
         </div>
       </div>
+
+      {/* v7.24 (R6): Backup result banner */}
+      {backupResult && (
+        <Alert variant={backupResult.success ? 'default' : 'destructive'}>
+          {backupResult.success
+            ? <CheckCircle2 className="size-4" />
+            : <AlertCircle className="size-4" />}
+          <AlertDescription>
+            {backupResult.success
+              ? `Backup concluído: ${backupResult.backed}/${backupResult.total} usuário(s) salvos no chatter do Odoo.`
+              : `Backup parcial: ${backupResult.backed}/${backupResult.total} ok, ${backupResult.failed.length} falha(s).`}
+            {backupResult.failed.length > 0 && (
+              <ul className="mt-1 ml-4 text-xs list-disc">
+                {backupResult.failed.map((f, i) => (
+                  <li key={i}>{f.email}: {f.error}</li>
+                ))}
+              </ul>
+            )}
+            <span className="block mt-1 text-xs text-muted-foreground">
+              Realizado em {new Date(backupResult.at).toLocaleString('pt-BR')}
+            </span>
+          </AlertDescription>
+        </Alert>
+      )}
 
       {error && (
         <Alert variant="destructive">

@@ -32,7 +32,7 @@ import {
   Server,
   RefreshCw,
   Trash2,
-  MoreVertical,
+  Contact,
 } from 'lucide-react'
 import { OdooContactSearchDialog } from './OdooContactSearchDialog'
 import type { DeviceContact } from '@/lib/use-whatsapp'
@@ -119,48 +119,21 @@ export function ConversationList({
   onDeleteConversation,
   onRefreshData,
 }: ConversationListProps) {
-  const [activeTab, setActiveTab] = useState<Tab>('conversations')
+  // v7.24: R2 — merged "Contatos e Conversas" into a single tab.
+  // The server already merges device contacts into the conversations list
+  // (see getSortedConversations in user-session.js — entries with
+  // _isDeviceContact=true are device contacts without a conversation yet).
+  // The previous "Contatos" tab was a redundant phonebook view of the same
+  // data; removing it simplifies the UI without losing any functionality.
   const [searchQuery, setSearchQuery] = useState('')
   const [odooSearchOpen, setOdooSearchOpen] = useState(false)
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [deleteTarget, setDeleteTarget] = useState<{ jid: string; name: string } | null>(null)
 
-  // Contacts state
-  const [contacts, setContacts] = useState<DeviceContact[]>([])
-  const [contactsLoading, setContactsLoading] = useState(false)
-
-  // Load contacts when contacts tab is opened
-  const loadContacts = useCallback(async (query?: string) => {
-    if (!onGetContacts) return
-    setContactsLoading(true)
-    try {
-      const result = await onGetContacts(query)
-      if (result.success) {
-        setContacts(result.data || [])
-      } else {
-        setContacts([])
-      }
-    } catch {
-      setContacts([])
-    } finally {
-      setContactsLoading(false)
-    }
-  }, [onGetContacts])
-
-  useEffect(() => {
-    if (activeTab === 'contacts' && onGetContacts) {
-      loadContacts()
-    }
-  }, [activeTab, onGetContacts, loadContacts])
-
-  // Debounced contact search
-  useEffect(() => {
-    if (activeTab !== 'contacts' || !onGetContacts) return
-    const timer = setTimeout(() => {
-      loadContacts(searchQuery || undefined)
-    }, 350)
-    return () => clearTimeout(timer)
-  }, [searchQuery, activeTab, onGetContacts, loadContacts])
+  // Note: we still keep the onGetContacts prop wired because the Odoo contact
+  // search dialog uses it for phonebook lookups. The device contacts are
+  // already merged into `conversations` server-side, so we don't need to
+  // load them separately anymore.
 
   const filteredConversations = useMemo(() => {
     if (!searchQuery.trim()) return conversations
@@ -175,6 +148,11 @@ export function ConversationList({
   }, [conversations, searchQuery])
 
   const totalUnread = conversations.reduce((sum, c) => sum + c.unreadCount, 0)
+  // Count how many entries are device-only contacts (no messages yet)
+  const contactsOnlyCount = useMemo(
+    () => conversations.filter((c: any) => c._isDeviceContact).length,
+    [conversations]
+  )
 
   const handleStartFromOdoo = async (phone: string, name?: string) => {
     if (!onStartConversation) {
@@ -184,7 +162,6 @@ export function ConversationList({
   }
 
   const handleConversationStarted = (jid: string) => {
-    setActiveTab('conversations')
     onSelect(jid)
   }
 
@@ -221,7 +198,7 @@ export function ConversationList({
         <div className="flex items-center justify-between mb-3">
           <div className="flex items-center gap-2 min-w-0">
             <MessageCircle className="size-5 text-primary shrink-0" />
-            <h2 className="font-semibold text-base truncate">WhatsApp</h2>
+            <h2 className="font-semibold text-base truncate">Contatos e Conversas</h2>
             {totalUnread > 0 && (
               <Badge className="bg-primary text-primary-foreground text-[10px] px-1.5 min-w-[20px] h-5 flex items-center justify-center shrink-0">
                 {totalUnread > 99 ? '99+' : totalUnread}
@@ -267,42 +244,23 @@ export function ConversationList({
           </div>
         </div>
 
-        {/* Tab switcher: Conversas | Contatos */}
-        <div className="flex items-center gap-1 mb-3 bg-muted/50 rounded-lg p-1">
-          <button
-            onClick={() => setActiveTab('conversations')}
-            className={cn(
-              'flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-md text-xs font-medium transition-colors',
-              activeTab === 'conversations'
-                ? 'bg-background text-foreground shadow-sm'
-                : 'text-muted-foreground hover:text-foreground'
-            )}
-          >
-            <MessagesSquare className="size-3.5" />
-            Conversas
-            {conversations.length > 0 && (
-              <span className="text-[10px] text-muted-foreground">({conversations.length})</span>
-            )}
-          </button>
-          <button
-            onClick={() => setActiveTab('contacts')}
-            className={cn(
-              'flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded-md text-xs font-medium transition-colors',
-              activeTab === 'contacts'
-                ? 'bg-background text-foreground shadow-sm'
-                : 'text-muted-foreground hover:text-foreground'
-            )}
-          >
-            <Users className="size-3.5" />
-            Contatos
-            {contacts.length > 0 && (
-              <span className="text-[10px] text-muted-foreground">({contacts.length})</span>
-            )}
-          </button>
+        {/* v7.24: Single unified list — no more Conversas/Contatos tab switcher.
+            The server already merges device contacts (with _isDeviceContact=true)
+            into the conversations array, so this single list shows everything. */}
+        <div className="flex items-center gap-2 mb-3 text-[11px] text-muted-foreground">
+          <MessagesSquare className="size-3.5" />
+          <span>{conversations.length} itens</span>
+          {contactsOnlyCount > 0 && (
+            <>
+              <span className="text-muted-foreground/40">•</span>
+              <Contact className="size-3.5" />
+              <span>{contactsOnlyCount} contatos sem conversa</span>
+            </>
+          )}
         </div>
 
-        {/* Sync progress (only on conversations tab) */}
-        {activeTab === 'conversations' && isSyncing && (
+        {/* Sync progress */}
+        {isSyncing && (
           <div className="flex items-center gap-2 mb-2 px-2 py-1.5 bg-primary/5 rounded-lg border border-primary/10">
             <Loader2 className="size-3.5 text-primary animate-spin" />
             <div className="flex-1">
@@ -321,7 +279,7 @@ export function ConversationList({
         <div className="relative">
           <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 size-4 text-muted-foreground" />
           <Input
-            placeholder={activeTab === 'conversations' ? 'Buscar conversas...' : 'Buscar contatos...'}
+            placeholder="Buscar contatos e conversas..."
             className="pl-9 h-9 text-sm bg-muted/50 border-transparent focus:border-border focus:bg-background"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
@@ -329,27 +287,16 @@ export function ConversationList({
         </div>
       </div>
 
-      {/* Scrollable list */}
+      {/* Scrollable list — single merged view */}
       <ScrollArea className="flex-1 min-h-0">
-        {activeTab === 'conversations' ? (
-          <ConversationsTabContent
-            conversations={filteredConversations}
-            selectedJid={selectedJid}
-            onSelect={onSelect}
-            isSyncing={isSyncing}
-            hasSearchQuery={!!searchQuery.trim()}
-            onDeleteConversation={onDeleteConversation ? (jid, name) => setDeleteTarget({ jid, name }) : undefined}
-          />
-        ) : (
-          <ContactsTabContent
-            contacts={contacts}
-            loading={contactsLoading}
-            selectedJid={selectedJid}
-            onSelect={onSelect}
-            hasSearchQuery={!!searchQuery.trim()}
-            available={!!onGetContacts}
-          />
-        )}
+        <ConversationsTabContent
+          conversations={filteredConversations}
+          selectedJid={selectedJid}
+          onSelect={onSelect}
+          isSyncing={isSyncing}
+          hasSearchQuery={!!searchQuery.trim()}
+          onDeleteConversation={onDeleteConversation ? (jid, name) => setDeleteTarget({ jid, name }) : undefined}
+        />
       </ScrollArea>
 
       {/* Delete confirmation dialog */}
