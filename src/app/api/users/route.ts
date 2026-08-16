@@ -4,7 +4,7 @@
 // ====================================================================
 
 import { NextRequest, NextResponse } from 'next/server'
-import { db } from '@/lib/db'
+import { userStore } from '@/lib/user-store'
 import { getSessionFromRequest, hashPassword } from '@/lib/auth'
 
 export const runtime = 'nodejs'
@@ -22,23 +22,21 @@ export async function GET(req: NextRequest) {
   if ('error' in auth) return auth.error
 
   try {
-    const users = await db.user.findMany({
-      orderBy: { createdAt: 'desc' },
-      select: {
-        id: true,
-        email: true,
-        name: true,
-        role: true,
-        isActive: true,
-        whatsappPhone: true,
-        odooUrl: true,
-        odooDb: true,
-        odooUsername: true,
-        createdAt: true,
-        updatedAt: true,
-        // passwordHash is intentionally excluded
-      },
-    })
+    const all = await userStore.findMany()
+    // Return only the safe fields (never passwordHash / odooPassword).
+    const users = all.map(u => ({
+      id: u.id,
+      email: u.email,
+      name: u.name,
+      role: u.role,
+      isActive: u.isActive,
+      whatsappPhone: u.whatsappPhone,
+      odooUrl: u.odooUrl,
+      odooDb: u.odooDb,
+      odooUsername: u.odooUsername,
+      createdAt: u.createdAt,
+      updatedAt: u.updatedAt,
+    }))
     return NextResponse.json({ success: true, users })
   } catch (err: any) {
     console.error('[/api/users GET] error:', err.message)
@@ -67,13 +65,13 @@ export async function POST(req: NextRequest) {
     }
 
     // Check if email is already taken
-    const existing = await db.user.findUnique({ where: { email } })
+    const existing = await userStore.findUnique({ where: { email } })
     if (existing) {
       return NextResponse.json({ success: false, error: 'Email já cadastrado' }, { status: 409 })
     }
 
     const passwordHash = await hashPassword(body.password)
-    const user = await db.user.create({
+    const created = await userStore.create({
       data: {
         email,
         passwordHash,
@@ -86,19 +84,20 @@ export async function POST(req: NextRequest) {
         odooUsername: body.odooUsername?.trim() || null,
         odooPassword: body.odooPassword?.trim() || null,
       },
-      select: {
-        id: true,
-        email: true,
-        name: true,
-        role: true,
-        isActive: true,
-        whatsappPhone: true,
-        odooUrl: true,
-        odooDb: true,
-        odooUsername: true,
-        createdAt: true,
-      },
     })
+
+    const user = {
+      id: created.id,
+      email: created.email,
+      name: created.name,
+      role: created.role,
+      isActive: created.isActive,
+      whatsappPhone: created.whatsappPhone,
+      odooUrl: created.odooUrl,
+      odooDb: created.odooDb,
+      odooUsername: created.odooUsername,
+      createdAt: created.createdAt,
+    }
 
     return NextResponse.json({ success: true, user })
   } catch (err: any) {

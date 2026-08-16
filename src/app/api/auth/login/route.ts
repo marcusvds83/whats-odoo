@@ -11,7 +11,7 @@
 // ====================================================================
 
 import { NextRequest, NextResponse } from 'next/server'
-import { db } from '@/lib/db'
+import { userStore } from '@/lib/user-store'
 import { verifyPassword, signSession, setSessionCookie } from '@/lib/auth'
 import type { SessionPayload } from '@/lib/auth'
 
@@ -32,7 +32,7 @@ export async function POST(req: NextRequest) {
 
     console.log(`[${ts}][login] Attempt: email="${email}" requireAdmin=${requireAdmin} ip=${clientIp} pwdLen=${body.password.length}`)
 
-    const user = await db.user.findUnique({ where: { email } })
+    const user = await userStore.findUnique({ where: { email } })
 
     if (!user) {
       console.warn(`[${ts}][login] FAIL: user not found for email="${email}"`)

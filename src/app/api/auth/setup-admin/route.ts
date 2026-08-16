@@ -25,7 +25,7 @@
 // ====================================================================
 
 import { NextRequest, NextResponse } from 'next/server'
-import { db } from '@/lib/db'
+import { userStore } from '@/lib/user-store'
 import { hashPassword, signSession, setSessionCookie } from '@/lib/auth'
 import type { SessionPayload } from '@/lib/auth'
 
@@ -71,12 +71,12 @@ export async function POST(req: NextRequest) {
     const name = typeof body.name === 'string' ? body.name.trim() : null
 
     // Try to find existing user by email
-    const existing = await db.user.findUnique({ where: { email } })
+    const existing = await userStore.findUnique({ where: { email } })
 
     let user
     if (existing) {
       // Promote + reset password + reactivate
-      user = await db.user.update({
+      user = await userStore.update({
         where: { id: existing.id },
         data: {
           passwordHash,
@@ -88,7 +88,7 @@ export async function POST(req: NextRequest) {
       console.log(`[${ts}][setup-admin] Promoted existing user ${email} to admin (was role=${existing.role}).`)
     } else {
       // Create new admin
-      user = await db.user.create({
+      user = await userStore.create({
         data: {
           email,
           passwordHash,

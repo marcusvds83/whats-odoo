@@ -7,7 +7,7 @@
 // ====================================================================
 
 import { NextRequest, NextResponse } from 'next/server'
-import { db } from '@/lib/db'
+import { userStore } from '@/lib/user-store'
 import { getSessionFromRequest, getSessionCookieName } from '@/lib/auth'
 
 export const runtime = 'nodejs'
@@ -26,25 +26,22 @@ export async function GET(req: NextRequest) {
     }
 
     // Fetch fresh user data (in case role/isActive changed since JWT was issued)
-    const user = await db.user.findUnique({
-      where: { id: session.userId },
-      select: {
-        id: true,
-        email: true,
-        name: true,
-        role: true,
-        isActive: true,
-        whatsappPhone: true,
-        odooUrl: true,
-        odooDb: true,
-        odooUsername: true,
-        // Don't return odooPassword to the browser
-      },
-    })
-
-    if (!user || !user.isActive) {
+    const raw = await userStore.findUnique({ where: { id: session.userId } })
+    if (!raw || !raw.isActive) {
       console.warn(`[${ts}][/api/auth/me] 401 — user not found or inactive (userId=${session.userId})`)
       return NextResponse.json({ success: false, authenticated: false }, { status: 401 })
+    }
+    // Never send the password hash / odooPassword to the browser.
+    const user = {
+      id: raw.id,
+      email: raw.email,
+      name: raw.name,
+      role: raw.role,
+      isActive: raw.isActive,
+      whatsappPhone: raw.whatsappPhone,
+      odooUrl: raw.odooUrl, // not ideal to expose, kept for legacy UI compat
+      odooDb: raw.odooDb,
+      odooUsername: raw.odooUsername,
     }
 
     console.log(`[${ts}][/api/auth/me] 200 — email=${user.email} role=${user.role}`)

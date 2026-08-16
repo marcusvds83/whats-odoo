@@ -19,7 +19,7 @@
 // ====================================================================
 
 import { NextRequest, NextResponse } from 'next/server'
-import { db } from '@/lib/db'
+import { userStore } from '@/lib/user-store'
 import { getSessionFromRequest, verifyPassword, hashPassword } from '@/lib/auth'
 
 export const runtime = 'nodejs'
@@ -43,7 +43,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
       return NextResponse.json({ success: false, error: 'password é obrigatório' }, { status: 400 })
     }
 
-    const user = await db.user.findUnique({ where: { id } })
+    const user = await userStore.findUnique({ where: { id } })
     if (!user) {
       console.warn(`[${ts}][test-login] User not found: id=${id}`)
       return NextResponse.json({

@@ -3199,9 +3199,12 @@ class UserSession {
 // ====================================================================
 
 class SessionManager {
-  constructor({ io, prisma }) {
+  constructor({ io, prisma, loadUserById }) {
     this.io = io
     this.prisma = prisma
+    // Route user lookup through the Firestore-capable bridge when provided
+    // (Firestore for logins; otherwise falls back to SQLite/Prisma).
+    this.loadUserById = loadUserById || null
     this.sessions = new Map()  // userId -> UserSession
   }
 
@@ -3209,8 +3212,10 @@ class SessionManager {
     let s = this.sessions.get(userId)
     if (s) return s
 
-    // Load user from DB
-    const user = await this.prisma.user.findUnique({ where: { id: userId } })
+    // Load user from DB (Firestore when configured, else SQLite)
+    const user = this.loadUserById
+      ? await this.loadUserById(userId, this.prisma)
+      : await this.prisma.user.findUnique({ where: { id: userId } })
     if (!user || !user.isActive) return null
 
     s = new UserSession({ userId, user, io: this.io, prisma: this.prisma })

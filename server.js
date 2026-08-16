@@ -54,6 +54,7 @@ const { PrismaClient } = require('@prisma/client')
 
 // v7.23: Per-user session manager + auth helpers (CommonJS)
 const { SessionManager, DATA_DIR } = require('./src/server/user-session.js')
+const { loadUserById } = require('./src/server/user-lookup.cjs')
 const { getSessionCookieName, parseCookies, verifySession } = require('./src/lib/auth-edge.cjs')
 
 // Ensure production mode on Render
@@ -205,7 +206,7 @@ app.prepare().then(async () => {
   })
 
   // v7.23: Initialize the SessionManager — owns all UserSession instances
-  sessionManager = new SessionManager({ io, prisma })
+  sessionManager = new SessionManager({ io, prisma, loadUserById })
 
   const waNamespace = io.of('/whatsapp')
   const odooNamespace = io.of('/odoo')

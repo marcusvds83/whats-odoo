@@ -5,7 +5,7 @@
 // ====================================================================
 
 import { NextRequest, NextResponse } from 'next/server'
-import { db } from '@/lib/db'
+import { userStore } from '@/lib/user-store'
 import { getSessionFromRequest, hashPassword } from '@/lib/auth'
 
 export const runtime = 'nodejs'
@@ -31,7 +31,7 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
     }
 
     // Verify user exists
-    const existing = await db.user.findUnique({ where: { id } })
+    const existing = await userStore.findUnique({ where: { id } })
     if (!existing) {
       return NextResponse.json({ success: false, error: 'Usuário não encontrado' }, { status: 404 })
     }
@@ -67,29 +67,34 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(newEmail)) {
         return NextResponse.json({ success: false, error: 'Email inválido' }, { status: 400 })
       }
-      const taken = await db.user.findUnique({ where: { email: newEmail } })
+      const taken = await userStore.findUnique({ where: { email: newEmail } })
       if (taken && taken.id !== id) {
         return NextResponse.json({ success: false, error: 'Email já cadastrado' }, { status: 409 })
       }
       updateData.email = newEmail
     }
 
-    const updated = await db.user.update({
+    const updatedRaw = await userStore.update({
       where: { id },
       data: updateData,
-      select: {
-        id: true,
-        email: true,
-        name: true,
-        role: true,
-        isActive: true,
-        whatsappPhone: true,
-        odooUrl: true,
-        odooDb: true,
-        odooUsername: true,
-        updatedAt: true,
-      },
     })
+
+    if (!updatedRaw) {
+      return NextResponse.json({ success: false, error: 'Usuário não encontrado' }, { status: 404 })
+    }
+
+    const updated = {
+      id: updatedRaw.id,
+      email: updatedRaw.email,
+      name: updatedRaw.name,
+      role: updatedRaw.role,
+      isActive: updatedRaw.isActive,
+      whatsappPhone: updatedRaw.whatsappPhone,
+      odooUrl: updatedRaw.odooUrl,
+      odooDb: updatedRaw.odooDb,
+      odooUsername: updatedRaw.odooUsername,
+      updatedAt: updatedRaw.updatedAt,
+    }
 
     return NextResponse.json({ success: true, user: updated })
   } catch (err: any) {
@@ -112,12 +117,12 @@ export async function DELETE(req: NextRequest, { params }: { params: Promise<{ i
       return NextResponse.json({ success: false, error: 'Você não pode excluir sua própria conta' }, { status: 400 })
     }
 
-    const existing = await db.user.findUnique({ where: { id } })
+    const existing = await userStore.findUnique({ where: { id } })
     if (!existing) {
       return NextResponse.json({ success: false, error: 'Usuário não encontrado' }, { status: 404 })
     }
 
-    await db.user.delete({ where: { id } })
+    await userStore.delete({ where: { id } })
     return NextResponse.json({ success: true })
   } catch (err: any) {
     console.error('[/api/users DELETE] error:', err.message)

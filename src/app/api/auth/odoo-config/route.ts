@@ -6,7 +6,7 @@
 // ====================================================================
 
 import { NextRequest, NextResponse } from 'next/server'
-import { db } from '@/lib/db'
+import { userStore } from '@/lib/user-store'
 import { getSessionFromRequest } from '@/lib/auth'
 
 export const runtime = 'nodejs'
@@ -18,15 +18,17 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ success: false, error: 'Não autenticado' }, { status: 401 })
     }
 
-    const user = await db.user.findUnique({
-      where: { id: session.userId },
-      select: {
-        odooUrl: true,
-        odooDb: true,
-        odooUsername: true,
-        odooPassword: true,
-      },
-    })
+    const raw = await userStore.findUnique({ where: { id: session.userId } })
+    if (!raw) {
+      return NextResponse.json({ success: false, error: 'Usuário não encontrado' }, { status: 404 })
+    }
+    // Pull only the Odoo fields into the shape the old select returned.
+    const user = {
+      odooUrl: raw.odooUrl,
+      odooDb: raw.odooDb,
+      odooUsername: raw.odooUsername,
+      odooPassword: raw.odooPassword,
+    }
 
     // If user has per-user Odoo config, use it
     if (user && user.odooUrl && user.odooDb && user.odooUsername && user.odooPassword) {

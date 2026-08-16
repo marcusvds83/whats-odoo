@@ -24,6 +24,21 @@ services:
         sync: false
       - key: ODOO_PASSWORD
         sync: false
+      # v7.28: Session signing secret (required in production)
+      - key: JWT_SECRET
+        sync: false
+      # v7.28: Firebase — logins no Firestore (optional, picks ONE credential form)
+      # Use either FIREBASE_SERVICE_ACCOUNT (full JSON) OR the B64 form OR split vars.
+      - key: FIREBASE_SERVICE_ACCOUNT
+        sync: false
+      # - key: FIREBASE_SERVICE_ACCOUNT_B64
+      #   sync: false
+      # - key: FIREBASE_PROJECT_ID
+      #   sync: false
+      # - key: FIREBASE_CLIENT_EMAIL
+      #   sync: false
+      # - key: FIREBASE_PRIVATE_KEY
+      #   sync: false
     disk:
       name: whats-odoo-data
       mountPath: /opt/render/project/src/data

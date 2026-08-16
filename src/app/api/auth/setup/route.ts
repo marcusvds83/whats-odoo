@@ -7,7 +7,7 @@
 // ====================================================================
 
 import { NextRequest, NextResponse } from 'next/server'
-import { db } from '@/lib/db'
+import { userStore } from '@/lib/user-store'
 import { hashPassword, signSession, setSessionCookie } from '@/lib/auth'
 import type { SessionPayload } from '@/lib/auth'
 
@@ -16,7 +16,7 @@ export const runtime = 'nodejs'
 export async function POST(req: NextRequest) {
   try {
     // Security check: only allow if no users exist
-    const userCount = await db.user.count()
+    const userCount = await userStore.count()
     if (userCount > 0) {
       return NextResponse.json(
         { success: false, error: 'Setup já foi concluído. Faça login como administrador.' },
@@ -39,7 +39,7 @@ export async function POST(req: NextRequest) {
     }
 
     const passwordHash = await hashPassword(body.password)
-    const user = await db.user.create({
+    const user = await userStore.create({
       data: {
         email,
         passwordHash,
@@ -78,7 +78,7 @@ export async function POST(req: NextRequest) {
 // GET: check if setup is needed (any users exist?)
 export async function GET() {
   try {
-    const userCount = await db.user.count()
+    const userCount = await userStore.count()
     return NextResponse.json({
       success: true,
       needsSetup: userCount === 0,

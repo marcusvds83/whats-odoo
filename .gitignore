@@ -40,6 +40,9 @@ mini-services/whatsapp-service/auth_store/
 # Database
 db/*.db
 db/*.db-journal
+prisma/data/
+# Runtime data (sessions, conv state, media) — never commit
+data/
 
 # Logs
 dev.log
