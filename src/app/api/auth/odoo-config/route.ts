@@ -7,6 +7,7 @@
 
 import { NextRequest, NextResponse } from 'next/server'
 import { userStore } from '@/lib/user-store'
+import { db } from '@/lib/db'
 import { getSessionFromRequest } from '@/lib/auth'
 
 export const runtime = 'nodejs'

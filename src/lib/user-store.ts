@@ -95,14 +95,16 @@ function toRecord(doc: any): UserRecord | null {
 
 async function fsFindUnique(firestore: Firestore, where: UserWhere): Promise<UserRecord | null> {
   const usersRef = firestore.collection('users')
-  let snapshot
+
+  // If neither id nor email is provided, we have nothing to look up by.
+  if (!where.id && !where.email) return null
+
   if (where.id) {
     const d = await usersRef.doc(where.id).get()
-    const rec = toRecord(d)
-    return rec
+    return toRecord(d)
   }
   // email: query where email == (email must be lowercased consistently)
-  snapshot = await usersRef.where('email', '==', where.email).limit(1).get()
+  const snapshot = await usersRef.where('email', '==', where.email).limit(1).get()
   if (snapshot.empty) return null
   return toRecord(snapshot.docs[0])
 }

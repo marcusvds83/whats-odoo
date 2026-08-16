@@ -127,6 +127,12 @@ export function UsersPanel() {
   }>(null)
   const [isTestingLogin, setIsTestingLogin] = useState(false)
   const [showPassword, setShowPassword] = useState(false)
+  // v7.29: "Alterar senha" dialog state
+  const [pwdUser, setPwdUser] = useState<UserRow | null>(null)
+  const [newPassword, setNewPassword] = useState('')
+  const [showNewPassword, setShowNewPassword] = useState(false)
+  const [isChangingPwd, setIsChangingPwd] = useState(false)
+  const [pwdCopied, setPwdCopied] = useState(false)
 
   const loadUsers = useCallback(async () => {
     setIsLoading(true)
@@ -327,6 +333,47 @@ export function UsersPanel() {
   const activeCount = users.filter(u => u.isActive).length
   const adminCount = users.filter(u => u.role === 'admin').length
 
+  // v7.29: Open the "Alterar senha" dialog for a user
+  const openChangePassword = (user: UserRow) => {
+    setPwdUser(user)
+    setNewPassword('')
+    setShowNewPassword(false)
+    setPwdCopied(false)
+  }
+
+  // v7.29: Save a new password for the user (hashed on the server)
+  const handleChangePassword = async () => {
+    if (!pwdUser || !newPassword.trim()) return
+    setIsChangingPwd(true)
+    setError(null)
+    try {
+      const res = await fetch(`/api/users/${pwdUser.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: newPassword.trim() }),
+      })
+      const data = await res.json()
+      if (data.success) {
+        setPwdUser(null)
+        await loadUsers()
+      } else {
+        setError(data.error || 'Falha ao alterar a senha')
+      }
+    } catch (err: any) {
+      setError(err.message)
+    } finally {
+      setIsChangingPwd(false)
+    }
+  }
+
+  const copyNewPassword = async () => {
+    try {
+      await navigator.clipboard?.writeText(newPassword)
+      setPwdCopied(true)
+      setTimeout(() => setPwdCopied(false), 2000)
+    } catch {}
+  }
+
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between gap-3">
@@ -476,6 +523,15 @@ export function UsersPanel() {
                           variant="ghost"
                           size="icon"
                           className="size-8"
+                          onClick={() => openChangePassword(user)}
+                          title="Alterar senha"
+                        >
+                          <Key className="size-4" />
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="size-8"
                           onClick={() => {
                             setTestLoginUser(user)
                             setTestLoginPassword('')
@@ -512,6 +568,97 @@ export function UsersPanel() {
           )}
         </CardContent>
       </Card>
+
+      {/* v7.29: Alterar senha dialog */}
+      <Dialog open={!!pwdUser} onOpenChange={(o) => { if (!o) setPwdUser(null) }}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Key className="size-5 text-emerald-600" />
+              Alterar senha
+            </DialogTitle>
+            <DialogDescription>
+              {pwdUser && (
+                <>Redefinir a senha de <strong>{pwdUser.email}</strong>. A nova senha fica salva no Firebase (hasheada) e passa a valer no próximo login.</>
+              )}
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-3 py-2">
+            <div className="space-y-1.5">
+              <Label htmlFor="new-pwd" className="flex items-center gap-1">
+                Nova senha *
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="size-6 p-0 ml-auto"
+                  onClick={() => {
+                    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789!@#$%&*'
+                    let pwd = ''
+                    const arr = new Uint32Array(12)
+                    crypto.getRandomValues(arr)
+                    for (let i = 0; i < 12; i++) pwd += chars[arr[i] % chars.length]
+                    setNewPassword(pwd)
+                    setShowNewPassword(true)
+                  }}
+                  title="Gerar senha forte"
+                >
+                  <Dices className="size-3.5" />
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  className="size-6 p-0"
+                  onClick={() => setShowNewPassword(s => !s)}
+                  title={showNewPassword ? 'Ocultar' : 'Mostrar'}
+                >
+                  {showNewPassword ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
+                </Button>
+              </Label>
+              <Input
+                id="new-pwd"
+                type={showNewPassword ? 'text' : 'password'}
+                value={newPassword}
+                onChange={(e) => setNewPassword(e.target.value)}
+                placeholder="Mínimo 6 caracteres"
+                className="font-mono"
+                minLength={6}
+              />
+            </div>
+
+            {newPassword && (
+              <div className="flex items-center justify-between rounded-md bg-muted/40 border px-3 py-2">
+                <code className="font-mono text-sm break-all pr-2">{newPassword}</code>
+                <Button type="button" variant="ghost" size="sm" className="shrink-0" onClick={copyNewPassword}>
+                  {pwdCopied ? <CheckCircle2 className="size-4 text-emerald-600" /> : <span className="text-xs">Copiar</span>}
+                </Button>
+              </div>
+            )}
+
+            {newPassword && (
+              <p className="text-xs text-muted-foreground">
+                Compartilhe a senha com o usuário de forma segura (WhatsApp/telefone). Você também pode usar &quot;Testar login&quot; depois para confirmar.
+              </p>
+            )}
+          </div>
+
+          <DialogFooter className="gap-2">
+            <Button variant="outline" onClick={() => setPwdUser(null)} disabled={isChangingPwd}>
+              Cancelar
+            </Button>
+            <Button
+              onClick={handleChangePassword}
+              disabled={isChangingPwd || !newPassword.trim() || newPassword.trim().length < 6}
+              className="bg-emerald-600 hover:bg-emerald-700 text-white"
+            >
+              {isChangingPwd && <Loader2 className="size-4 mr-1.5 animate-spin" />}
+              Salvar nova senha
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* v7.26: Test-login dialog */}
       <Dialog open={!!testLoginUser} onOpenChange={(o) => { if (!o) setTestLoginUser(null) }}>

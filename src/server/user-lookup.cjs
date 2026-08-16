@@ -15,12 +15,19 @@
 
 const fs = require('fs')
 
+// NOTA: os nomes abaixo DEVEM espelhar exatamente os suportados por
+// src/lib/firebase-admin.ts (lado TS usado pelas rotas /api/auth). Se os
+// nomes divergirem, o socket cai no SQLite e usuários do Firestore são
+// rejeitados ao conectar — sintoma: login "funciona" mas a tela não abre.
 function firebaseConfigured() {
   return Boolean(
     process.env.FIREBASE_SERVICE_ACCOUNT ||
+      process.env.FIREBASE_SERVICE_ACCOUNT_B64 ||
       process.env.FIREBASE_SERVICE_ACCOUNT_BASE64 ||
-      process.env.GOOGLE_APPLICATION_CREDENTIALS || // ignored here (needs admin SDK)
-      (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_PRIVATE_KEY)
+      process.env.GOOGLE_APPLICATION_CREDENTIALS ||
+      (process.env.FIREBASE_PROJECT_ID &&
+        process.env.FIREBASE_CLIENT_EMAIL &&
+        process.env.FIREBASE_PRIVATE_KEY)
   )
 }
 
@@ -78,16 +85,22 @@ function parseCredentials() {
   if (process.env.FIREBASE_SERVICE_ACCOUNT) {
     return JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
   }
-  // 2) base64-encoded JSON
-  if (process.env.FIREBASE_SERVICE_ACCOUNT_BASE64) {
-    return JSON.parse(Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT_BASE64, 'base64').toString('utf8'))
+  // 2) base64-encoded JSON — aceita B64 (canônico) e BASE64 (legado)
+  const b64 = process.env.FIREBASE_SERVICE_ACCOUNT_B64 || process.env.FIREBASE_SERVICE_ACCOUNT_BASE64
+  if (b64) {
+    return JSON.parse(Buffer.from(b64, 'base64').toString('utf8'))
   }
-  // 3) split env vars
-  return {
-    project_id: process.env.FIREBASE_PROJECT_ID,
-    client_email: process.env.FIREBASE_CLIENT_EMAIL,
-    private_key: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+  // 3) split env vars (exige project_id + client_email + private_key,
+  //    igual ao firebase-admin.ts)
+  if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
+    const privateKey = process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n')
+    return {
+      project_id: process.env.FIREBASE_PROJECT_ID,
+      client_email: process.env.FIREBASE_CLIENT_EMAIL,
+      private_key: privateKey,
+    }
   }
+  return null
 }
 
 // NOTE: GOOGLE_APPLICATION_CREDENTIALS requires a file path on disk; the

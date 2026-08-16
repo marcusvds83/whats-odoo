@@ -141,6 +141,8 @@ class UserSession {
     this.lastQrCode = null
     this.reconnectAttempts = 0
     this.watchdogTimer = null
+    this.waConnecting = false        // v7.29: re-entrancy guard for connectWhatsApp
+    this.waReconnectTimer = null     // v7.29: single pending reconnect timer
     this.conversations = new Map()
     this.contactNames = new Map()
     this.deviceContacts = new Map()
@@ -293,6 +295,7 @@ class UserSession {
     try {
       if (this.persistTimer) { clearInterval(this.persistTimer); this.persistTimer = null }
       if (this.watchdogTimer) { clearInterval(this.watchdogTimer); this.watchdogTimer = null }
+      if (this.waReconnectTimer) { clearTimeout(this.waReconnectTimer); this.waReconnectTimer = null }
       if (this.odooReauthTimer) { clearInterval(this.odooReauthTimer); this.odooReauthTimer = null }
       try { this.waSocket?.end(undefined) } catch {}
       this.persistConversationsToDisk()
@@ -1321,6 +1324,35 @@ class UserSession {
   }
 
   async connectWhatsApp() {
+    // v7.29: re-entrancy guard — never start a second Baileys socket while
+    // one is still connecting. Without this, the watchdog and the
+    // connection.update reconnect timer could overlap, producing multiple
+    // sockets that fight over the same auth state → disconnect/reconnect loop.
+    if (this.waConnecting) return
+    this.waConnecting = true
+    try {
+      await this._connectWhatsAppInner()
+    } finally {
+      this.waConnecting = false
+    }
+  }
+
+  // v7.29: schedule a single reconnect; reuses/cancels any pending timer so
+  // repeated triggers never stack duplicate attempts.
+  scheduleReconnect(reason) {
+    if (this.waReconnectTimer) return
+    this.reconnectAttempts++
+    const delay = Math.min(2000 * Math.pow(2, this.reconnectAttempts - 1), 30000)
+    console.log(`[WA:${this.userId}] ${reason} — reconnect #${this.reconnectAttempts} in ${delay}ms`)
+    this.waReconnectTimer = setTimeout(() => {
+      this.waReconnectTimer = null
+      this.connectWhatsApp().catch(err =>
+        console.error(`[WA:${this.userId}] reconnect error:`, err && err.message)
+      )
+    }, delay)
+  }
+
+  async _connectWhatsAppInner() {
     const baileys = await this.loadBaileys()
     const {
       makeWASocket,
@@ -1395,10 +1427,7 @@ class UserSession {
         })
 
         if (shouldReconnect) {
-          this.reconnectAttempts++
-          const delay = Math.min(2000 * Math.pow(2, this.reconnectAttempts - 1), 30000)
-          console.log(`[WA:${this.userId}] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})...`)
-          setTimeout(() => this.connectWhatsApp(), delay)
+          this.scheduleReconnect(`Connection closed (status=${statusCode})`)
         }
       }
 
@@ -1417,9 +1446,7 @@ class UserSession {
               try { this.waSocket?.end(undefined) } catch {}
               this.waSocket = null
               this.connectionState = { connection: 'close' }
-              this.reconnectAttempts++
-              const delay = Math.min(2000 * Math.pow(2, this.reconnectAttempts - 1), 30000)
-              setTimeout(() => this.connectWhatsApp(), delay)
+              this.scheduleReconnect('Watchdog: not open')
               return
             }
             const state = this.waSocket.ws?.readyState
@@ -1428,9 +1455,7 @@ class UserSession {
               try { this.waSocket.end(undefined) } catch {}
               this.waSocket = null
               this.connectionState = { connection: 'close' }
-              this.reconnectAttempts++
-              const delay = Math.min(2000 * Math.pow(2, this.reconnectAttempts - 1), 30000)
-              setTimeout(() => this.connectWhatsApp(), delay)
+              this.scheduleReconnect('Watchdog: ws dead')
             }
           } catch (err) {
             console.log(`[WA Watchdog:${this.userId}] Error:`, err.message)
