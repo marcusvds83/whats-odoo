@@ -96,6 +96,71 @@ function stripHtml(html) {
   return text
 }
 
+// v7.28: Parse a chatter body produced by buildChatterBody() back into clean
+// message components (direction, timestamp, text). The chatter body format is:
+//   <div><strong>📱 WhatsApp {Enviada|Recebida}:</strong> {ts}<br/>{mediaLine}<span>{text}</span></div>
+// We want to extract ONLY the user-visible text (the <span> content), detect
+// the direction from "Enviada" vs "Recebida", and parse the timestamp.
+// Falls back to stripHtml() for any non-conforming body (e.g. messages posted
+// by other Odoo users from the web UI — those are returned as-is, plain text).
+function parseChatterBody(body) {
+  if (!body) return { fromMe: false, timestamp: null, text: '' }
+  const s = String(body)
+
+  // Detect direction from the "WhatsApp Enviada/Recebida:" marker
+  const isSent = /WhatsApp\s+Enviada/i.test(s)
+  const fromMe = isSent
+
+  // Extract timestamp from "(...)" — buildChatterBody uses toLocaleString('pt-BR')
+  // inside parentheses as part of the label. Actually buildChatterBody does NOT
+  // wrap in parens — it inserts the timestamp directly after the colon.
+  // But older messages may have the "(date)" format. Support both.
+  let timestamp = null
+  const parenMatch = s.match(/\(([^)]+)\)/)
+  if (parenMatch) {
+    const parsed = new Date(parenMatch[1])
+    if (!isNaN(parsed.getTime())) timestamp = parsed
+  }
+
+  // Extract the text content from the <span>...</span> block (the real message)
+  let text = ''
+  const spanMatch = s.match(/<span[^>]*>([\s\S]*?)<\/span>/i)
+  if (spanMatch) {
+    text = stripHtml(spanMatch[1])
+  } else {
+    // No <span> — this isn't a WhatsApp chatter message produced by us.
+    // It's probably a note posted by a human via the Odoo UI, or a different
+    // format entirely. Strip HTML and return the whole body as plain text.
+    text = stripHtml(s)
+    // If the body still starts with the WhatsApp metadata header, strip it.
+    // This handles the case where buildChatterBody emitted no <span> because
+    // textContent was empty (media-only message).
+    const headerMatch = text.match(/^📱\s*WhatsApp\s+(Enviada|Recebida)[:\s]*(.*)$/is)
+    if (headerMatch) {
+      // For media-only messages, the "text" will be empty after the header.
+      // Strip the header line and keep the remaining content (media label).
+      const remaining = text.slice(headerMatch[0].length).trim()
+      // Try to detect a media label line like "🎙️ Áudio"
+      const mediaMatch = remaining.match(/^([🎙️🖼️📄🎬🏷️][^\n]*)/)
+      text = mediaMatch ? mediaMatch[1] : remaining
+    }
+  }
+
+  // Try to parse timestamp from the label after the colon (no parens case)
+  if (!timestamp) {
+    // Look for a date pattern like "14/08/2026, 10:30:45" or "14/08/2026 10:30"
+    const dateMatch = s.match(/(\d{1,2}\/\d{1,2}\/\d{4})[,\s]+(\d{1,2}:\d{2}(?::\d{2})?)/)
+    if (dateMatch) {
+      const [_, d, t] = dateMatch
+      // pt-BR format: DD/MM/YYYY HH:MM:SS
+      const parsed = new Date(`${d.split('/').reverse().join('-')}T${t}`)
+      if (!isNaN(parsed.getTime())) timestamp = parsed
+    }
+  }
+
+  return { fromMe, timestamp, text }
+}
+
 // Extract a display name from a message's pushName field
 function pushNameFallback(msg) {
   return msg?.pushName || null
@@ -1122,16 +1187,15 @@ class UserSession {
       let added = 0
       for (const msg of (messages || [])) {
         const body = msg.body || ''
-        const plainText = stripHtml(body)
-        const isSent = /WhatsApp\s+Enviada/i.test(body)
-        const fromMe = isSent
+        // v7.28: Use parseChatterBody() to extract ONLY the user-visible
+        // text from the chatter body (the content inside <span>), instead
+        // of the whole stripped-HTML which included "📱 WhatsApp Enviada: ..."
+        // metadata prefixes that made messages look ugly in the chat view.
+        const parsed = parseChatterBody(body)
+        const fromMe = parsed.fromMe
+        const plainText = parsed.text
 
-        let timestamp
-        const dateMatch = body.match(/\(([^)]+)\)/)
-        if (dateMatch) {
-          const parsed = new Date(dateMatch[1])
-          if (!isNaN(parsed.getTime())) timestamp = parsed
-        }
+        let timestamp = parsed.timestamp
         if (!timestamp) timestamp = new Date(msg.date || msg.create_date || Date.now())
 
         const externalId = `odoo-${msg.id}`
@@ -3115,16 +3179,16 @@ class UserSession {
 
       const converted = (messages || []).map((msg) => {
         const body = msg.body || ''
-        const plainText = stripHtml(body)
-        const isSent = /WhatsApp\s+Enviada/i.test(body)
-        const fromMe = isSent
-        let timestamp
-        const dateMatch = body.match(/\(([^)]+)\)/)
-        if (dateMatch) {
-          const parsed = new Date(dateMatch[1])
-          if (!isNaN(parsed.getTime())) timestamp = parsed.toISOString()
-        }
-        if (!timestamp) timestamp = msg.date || msg.create_date || new Date().toISOString()
+        // v7.28: Use parseChatterBody() to extract ONLY the user-visible
+        // text from the chatter body — the content inside <span> — instead
+        // of the whole stripped-HTML which included metadata like
+        // "📱 WhatsApp Enviada: 14/08/2026, 10:30:45" as a prefix.
+        const parsed = parseChatterBody(body)
+        const fromMe = parsed.fromMe
+        const plainText = parsed.text
+        let timestamp = parsed.timestamp
+          ? parsed.timestamp.toISOString()
+          : (msg.date || msg.create_date || new Date().toISOString())
         return {
           externalId: `odoo-${msg.id}`,
           fromMe,
@@ -3306,6 +3370,7 @@ module.exports = {
   normalizePhoneToJid,
   escapeHtml,
   stripHtml,
+  parseChatterBody,  // v7.28: exported for tests / external use
   pushNameFallback,
   buildConversationTranscript,
   DATA_DIR,
