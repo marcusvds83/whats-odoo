@@ -207,7 +207,7 @@ export default function LoginPage() {
         </Suspense>
 
         <p className="text-xs text-muted-foreground text-center mt-4">
-          v7.28 • Multi-usuário
+          v7.29.1 • Reconnect estável
         </p>
       </div>
     </div>

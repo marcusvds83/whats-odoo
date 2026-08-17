@@ -500,7 +500,7 @@ export default function HomePage() {
             {!sidebarCollapsed && (
               <div className="hidden lg:block min-w-0">
                 <p className="text-sm font-bold leading-tight truncate">Whats-Odoo</p>
-                <p className="text-[10px] text-muted-foreground">v7.28 Middleware</p>
+                <p className="text-[10px] text-muted-foreground">v7.29.1 Reconnect estável</p>
               </div>
             )}
           </div>

@@ -1403,11 +1403,23 @@ class UserSession {
 
   // v7.29: schedule a single reconnect; reuses/cancels any pending timer so
   // repeated triggers never stack duplicate attempts.
+  // v7.29.1: also clear any stale waSocket reference so the watchdog stops
+  // firing on a socket that's already being replaced.
   scheduleReconnect(reason) {
-    if (this.waReconnectTimer) return
+    if (this.waReconnectTimer) {
+      console.log(`[WA:${this.userId}] Reconnect already pending — ignoring '${reason}'`)
+      return
+    }
     this.reconnectAttempts++
-    const delay = Math.min(2000 * Math.pow(2, this.reconnectAttempts - 1), 30000)
+    const delay = Math.min(2000 * Math.pow(2, this.reconnectAttempts - 1), 60000)
     console.log(`[WA:${this.userId}] ${reason} — reconnect #${this.reconnectAttempts} in ${delay}ms`)
+    // v7.29.1: null out the old socket immediately so the watchdog and
+    // connection.update handler treat subsequent events as stale.
+    if (this.waSocket) {
+      try { this.waSocket.ev.removeAllListeners() } catch {}
+      try { this.waSocket.end(undefined) } catch {}
+      this.waSocket = null
+    }
     this.waReconnectTimer = setTimeout(() => {
       this.waReconnectTimer = null
       this.connectWhatsApp().catch(err =>
@@ -1433,7 +1445,11 @@ class UserSession {
     const { state, saveCreds } = await useMultiFileAuthState(this.authFolder)
     const { version } = await fetchLatestBaileysVersion()
 
-    this.waSocket = makeWASocket({
+    // v7.29.1: capture THIS socket instance so we can ignore stale events
+    // from any previous socket that hasn't fully closed yet. Without this,
+    // the old socket fires 'close' AFTER the new socket is already open,
+    // emitting whatsapp:status { reconnecting } → UI flicker loop.
+    const socketInstance = makeWASocket({
       version,
       logger,
       auth: {
@@ -1444,7 +1460,10 @@ class UserSession {
       printQRInTerminal: false,
       connectTimeoutMs: 90_000,
       defaultQueryTimeoutMs: 60_000,
-      keepAliveIntervalMs: 10_000,
+      // v7.29.1: 10s → 30s (Baileys default). 10s was too aggressive — on
+      // Render, transient ping failures caused Baileys to close the WS
+      // and trigger a reconnect every few minutes.
+      keepAliveIntervalMs: 30_000,
       markOnlineOnConnect: true,
       syncFullHistory: false,
       retryRequestDelayMs: 250,
@@ -1452,9 +1471,27 @@ class UserSession {
       shouldIgnoreJid: (jid) => jid === 'status@broadcast',
     })
 
-    this.waSocket.ev.on('creds.update', saveCreds)
+    this.waSocket = socketInstance
+    this.waSocketStartTime = Date.now()  // v7.29.1: track uptime for backoff reset
 
-    this.waSocket.ev.on('connection.update', async (update) => {
+    // v7.29.1: returns true if socketInstance is still the current socket.
+    // Used to ignore stale events from previous sockets.
+    const isCurrentSocket = () => this.waSocket === socketInstance
+
+    socketInstance.ev.on('creds.update', saveCreds)
+
+    socketInstance.ev.on('connection.update', async (update) => {
+      // v7.29.1: Ignore events from stale sockets. This happens when the
+      // old socket (from a previous failed connect or a watchdog kill)
+      // finally fires its own 'close' event AFTER the new socket has
+      // already been created. Without this guard, the old socket's close
+      // would emit whatsapp:status { reconnecting } to the UI even though
+      // the new socket is healthy → UI flicker / "caindo e reconectando".
+      if (!isCurrentSocket()) {
+        console.log(`[WA:${this.userId}] Ignoring stale socket event: ${update.connection}`)
+        return
+      }
+
       const { connection, lastDisconnect, qr } = update
       this.connectionState = { connection }
       console.log(`[WA:${this.userId}] Connection update: ${connection}`)
@@ -1484,6 +1521,15 @@ class UserSession {
           this.emitWA('whatsapp:conversations', [])
         }
 
+        // v7.29.1: If the connection was open for >5 min before closing,
+        // it was a stable session that hit a transient blip. Reset the
+        // backoff so the reconnect is fast (2s) instead of escalating.
+        const uptimeMs = this.waSocketStartTime ? (Date.now() - this.waSocketStartTime) : 0
+        if (uptimeMs > 300_000 && shouldReconnect) {  // >5 min
+          console.log(`[WA:${this.userId}] Was open for ${Math.round(uptimeMs/1000)}s — resetting backoff`)
+          this.reconnectAttempts = 0
+        }
+
         this.emitWA('whatsapp:status', {
           connected: false,
           reason: statusCode === DisconnectReason.loggedOut ? 'logged_out' : 'reconnecting',
@@ -1503,28 +1549,41 @@ class UserSession {
         this.emitWA('whatsapp:status', { connected: true, hasSession: true })
 
         if (this.watchdogTimer) clearInterval(this.watchdogTimer)
+        // v7.29.1: Conservative watchdog. The previous version fired every
+        // 60s and forced reconnect whenever connectionState !== 'open',
+        // which killed the connection DURING the initial 'connecting'
+        // phase (which can take >60s on Render). The new watchdog:
+        //   - Runs every 3 minutes (not 60s)
+        //   - Skips entirely if a reconnect is already pending
+        //   - Skips if connectionState !== 'open' (let the close handler
+        //     deal with it)
+        //   - Only forces reconnect after 2 consecutive dead-WS checks
+        //     (~6 minutes of a truly dead WebSocket)
+        let deadWsCount = 0
         this.watchdogTimer = setInterval(() => {
-          try {
-            if (!this.waSocket || this.connectionState.connection !== 'open') {
-              console.log(`[WA Watchdog:${this.userId}] Connection not open, forcing reconnect...`)
-              try { this.waSocket?.end(undefined) } catch {}
-              this.waSocket = null
-              this.connectionState = { connection: 'close' }
-              this.scheduleReconnect('Watchdog: not open')
-              return
+          if (this.waReconnectTimer) return            // reconnect already pending
+          if (!this.waSocket) return                   // no socket to check
+          if (!isCurrentSocket()) return                // stale socket ref
+          if (this.connectionState.connection !== 'open') return  // let close handler deal
+
+          const wsState = this.waSocket.ws?.readyState
+          if (wsState === 3) {  // CLOSED
+            deadWsCount++
+            console.log(`[WA Watchdog:${this.userId}] WebSocket CLOSED (stale count=${deadWsCount}/2)`)
+            if (deadWsCount >= 2) {
+              console.log(`[WA Watchdog:${this.userId}] Dead WS for >6min, forcing reconnect...`)
+              deadWsCount = 0
+              this.emitWA('whatsapp:status', {
+                connected: false,
+                reason: 'reconnecting',
+                hasSession: this.hasSavedSession,
+              })
+              this.scheduleReconnect('Watchdog: dead WS for >6min')
             }
-            const state = this.waSocket.ws?.readyState
-            if (state === 3 || state === 2) {
-              console.log(`[WA Watchdog:${this.userId}] WebSocket dead, forcing reconnect...`)
-              try { this.waSocket.end(undefined) } catch {}
-              this.waSocket = null
-              this.connectionState = { connection: 'close' }
-              this.scheduleReconnect('Watchdog: ws dead')
-            }
-          } catch (err) {
-            console.log(`[WA Watchdog:${this.userId}] Error:`, err.message)
+          } else {
+            deadWsCount = 0
           }
-        }, 60_000)
+        }, 180_000)  // v7.29.1: 60s → 180s (3 minutes)
 
         try {
           const meId = this.waSocket.user?.id
@@ -2210,11 +2269,21 @@ class UserSession {
     } else if (this.lastQrCode) {
       this.emitTo(socket, 'whatsapp:qr', { qr: this.lastQrCode })
     } else {
+      // v7.29.1: clear any pending reconnect and force a fresh connect.
+      // Previously, this just nulled waSocket but left waReconnectTimer
+      // running, so the timer would fire LATER and start a SECOND
+      // socket → race condition → reconnect loop.
+      if (this.waReconnectTimer) {
+        clearTimeout(this.waReconnectTimer)
+        this.waReconnectTimer = null
+      }
       if (this.waSocket) {
+        try { this.waSocket.ev.removeAllListeners() } catch {}
         try { this.waSocket.end(undefined) } catch {}
         this.waSocket = null
       }
       this.lastQrCode = null
+      this.reconnectAttempts = 0
       this.connectWhatsApp()
     }
   }
@@ -2615,7 +2684,14 @@ class UserSession {
 
   async onDisconnectWA(callback) {
     try {
+      // v7.29.1: cancel any pending reconnect BEFORE logging out, otherwise
+      // the timer would fire after logout and start a new socket.
+      if (this.waReconnectTimer) {
+        clearTimeout(this.waReconnectTimer)
+        this.waReconnectTimer = null
+      }
       if (this.waSocket) {
+        try { this.waSocket.ev.removeAllListeners() } catch {}
         await this.waSocket.logout('User requested disconnect')
         this.waSocket = null
         this.connectionState = { connection: 'close' }
@@ -2632,7 +2708,13 @@ class UserSession {
         this.emitWA('whatsapp:conversations', [])
         callback?.({ success: true })
       } else {
-        callback?.({ success: false, error: 'Not connected' })
+        // v7.29.1: even if waSocket is null, clear state so the UI shows
+        // the disconnected state properly.
+        this.connectionState = { connection: 'close' }
+        this.hasSavedSession = false
+        this.lastQrCode = null
+        this.emitWA('whatsapp:status', { connected: false, reason: 'logged_out', hasSession: false })
+        callback?.({ success: true })
       }
     } catch (error) { callback?.({ success: false, error: error.message }) }
   }
