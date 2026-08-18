@@ -1896,16 +1896,50 @@ class UserSession {
             continue
           }
 
+          // v7.29.4: Use Baileys' own normalizeMessageContent to unwrap nested
+          // message types (ephemeralMessage, viewOnceMessage, viewOnceMessageV2,
+          // viewOnceMessageV2Extension, documentWithCaptionMessage, editedMessage).
+          // The previous manual unwrap was missing viewOnceMessageV2Extension,
+          // which is used for view-once media with captions — that caused real
+          // media messages to be silently dropped with "no text/media".
+          // Also handle deviceSentMessage separately (Baileys' normalize does NOT
+          // include it — it's only used for outgoing message echoes).
           let m = msg.message
-          if (m?.ephemeralMessage?.message) m = m.ephemeralMessage.message
-          else if (m?.viewOnceMessage?.message) m = m.viewOnceMessage.message
-          else if (m?.viewOnceMessageV2?.message) m = m.viewOnceMessageV2.message
-          else if (m?.documentWithCaptionMessage?.message) m = m.documentWithCaptionMessage.message
-          else if (m?.deviceSentMessage?.message) m = m.deviceSentMessage.message
-          else if (m?.editedMessage?.message) m = m.editedMessage.message
+          if (m?.deviceSentMessage?.message) m = m.deviceSentMessage.message
+          try {
+            const baileysMod = await this.loadBaileys()
+            const normalized = baileysMod.normalizeMessageContent?.(m)
+            if (normalized) m = normalized
+          } catch (e) {
+            // Fallback: keep the original message body if normalize fails
+          }
 
-          if (!m) {
+          // v7.29.4: Silently skip protocol/control messages that have no
+          // user-visible content. These arrive with messageStubType set and
+          // msg.message either missing or containing only messageContextInfo.
+          // Skipping them loudly pollutes the logs ("no text/media" spam).
+          if (msg.messageStubType !== undefined && msg.messageStubType !== null) {
+            console.log(`[WA:${this.userId}] upsert msg skipped — stub type=${msg.messageStubType} (protocol/control message)`)
+            continue
+          }
+
+          if (!m || typeof m !== 'object') {
             console.log(`[WA:${this.userId}] upsert msg skipped — no message body`)
+            continue
+          }
+
+          // v7.29.4: Handle reactionMessage separately — these are emoji
+          // reactions, not text/media. Skip them silently (we don't render
+          // reactions in the chat view yet).
+          if (m.reactionMessage) {
+            console.log(`[WA:${this.userId}] upsert msg skipped — reactionMessage`)
+            continue
+          }
+
+          // v7.29.4: Handle protocolMessage separately — these are protocol
+          // updates (message revoked, E2E changed, etc.) with no body.
+          if (m.protocolMessage) {
+            console.log(`[WA:${this.userId}] upsert msg skipped — protocolMessage (type=${m.protocolMessage.type})`)
             continue
           }
 
@@ -1935,9 +1969,13 @@ class UserSession {
           else if (m.stickerMessage) mediaType = 'sticker'
 
           if (!textContent && !mediaType) {
-            console.log(`[WA:${this.userId}] upsert msg skipped — no text/media`)
+            // v7.29.4: Log the actual top-level keys present in `m` so we can
+            // diagnose what Baileys is sending. Previously this was silent and
+            // we had no way to know what message type was being skipped.
+            const keys = Object.keys(m).join(',') || '(empty)'
+            console.log(`[WA:${this.userId}] upsert msg skipped — no text/media | keys=[${keys}] fromMe=${fromMe}`)
             try {
-              this.logUpsertEvent({ type: 'skipped-no-content', jid, keys: Object.keys(m).join(','), sample: JSON.stringify(m).slice(0, 300) })
+              this.logUpsertEvent({ type: 'skipped-no-content', jid, keys, sample: JSON.stringify(m).slice(0, 300) })
             } catch {}
             continue
           }

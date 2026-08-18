@@ -266,7 +266,9 @@ export function useWhatsApp() {
     // v7.14: Listen for "messages refreshed" events — emitted by the server
     // after a fetchMessageHistory call completes. Used to update the active
     // chat view with newly-fetched messages.
-    socket.on('whatsapp:messages:refreshed', (data: { jid: string; messages: WhatsAppMessage[] }) => {
+    // v7.29.4: Be defensive — payload may be malformed/missing in edge cases.
+    socket.on('whatsapp:messages:refreshed', (data: { jid: string; messages?: WhatsAppMessage[] }) => {
+      if (!data || !Array.isArray(data.messages)) return
       console.log('[WhatsApp] Messages refreshed:', data.jid, data.messages.length, 'msgs')
       // Only update if this is for the active conversation
       const normalizedIncoming = normalizeJidForCompare(data.jid)
@@ -274,12 +276,12 @@ export function useWhatsApp() {
       if (normalizedIncoming && normalizedIncoming === normalizedCurrent) {
         setCurrentMessages(prev => {
           // Merge: keep existing messages, append new ones (dedup by id)
-          const existingIds = new Set(prev.map(m => m.id))
-          const newOnes = data.messages.filter(m => !existingIds.has(m.id))
+          const existingIds = new Set((prev || []).map(m => m.id))
+          const newOnes = data.messages!.filter(m => !existingIds.has(m.id))
           if (newOnes.length === 0) return prev
           console.log(`[WhatsApp] Appending ${newOnes.length} refreshed messages`)
           // Sort all by timestamp
-          return [...prev, ...newOnes].sort((a, b) => {
+          return [...(prev || []), ...newOnes].sort((a, b) => {
             const tA = new Date(a.timestamp).getTime()
             const tB = new Date(b.timestamp).getTime()
             return tA - tB
@@ -347,8 +349,18 @@ export function useWhatsApp() {
   const loadMessages = useCallback((jid: string) => {
     setCurrentJid(jid)
     setCurrentMessages([])
-    socketRef.current?.emit('whatsapp:get-messages', { jid }, (response: { messages: WhatsAppMessage[] }) => {
-      setCurrentMessages(response.messages)
+    socketRef.current?.emit('whatsapp:get-messages', { jid }, (response: { messages?: WhatsAppMessage[] } | undefined) => {
+      // v7.29.4: Be defensive — if the socket disconnected before the server
+      // could reply, response may be undefined. Setting currentMessages to
+      // undefined would crash React downstream (every .map() in ChatView).
+      // Fall back to [] so the chat view renders the "Sem mensagens" empty
+      // state instead of throwing.
+      try {
+        setCurrentMessages(Array.isArray(response?.messages) ? response.messages! : [])
+      } catch (err) {
+        console.error('[WhatsApp] loadMessages callback error:', err)
+        setCurrentMessages([])
+      }
     })
   }, [])
 
@@ -462,9 +474,10 @@ export function useWhatsApp() {
     return new Promise((resolve) => {
       socketRef.current?.emit('whatsapp:inject-history', { jid, messages }, (response: any) => {
         // After injecting, reload current messages for this JID if it's the active one
-        if (response.success && currentJid === jid) {
-          socketRef.current?.emit('whatsapp:get-messages', { jid }, (msgResponse: { messages: WhatsAppMessage[] }) => {
-            setCurrentMessages(msgResponse.messages)
+        if (response?.success && currentJid === jid) {
+          socketRef.current?.emit('whatsapp:get-messages', { jid }, (msgResponse: { messages?: WhatsAppMessage[] } | undefined) => {
+            // v7.29.4: defensive — msgResponse may be undefined if socket died
+            setCurrentMessages(Array.isArray(msgResponse?.messages) ? msgResponse!.messages : [])
           })
         }
         resolve(response)
@@ -503,7 +516,8 @@ export function useWhatsApp() {
   const refreshMessages = useCallback((jid: string): Promise<{ success: boolean; messages?: WhatsAppMessage[]; count?: number; serverFetchAttempted?: boolean; serverFetchMethods?: string[]; error?: string }> => {
     return new Promise((resolve) => {
       socketRef.current?.emit('whatsapp:refresh-messages', { jid }, (response: any) => {
-        if (response && response.success && response.messages) {
+        // v7.29.4: defensive — response may be undefined if socket disconnected
+        if (response && response.success && Array.isArray(response.messages)) {
           // Replace current messages with the refreshed set (if for active chat)
           const normalizedIncoming = normalizeJidForCompare(jid)
           const normalizedCurrent = normalizeJidForCompare(currentJidRef.current)
@@ -511,7 +525,7 @@ export function useWhatsApp() {
             setCurrentMessages(response.messages)
           }
         }
-        resolve(response)
+        resolve(response || { success: false, error: 'No response from server' })
       })
     })
   }, [])
@@ -536,6 +550,9 @@ export function useWhatsApp() {
   // The poll only fetches the local server-side cache — it does NOT trigger
   // a fetchMessageHistory call (that would be too expensive every 3s).
   // The user can manually click "Buscar no aparelho" to trigger a server-side fetch.
+  // v7.29.4: Be defensive — if response is undefined (e.g., socket disconnected
+  // mid-poll), don't crash. Previously `response.messages.length` would throw
+  // a TypeError and unmount the entire WhatsApp UI.
   useEffect(() => {
     if (!currentJid) return
     // Use a ref-like pattern to avoid stale closures
@@ -543,17 +560,20 @@ export function useWhatsApp() {
     const pollInterval = setInterval(() => {
       // Only poll if this is still the active conversation
       if (currentJidRef.current !== jid) return
-      socketRef.current?.emit('whatsapp:get-messages', { jid }, (response: { messages: WhatsAppMessage[] }) => {
+      socketRef.current?.emit('whatsapp:get-messages', { jid }, (response: { messages?: WhatsAppMessage[] } | undefined) => {
         if (currentJidRef.current !== jid) return
+        // v7.29.4: skip silently if response is undefined or messages isn't an array
+        if (!response || !Array.isArray(response.messages)) return
         // Only update if the message count changed (avoid unnecessary re-renders)
         setCurrentMessages(prev => {
-          if (response.messages.length === prev.length) return prev
+          if (!Array.isArray(prev)) return response.messages
+          if (response.messages!.length === prev.length) return prev
           // Check if any new messages exist that aren't in prev
           const existingIds = new Set(prev.map(m => m.id))
-          const hasNew = response.messages.some(m => !existingIds.has(m.id))
+          const hasNew = response.messages!.some(m => !existingIds.has(m.id))
           if (!hasNew) return prev
-          console.log(`[WhatsApp] Polling found ${response.messages.length - prev.length} new message(s)`)
-          return response.messages
+          console.log(`[WhatsApp] Polling found ${response.messages!.length - prev.length} new message(s)`)
+          return response.messages!
         })
       })
     }, 3000)
