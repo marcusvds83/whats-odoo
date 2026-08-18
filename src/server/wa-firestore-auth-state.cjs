@@ -128,6 +128,48 @@ function parseServiceAccount() {
 }
 
 /**
+ * v7.34: Deep-clone an object tree into PLAIN objects that Firestore can
+ * serialize. Firestore rejects any value whose prototype is not Object.prototype
+ * or Array.prototype — e.g. protobuf message instances like ADVSignedDeviceIdentity
+ * that Baileys creates via `new` after a successful QR scan.
+ *
+ * Behavior:
+ *   - Buffer → returned as-is (Firestore stores as Blob, revives as Buffer)
+ *   - Date   → returned as-is (Firestore stores as Timestamp, revives as Date)
+ *   - Array  → element-wise recursion into a fresh []
+ *   - Object → copy all own enumerable string-keyed props into a fresh {}
+ *              (this strips custom prototypes while preserving the data)
+ *   - primitives (string/number/boolean/null/undefined) → returned as-is
+ *   - cycle protection via WeakSet (returns null on revisits)
+ *
+ * This mirrors what Baileys' own useMultiFileAuthState does internally
+ * (JSON.stringify + a Buffer-aware replacer), but without converting Buffers
+ * to plain {type:'Buffer',data:base64} maps — Firestore's native Buffer
+ * support gives us smaller docs and faster reads.
+ */
+function toPlainFirestore(obj, seen) {
+  if (obj === null || obj === undefined) return obj
+  if (Buffer.isBuffer(obj)) return obj
+  if (obj instanceof Date) return obj
+  if (typeof obj !== 'object') return obj
+  if (!seen) seen = new WeakSet()
+  if (seen.has(obj)) return null  // cycle protection
+  seen.add(obj)
+  if (Array.isArray(obj)) {
+    const arr = new Array(obj.length)
+    for (let i = 0; i < obj.length; i++) {
+      arr[i] = toPlainFirestore(obj[i], seen)
+    }
+    return arr
+  }
+  const out = {}
+  for (const [k, v] of Object.entries(obj)) {
+    out[k] = toPlainFirestore(v, seen)
+  }
+  return out
+}
+
+/**
  * In-memory representation of the auth state. Mirrors what Baileys'
  * `useMultiFileAuthState` returns, but backed by Firestore.
  *
@@ -236,13 +278,32 @@ async function useFirestoreAuthState(db, userId) {
   // debounced persist would then write `creds: null` to Firestore, so the
   // first scan's credentials were lost → next deploy, user had to re-scan.
   // Now we read `state.creds` at persist-time so we always save the latest.
+  //
+  // v7.34 CRITICAL FIX: deep-clone creds and keys into plain objects via
+  // toPlainFirestore() before writing. After a successful QR scan, Baileys
+  // populates creds.account with an ADVSignedDeviceIdentity protobuf instance
+  // (custom prototype created via `new`). Firestore REJECTS any object whose
+  // prototype is not Object.prototype or Array.prototype — it throws:
+  //   "Couldn't serialize object of type 'ADVSignedDeviceIdentity' ...
+  //    Firestore doesn't support JavaScript objects with custom prototypes"
+  // When persistState threw, the freshly-paired creds never made it to
+  // Firestore → on the next reconnect (status 515) we generated fresh
+  // initAuthCreds() and the completed registration was lost → the phone
+  // showed "couldn't connect, scan QR again" and the UI spun forever.
+  //
+  // toPlainFirestore() copies any custom-prototype object into a fresh {}
+  // (preserving all own enumerable props) so Firestore accepts it, while
+  // leaving Buffer and Date instances untouched (Firestore stores those
+  // natively as Blob / Timestamp and revives them on read).
   const persistState = async () => {
     if (!state.creds) return
     try {
       cached.creds = state.creds  // keep cached in sync
+      const plainCreds = toPlainFirestore(state.creds)
+      const plainKeys = toPlainFirestore(cached.keys)
       await docRef.set({
-        creds: state.creds,
-        keys: cached.keys,
+        creds: plainCreds,
+        keys: plainKeys,
         updatedAt: new Date(),
       }, { merge: false })
     } catch (err) {

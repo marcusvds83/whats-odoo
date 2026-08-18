@@ -3738,22 +3738,52 @@ class SessionManager {
     // (Firestore for logins; otherwise falls back to SQLite/Prisma).
     this.loadUserById = loadUserById || null
     this.sessions = new Map()  // userId -> UserSession
+    // v7.34: pending-promises map to dedupe concurrent getOrCreate() calls.
+    // Without this, when a browser opens two socket connections in parallel
+    // (e.g., one to /whatsapp and one to /odoo namespace on page load),
+    // both call getOrCreate(userId) at the same instant, both see no
+    // existing session, both create a NEW UserSession, and both call
+    // start() — producing TWO parallel WhatsApp connections for the same
+    // user that fight over the same Baileys auth state. This caused the
+    // duplicate "QR Code generated" / "Connection update: connecting"
+    // log lines visible in v7.33.1 Render logs, and was a contributing
+    // cause of the 515 (loggedOut) status after QR scan.
+    this._pending = new Map()  // userId -> Promise<UserSession|null>
   }
 
   async getOrCreate(userId) {
-    let s = this.sessions.get(userId)
-    if (s) return s
+    const existing = this.sessions.get(userId)
+    if (existing) return existing
 
-    // Load user from DB (Firestore when configured, else SQLite)
-    const user = this.loadUserById
-      ? await this.loadUserById(userId, this.prisma)
-      : await this.prisma.user.findUnique({ where: { id: userId } })
-    if (!user || !user.isActive) return null
+    // v7.34: if another call is already in-flight for this user, await it
+    // instead of starting a second UserSession.
+    const pending = this._pending.get(userId)
+    if (pending) return pending
 
-    s = new UserSession({ userId, user, io: this.io, prisma: this.prisma })
-    this.sessions.set(userId, s)
-    await s.start()
-    return s
+    const promise = (async () => {
+      try {
+        // Load user from DB (Firestore when configured, else SQLite)
+        const user = this.loadUserById
+          ? await this.loadUserById(userId, this.prisma)
+          : await this.prisma.user.findUnique({ where: { id: userId } })
+        if (!user || !user.isActive) return null
+
+        // v7.34: re-check after the awaited DB lookup — a concurrent
+        // getOrCreate() might have finished first and inserted a session.
+        const raced = this.sessions.get(userId)
+        if (raced) return raced
+
+        const s = new UserSession({ userId, user, io: this.io, prisma: this.prisma })
+        this.sessions.set(userId, s)
+        await s.start()
+        return s
+      } finally {
+        this._pending.delete(userId)
+      }
+    })()
+
+    this._pending.set(userId, promise)
+    return promise
   }
 
   get(userId) {
@@ -3766,6 +3796,10 @@ class SessionManager {
       s.stop()
       this.sessions.delete(userId)
     }
+    // v7.34: also clear any pending getOrCreate promise — if a session
+    // is being invalidated while still starting, the in-flight promise
+    // should not resurrect it.
+    this._pending.delete(userId)
   }
 
   // Stop all sessions (used on SIGTERM)

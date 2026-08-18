@@ -1210,3 +1210,31 @@ Stage Summary:
 - QR scan will now persist creds to Firestore successfully
 - On QR expiration / connection close, reconnect will load saved creds from Firestore and reconnect automatically (no new QR needed)
 - Non-admin users will navigate to / successfully after login (no more cookie race condition)
+
+---
+Task ID: v7.34.0
+Agent: main (post-context-continuation)
+Task: Fix two remaining WhatsApp QR-scan failures from v7.33.1 Render logs: (a) persistState throws on ADVSignedDeviceIdentity custom-prototype; (b) double UserSession creation causing two parallel WA connections.
+
+Work Log:
+- Read /home/z/my-project/src/server/wa-firestore-auth-state.cjs and confirmed v7.33.1 already enabled `ignoreUndefinedProperties: true` (the previous "undefined field" error is gone from the latest logs).
+- Identified the NEW persistState error in user-supplied Render logs:
+  `Couldn't serialize object of type "ADVSignedDeviceIdentity" (found in field "creds.account"). Firestore doesn't support JavaScript objects with custom prototypes (i.e. objects that were created via the "new" operator).`
+  Root cause: after a successful QR scan, Baileys populates `creds.account` with a protobuf-generated class instance. Firestore rejects any value whose prototype isn't Object.prototype or Array.prototype.
+- Added new helper `toPlainFirestore(obj, seen)` to wa-firestore-auth-state.cjs. It deep-clones any object tree into plain {} / [] instances, preserving Buffer and Date (Firestore stores those natively as Blob / Timestamp). Cycle-protected via WeakSet. Mirrors what Baileys' own useMultiFileAuthState does internally (JSON.stringify with Buffer replacer), but keeps Buffers as Buffers for smaller docs.
+- Modified `persistState()` in wa-firestore-auth-state.cjs to call `toPlainFirestore(state.creds)` and `toPlainFirestore(cached.keys)` before `docRef.set(...)`. With this, the post-scan creds (including creds.account = ADVSignedDeviceIdentity) now persist cleanly to Firestore → on the next reconnect (status 515) we read the saved creds instead of generating fresh initAuthCreds() → the completed registration survives → user no longer sees "couldn't connect, scan QR again."
+- Read /home/z/my-project/src/server/user-session.js (SessionManager.getOrCreate). Confirmed root cause of double session: when the browser opens two socket connections in parallel (one to /whatsapp, one to /odoo), both attachUser middlewares call sessionManager.getOrCreate(userId) at the same instant. Both see `sessions.get(userId)` returning undefined, both create new UserSession instances, both call `start()` — producing the two parallel "Connection update: connecting" / "QR Code generated" / "Auto-authenticating" lines visible in v7.33.1 logs.
+- Patched SessionManager: added `this._pending = new Map()` (userId → Promise). getOrCreate() now returns the in-flight promise if one exists, so the second concurrent caller just awaits the first one's result instead of starting a second UserSession. Also added a re-check after the awaited DB lookup, in case another getOrCreate finished first while we were loading the user. Updated invalidate() to clear the pending promise too.
+- Bumped package.json version to 7.34.0; updated the version string on /login page footer.
+- Verified: `node -c` on both .cjs and .js files passes; `npx next build` compiles successfully (Next.js 16.1.3, Turbopack, 23.2s, 15/15 static pages).
+
+Stage Summary:
+- v7.34.0 ready to deploy. Two critical fixes:
+  1. Firestore can now persist Baileys creds after QR scan (ADVSignedDeviceIdentity stripped of custom prototype via toPlainFirestore). This was THE cause of "scan succeeded but phone says couldn't connect, scan QR again."
+  2. Only one UserSession per user — eliminates the duplicate QR / duplicate connecting / duplicate Firestore writes that were also corrupting the auth state.
+- No changes to admin or non-admin login flow (the v7.33.1 hard-navigation fix in /login and /admin pages already addresses the cookie race condition).
+- Files modified:
+  - src/server/wa-firestore-auth-state.cjs (added toPlainFirestore, modified persistState)
+  - src/server/user-session.js (SessionManager.getOrCreate dedupe, invalidate clear pending)
+  - package.json (version 7.34.0)
+  - src/app/login/page.tsx (footer version string)
