@@ -149,6 +149,24 @@ async function gracefulShutdown(signal) {
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'))
 process.on('SIGINT', () => gracefulShutdown('SIGINT'))
 
+// v7.29.2: Catch-all for unhandled errors. Without these, a single
+// unhandled promise rejection or synchronous exception in any of the
+// event handlers (WA socket events, Odoo sync, etc.) would crash the
+// entire Node process, kicking ALL users out (UI "falls" + redirect
+// to /login because socket.io disconnects). With these handlers, the
+// error is logged but the process keeps running.
+process.on('unhandledRejection', (reason, promise) => {
+  const msg = reason instanceof Error ? `${reason.message}\n${reason.stack || ''}` : String(reason)
+  console.error(`[Server] ⚠️  unhandledRejection (process staying alive):`, msg)
+})
+process.on('uncaughtException', (err) => {
+  console.error(`[Server] ⚠️  uncaughtException (process staying alive):`, err.message)
+  console.error(err.stack || '')
+  // Do NOT process.exit(1) — that would terminate the container and
+  // disconnect every user. Render would auto-restart but mid-conversation
+  // users would see "the page fell". Better to log and continue.
+})
+
 // ====================================================================
 // MAIN SERVER — Next.js + Socket.io (single process)
 // ====================================================================

@@ -693,12 +693,29 @@ class UserSession {
 
   odooAuthenticate() {
     return new Promise((resolve, reject) => {
-      const client = this.makeXmlRpcClient('/xmlrpc/2/common')
-      client.methodCall('authenticate', [this.odooConfig.db, this.odooConfig.username, this.odooConfig.password, {}], (error, value) => {
-        if (error) reject(error)
-        else if (!value) reject(new Error('Authentication failed - invalid credentials'))
-        else resolve(value)
-      })
+      // v7.29.2: 30s timeout on auth — same reasoning as odooExecuteKw
+      let settled = false
+      const timer = setTimeout(() => {
+        if (settled) return
+        settled = true
+        reject(new Error('Odoo authenticate timeout after 30s'))
+      }, 30_000)
+      try {
+        const client = this.makeXmlRpcClient('/xmlrpc/2/common')
+        client.methodCall('authenticate', [this.odooConfig.db, this.odooConfig.username, this.odooConfig.password, {}], (error, value) => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          if (error) reject(error)
+          else if (!value) reject(new Error('Authentication failed - invalid credentials'))
+          else resolve(value)
+        })
+      } catch (err) {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        reject(err)
+      }
     })
   }
 
@@ -708,11 +725,31 @@ class UserSession {
         reject(new Error('Not authenticated with Odoo'))
         return
       }
-      const client = this.makeXmlRpcClient('/xmlrpc/2/object')
-      client.methodCall('execute_kw', [this.odooConfig.db, this.odooConfig.uid, this.odooConfig.password, model, method, args, kwargs], (error, value) => {
-        if (error) reject(error)
-        else resolve(value)
-      })
+      // v7.29.2: Add 30s timeout. Without this, if Odoo hangs (network
+      // glitch, server slow), the Promise never resolves and the calling
+      // code stays blocked forever — which blocks the WA message handler
+      // and the user perceives it as "the page fell".
+      let settled = false
+      const timer = setTimeout(() => {
+        if (settled) return
+        settled = true
+        reject(new Error(`Odoo ${model}.${method} timeout after 30s`))
+      }, 30_000)
+      try {
+        const client = this.makeXmlRpcClient('/xmlrpc/2/object')
+        client.methodCall('execute_kw', [this.odooConfig.db, this.odooConfig.uid, this.odooConfig.password, model, method, args, kwargs], (error, value) => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          if (error) reject(error)
+          else resolve(value)
+        })
+      } catch (err) {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        reject(err)
+      }
     })
   }
 
@@ -2470,22 +2507,34 @@ class UserSession {
         this.emitWA('whatsapp:conversation:update', this.serializeConversation(conv))
       }
 
+      // v7.29.2: Respond to the client IMMEDIATELY after the WA message
+      // is sent and the local conversation is updated. Previously the
+      // callback waited for `await autoSyncWhatsAppMessage()` — if Odoo
+      // was slow/unreachable, the UI stayed stuck in "Enviando..."
+      // forever, which the user perceived as "the page fell".
+      // Now autoSync runs in the background (fire-and-forget).
+      callback?.({ success: true, messageId: msgId })
+
       const phone = extractPhone(jid)
       if (phone) {
-        try {
-          await this.autoSyncWhatsAppMessage({
-            jid, phone, pushName: conv.pushName,
-            textContent: data.text, mediaType: null,
-            fromMe: true, timestamp: new Date().toISOString(),
-            dedupId: msgId,
-            // v7.24 (R7): text-only message — no media fields
-            mediaBase64: null, mimeType: null, fileName: null,
-          })
-        } catch (err) {
-          console.error(`[AutoSync:${this.userId}] Send error:`, err.message)
-        }
+        // v7.29.2: fire-and-forget with explicit error logging
+        this.autoSyncWhatsAppMessage({
+          jid, phone, pushName: conv.pushName,
+          textContent: data.text, mediaType: null,
+          fromMe: true, timestamp: new Date().toISOString(),
+          dedupId: msgId,
+          // v7.24 (R7): text-only message — no media fields
+          mediaBase64: null, mimeType: null, fileName: null,
+        }).then(result => {
+          if (result.partnerId || result.leadId) {
+            this.emitWA('whatsapp:odoo-sync', {
+              jid, phone, partnerId: result.partnerId, leadId: result.leadId,
+              mailMessageId: result.mailMessageId, activityId: result.activityId,
+              created: result.created, errors: result.errors,
+            })
+          }
+        }).catch(err => console.error(`[AutoSync:${this.userId}] Send error:`, err.message))
       }
-      callback?.({ success: true, messageId: msgId })
     } catch (error) {
       callback?.({ success: false, error: error.message })
     }
@@ -2525,37 +2574,47 @@ class UserSession {
         conversation: this.serializeConversation(conv),
       })
 
+      // v7.29.2: respond immediately — don't block the UI on Odoo sync
+      callback?.({ success: true, messageId: msgId })
+
       const phone = extractPhone(jid)
       if (phone) {
-        try {
-          // v7.24 (R7): Read the file back as base64 so it can be attached
-          // to Odoo chatter. The file was just written to disk by the
-          // caller (onSendMedia). If the read fails, we still post the
-          // text-only chatter message.
-          let outgoingB64 = null
-          try {
-            const fpath = data.url?.replace(/^\/media\//, this.mediaDir + '/')
-            if (fpath && fs.existsSync(fpath)) {
-              const buf = fs.readFileSync(fpath)
-              if (buf.length < 1_500_000) outgoingB64 = buf.toString('base64')
-            }
-          } catch {}
-          await this.autoSyncWhatsAppMessage({
-            jid, phone, pushName: conv.pushName,
-            textContent: data.caption || null, mediaType: data.type,
-            fromMe: true, timestamp: messageTimestamp.toISOString(),
-            dedupId: msgId,
-            mediaBase64: outgoingB64,
-            mimeType: data.mimeType || null,
-            fileName: data.fileName || null,
-          })
-        } catch (err) {
+        // v7.29.2: fire-and-forget (read file + sync to Odoo in background)
+        this._syncOutgoingMedia(data, conv, msgId, messageTimestamp, phone).catch(err =>
           console.error(`[AutoSync:${this.userId}] Send media error:`, err.message)
-        }
+        )
       }
-      callback?.({ success: true, messageId: msgId })
     } catch (error) {
       callback?.({ success: false, error: error.message })
+    }
+  }
+
+  // v7.29.2: Helper — read media file from disk + sync to Odoo chatter
+  // in the background. Used by onSendMedia so the UI callback isn't blocked.
+  async _syncOutgoingMedia(data, conv, msgId, messageTimestamp, phone) {
+    let outgoingB64 = null
+    try {
+      const fpath = data.url?.replace(/^\/media\//, this.mediaDir + '/')
+      if (fpath && fs.existsSync(fpath)) {
+        const buf = fs.readFileSync(fpath)
+        if (buf.length < 1_500_000) outgoingB64 = buf.toString('base64')
+      }
+    } catch {}
+    const result = await this.autoSyncWhatsAppMessage({
+      jid: normalizeJid(data?.jid), phone, pushName: conv.pushName,
+      textContent: data.caption || null, mediaType: data.type,
+      fromMe: true, timestamp: messageTimestamp.toISOString(),
+      dedupId: msgId,
+      mediaBase64: outgoingB64,
+      mimeType: data.mimeType || null,
+      fileName: data.fileName || null,
+    })
+    if (result.partnerId || result.leadId) {
+      this.emitWA('whatsapp:odoo-sync', {
+        jid: normalizeJid(data?.jid), phone, partnerId: result.partnerId, leadId: result.leadId,
+        mailMessageId: result.mailMessageId, activityId: result.activityId,
+        created: result.created, errors: result.errors,
+      })
     }
   }
 
@@ -2642,28 +2701,35 @@ class UserSession {
         this.emitWA('whatsapp:conversation:update', this.serializeConversation(conv))
       }
 
+      // v7.29.2: respond immediately — don't block the UI on Odoo sync
+      callback?.({ success: true, messageId: finalMsgId, mediaUrl })
+
       const phone = extractPhone(jid)
       if (phone) {
-        try {
-          // v7.24 (R7): Pass the base64 data straight through — it's
-          // already in memory, no need to re-read from disk. Cap at
-          // 1.5 MB to avoid Odoo XML-RPC payload limits.
-          const outgoingB64 = (buffer.length < 1_500_000) ? data.base64 : null
-          await this.autoSyncWhatsAppMessage({
-            jid, phone, pushName: conv.pushName,
-            textContent: data.caption || `[${mediaType}]`,
-            mediaType, fromMe: true,
-            timestamp: messageTimestamp.toISOString(),
-            dedupId: finalMsgId,
-            mediaBase64: outgoingB64,
-            mimeType,
-            fileName: data.fileName || null,
-          })
-        } catch (err) {
-          console.error(`[AutoSync:${this.userId}] Send media base64 error:`, err.message)
-        }
+        // v7.29.2: fire-and-forget (Odoo sync in background)
+        // Pass the base64 data straight through — it's already in memory,
+        // no need to re-read from disk. Cap at 1.5 MB to avoid Odoo XML-RPC
+        // payload limits.
+        const outgoingB64 = (buffer.length < 1_500_000) ? data.base64 : null
+        this.autoSyncWhatsAppMessage({
+          jid, phone, pushName: conv.pushName,
+          textContent: data.caption || `[${mediaType}]`,
+          mediaType, fromMe: true,
+          timestamp: messageTimestamp.toISOString(),
+          dedupId: finalMsgId,
+          mediaBase64: outgoingB64,
+          mimeType,
+          fileName: data.fileName || null,
+        }).then(result => {
+          if (result.partnerId || result.leadId) {
+            this.emitWA('whatsapp:odoo-sync', {
+              jid, phone, partnerId: result.partnerId, leadId: result.leadId,
+              mailMessageId: result.mailMessageId, activityId: result.activityId,
+              created: result.created, errors: result.errors,
+            })
+          }
+        }).catch(err => console.error(`[AutoSync:${this.userId}] Send media base64 error:`, err.message))
       }
-      callback?.({ success: true, messageId: finalMsgId, mediaUrl })
     } catch (error) {
       console.error(`[WA IO:${this.userId}] send-media-base64 error:`, error.message)
       callback?.({ success: false, error: error.message })

@@ -39,7 +39,6 @@ import {
   AlertCircle,
   CheckCircle2,
   LogOut,
-  Shield,
 } from 'lucide-react'
 
 type Tab = 'dashboard' | 'whatsapp' | 'conversations' | 'settings' | 'users'
@@ -500,7 +499,7 @@ export default function HomePage() {
             {!sidebarCollapsed && (
               <div className="hidden lg:block min-w-0">
                 <p className="text-sm font-bold leading-tight truncate">Whats-Odoo</p>
-                <p className="text-[10px] text-muted-foreground">v7.29.1 Reconnect estável</p>
+                <p className="text-[10px] text-muted-foreground">v7.29.2 Send estável</p>
               </div>
             )}
           </div>
@@ -542,10 +541,11 @@ export default function HomePage() {
               {!sidebarCollapsed && (
                 <div className="flex-1 min-w-0 hidden lg:block">
                   <p className="text-xs font-medium truncate">{user?.name || user?.email}</p>
-                  <p className="text-[10px] text-muted-foreground flex items-center gap-1">
-                    {isAdmin && <Shield className="size-2.5 text-amber-600" />}
-                    {isAdmin ? 'Admin' : 'Usuário'}
-                  </p>
+                  {/* v7.29.2: Hide role label — regular users see the same UI as admins
+                      (the only difference is admin's "Usuários" tab, which is already
+                      gated). Showing "Admin"/"Usuário" creates a perceived difference
+                      that doesn't actually exist in functionality. */}
+                  <p className="text-[10px] text-muted-foreground truncate">{user?.email}</p>
                 </div>
               )}
               <Button

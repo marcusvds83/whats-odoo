@@ -207,7 +207,7 @@ export default function LoginPage() {
         </Suspense>
 
         <p className="text-xs text-muted-foreground text-center mt-4">
-          v7.29.1 • Reconnect estável
+          v7.29.2 • Send estável
         </p>
       </div>
     </div>
