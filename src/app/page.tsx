@@ -437,6 +437,7 @@ export default function HomePage() {
   const [activeTab, setActiveTab] = useState<Tab>('dashboard')
   const [selectedJid, setSelectedJid] = useState<string | null>(null)
   const [showOdooPanel, setShowOdooPanel] = useState(false)
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
 
   // v7.22: Auth guard — if not authenticated, redirect to /login
   useEffect(() => {
@@ -445,18 +446,13 @@ export default function HomePage() {
     }
   }, [authLoading, isAuthenticated, router])
 
-  // Show loading spinner while auth state is being determined
-  if (authLoading || !isAuthenticated) {
-    return (
-      <div className="min-h-screen flex items-center justify-center bg-background">
-        <div className="flex flex-col items-center gap-3">
-          <Loader2 className="size-8 animate-spin text-emerald-600" />
-          <p className="text-sm text-muted-foreground">Carregando...</p>
-        </div>
-      </div>
-    )
-  }
-
+  // v7.29.3: ALL hooks must be declared BEFORE any early return — otherwise
+  // React's rules of hooks are violated (hooks called in different orders
+  // between renders) and the page crashes with "Application error: a
+  // client-side exception has occurred". This was the root cause of the
+  // "neither admin nor user can send/receive messages" bug: the page would
+  // crash on first interaction once auth state flipped, taking down the
+  // entire WhatsApp UI with it.
   const selectedConversation = useMemo(() => {
     if (!selectedJid) return null
     return wa.conversations.find(c => c.jid === selectedJid) || null
@@ -471,14 +467,28 @@ export default function HomePage() {
     return links
   }, [selectedJid, odoo.conversationLinks])
 
+  // Show loading spinner while auth state is being determined.
+  // v7.29.3: This early return MUST come AFTER all hook declarations
+  // (useWhatsApp, useOdoo, useAuth, useState, useEffect, useMemo) — otherwise
+  // React throws "Rendered more hooks than during the previous render" /
+  // "Application error: a client-side exception has occurred".
+  if (authLoading || !isAuthenticated) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-background">
+        <div className="flex flex-col items-center gap-3">
+          <Loader2 className="size-8 animate-spin text-emerald-600" />
+          <p className="text-sm text-muted-foreground">Carregando...</p>
+        </div>
+      </div>
+    )
+  }
+
   const handleSelectConversation = (jid: string) => {
     setSelectedJid(jid)
     wa.loadMessages(jid)
     wa.markRead(jid)
     setActiveTab('conversations')
   }
-
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
 
   return (
     <div className="flex h-screen overflow-hidden">
@@ -499,7 +509,7 @@ export default function HomePage() {
             {!sidebarCollapsed && (
               <div className="hidden lg:block min-w-0">
                 <p className="text-sm font-bold leading-tight truncate">Whats-Odoo</p>
-                <p className="text-[10px] text-muted-foreground">v7.29.2 Send estável</p>
+                <p className="text-[10px] text-muted-foreground">v7.29.3 Page crash fix</p>
               </div>
             )}
           </div>

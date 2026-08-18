@@ -931,3 +931,78 @@ Stage Summary:
 - User needs to either: (a) push the commit to GitHub manually, or (b) apply the patch to their repo
 - Key change: switched from `response.headers.set('Set-Cookie', ...)` to `response.cookies.set({...})` in all 4 auth routes
 - Added comprehensive debug logging that will appear in Render logs to confirm the cookie is now being set and received correctly
+
+---
+Task ID: v7.29.3
+Agent: Main Agent
+Task: Fix "neither admin nor user can send/receive messages" — page crashes with client-side exception
+
+PROBLEM:
+- User reported: "não está fucnionando nem admin enviar e receber mensagens"
+- Both screenshots show the same white-screen error in the browser:
+  "Application error: a client-side exception has occurred while loading
+  whats-odoo.onrender.com (see the browser console for more information)."
+- The user pasted server logs that LOOKED healthy (WA upsert events firing,
+  OdooSync adding chatter history), but the frontend was completely dead —
+  no UI to send or receive messages through.
+
+ROOT CAUSE — Rules of Hooks violation in src/app/page.tsx:
+- The HomePage component had this order:
+    1. useWhatsApp()
+    2. useOdoo()
+    3. useAuth()
+    4. useRouter()
+    5. useState x3 (activeTab, selectedJid, showOdooPanel)
+    6. useEffect (auth guard — redirects to /login if not authed)
+    7. EARLY RETURN: if (authLoading || !isAuthenticated) return <Loader/>
+    8. useMemo selectedConversation    <-- HOOK #8
+    9. useMemo linkedOdooRecords       <-- HOOK #9
+   React's Rules of Hooks require hooks to be called in the SAME ORDER on
+   every render. When authLoading flips from true→false, hooks 8 and 9
+   suddenly start being called — React detects the inconsistency and throws
+   "Rendered fewer hooks than expected. This may be caused by an accidental
+   early return statement." Next.js surfaces this as the bare "Application
+   error: a client-side exception has occurred" page.
+- v7.29.2's auth-state-dependent early return was the trigger. The hook
+  order worked in v7.27 (no early return), but v7.22 introduced the auth
+  guard and the bug has been latent ever since — only manifests once
+  the auth cookie state changes mid-session.
+
+FIXES:
+1. src/app/page.tsx:
+   - Moved BOTH useMemo calls (selectedConversation, linkedOdooRecords)
+     to BEFORE the early return — now all hooks (useWhatsApp, useOdoo,
+     useAuth, useRouter, useState x4, useEffect, useMemo x2) are
+     declared unconditionally, then the early return fires.
+   - Also moved `const [sidebarCollapsed, setSidebarCollapsed] = useState(false)`
+     up to be with the other useState calls — was previously declared
+     AFTER the early return, which was itself a separate rules-of-hooks
+     violation.
+   - Added inline comment explaining the rule so future edits don't regress.
+
+2. src/app/error.tsx (NEW):
+   - Global Error Boundary as a safety net. If any future client-side
+     exception leaks through, instead of the bare "Application error"
+     white screen, users now see a friendly "Algo deu errado" page with:
+       - The actual error message (small, monospace, break-all)
+       - "Recarregar página" button (calls reset() to retry the render)
+       - "Voltar para o login" button (redirects to /login)
+   - This prevents the "page just dies, user can't even tell what happened"
+     UX failure mode from happening again.
+
+3. Version bump:
+   - package.json: 7.29.2 → 7.29.3
+   - page.tsx sidebar label: "v7.29.2 Send estável" → "v7.29.3 Page crash fix"
+
+VERIFICATION:
+- `npx next build` ✓ (Next.js 16.1.3 / Turbopack — compiled in 25.4s, 13 static pages generated, no errors)
+- Visual inspection confirms all hooks in HomePage are now called unconditionally before any return statement
+- error.tsx is registered as a route-level Error Boundary (Next.js App Router convention)
+
+Stage Summary:
+- Root cause was a React Rules-of-Hooks violation, NOT a Baileys or socket.io issue
+- The server logs the user saw (WA upsert events being skipped) were a red herring — those
+  messages are protocol/reaction echoes from the user's phone that SHOULD be skipped (no
+  text/media content); the real issue was that the frontend page never rendered at all
+- Two-layer defense: (1) hooks-order fix eliminates the crash, (2) error.tsx catches any
+  future runtime exception and shows a recoverable UI instead of a dead white screen
