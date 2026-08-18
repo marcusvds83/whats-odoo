@@ -139,26 +139,10 @@ async function useFirestoreAuthState(db, userId) {
   }
 
   // Debounced write — Baileys fires many key writes in bursts.
+  // v7.32: writeTimer/pendingWrite declared here; the actual persist logic
+  // is defined LATER in `schedulePersist()` (after persistState() is hoisted).
   let writeTimer = null
   let pendingWrite = false
-  function schedulePersist() {
-    if (writeTimer) return
-    writeTimer = setTimeout(async () => {
-      writeTimer = null
-      pendingWrite = true
-      try {
-        await docRef.set({
-          creds: cached.creds,
-          keys: cached.keys,
-          updatedAt: new Date(),
-        }, { merge: false })
-      } catch (err) {
-        console.error(`[WA-FS-Auth:${userId}] Persist to Firestore failed:`, err && err.message)
-      } finally {
-        pendingWrite = false
-      }
-    }, 800)  // 800ms debounce — same as Baileys' filesystem default
-  }
 
   // The SignalKeyStore interface Baileys expects
   const keys = {
@@ -184,6 +168,7 @@ async function useFirestoreAuthState(db, userId) {
     async clearAll() {
       cached.keys = {}
       cached.creds = null
+      state.creds = null
       try {
         await docRef.delete()
         console.log(`[WA-FS-Auth:${userId}] Cleared all state in Firestore`)
@@ -198,17 +183,46 @@ async function useFirestoreAuthState(db, userId) {
     keys,
   }
 
-  const saveCreds = async () => {
-    if (!cached.creds) return
+  // v7.32 FIX: persistState reads from `state.creds` (the live reference Baileys
+  // mutates) instead of `cached.creds` (a snapshot from the first read).
+  // Previously, when Baileys reassigned `state.creds = {...newCreds}`, the
+  // `cached.creds` snapshot stayed stale (still null for new users). The
+  // debounced persist would then write `creds: null` to Firestore, so the
+  // first scan's credentials were lost → next deploy, user had to re-scan.
+  // Now we read `state.creds` at persist-time so we always save the latest.
+  const persistState = async () => {
+    if (!state.creds) return
     try {
+      cached.creds = state.creds  // keep cached in sync
       await docRef.set({
-        creds: cached.creds,
+        creds: state.creds,
         keys: cached.keys,
         updatedAt: new Date(),
       }, { merge: false })
     } catch (err) {
-      console.error(`[WA-FS-Auth:${userId}] saveCreds failed:`, err && err.message)
+      console.error(`[WA-FS-Auth:${userId}] persistState failed:`, err && err.message)
     }
+  }
+
+  const saveCreds = async () => {
+    if (!state.creds) {
+      console.warn(`[WA-FS-Auth:${userId}] saveCreds called but state.creds is null — Baileys may not have initialized yet`)
+      return
+    }
+    await persistState()
+  }
+
+  function schedulePersist() {
+    if (writeTimer) return
+    writeTimer = setTimeout(async () => {
+      writeTimer = null
+      pendingWrite = true
+      try {
+        await persistState()
+      } finally {
+        pendingWrite = false
+      }
+    }, 800)  // 800ms debounce — same as Baileys' filesystem default
   }
 
   return { state, saveCreds, source: 'firestore' }

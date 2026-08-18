@@ -211,6 +211,7 @@ class UserSession {
     this.lastQrCode = null
     this.reconnectAttempts = 0
     this.watchdogTimer = null
+    this.initialConnectWatchdog = null   // v7.32: initial-connect watchdog
     this.waConnecting = false        // v7.29: re-entrancy guard for connectWhatsApp
     this.waReconnectTimer = null     // v7.29: single pending reconnect timer
     this.conversations = new Map()
@@ -384,6 +385,8 @@ class UserSession {
       if (this.persistTimer) { clearInterval(this.persistTimer); this.persistTimer = null }
       if (this.watchdogTimer) { clearInterval(this.watchdogTimer); this.watchdogTimer = null }
       if (this.waReconnectTimer) { clearTimeout(this.waReconnectTimer); this.waReconnectTimer = null }
+      // v7.32: clear the initial-connect watchdog if still pending
+      if (this.initialConnectWatchdog) { clearTimeout(this.initialConnectWatchdog); this.initialConnectWatchdog = null }
       if (this.odooReauthTimer) { clearInterval(this.odooReauthTimer); this.odooReauthTimer = null }
       try { this.waSocket?.end(undefined) } catch {}
       this.persistConversationsToDisk()
@@ -1447,15 +1450,35 @@ class UserSession {
     return this._baileysModule
   }
 
-  async connectWhatsApp() {
-    // v7.29: re-entrancy guard — never start a second Baileys socket while
-    // one is still connecting. Without this, the watchdog and the
-    // connection.update reconnect timer could overlap, producing multiple
-    // sockets that fight over the same auth state → disconnect/reconnect loop.
-    if (this.waConnecting) return
+  // v7.32: connectWhatsApp(force=false)
+  // --------------------------------------------------------------------
+  // - Default (force=false): re-entrancy guard — never start a second
+  //   Baileys socket while one is still connecting. The watchdog and the
+  //   connection.update reconnect timer could otherwise overlap, producing
+  //   multiple sockets fighting over the same auth state.
+  // - force=true: bypass the re-entrancy guard. Used by onRequestQR() and
+  //   onForceNewQR() when the user explicitly clicks "Solicitar QR Code"
+  //   or "Limpar sessão e gerar novo QR". Without this, clicking the QR
+  //   button while the initial start() connect is still in-flight would
+  //   SILENTLY NO-OP (return early), leaving the user with no QR ever.
+  //   The previous socket was killed by onRequestQR but no new one was
+  //   created → user stuck with no QR forever.
+  // --------------------------------------------------------------------
+  async connectWhatsApp(force = false) {
+    if (this.waConnecting && !force) {
+      console.log(`[WA:${this.userId}] connectWhatsApp called but waConnecting=true (use force=true to bypass) — ignoring`)
+      return
+    }
+    if (this.waConnecting && force) {
+      console.log(`[WA:${this.userId}] connectWhatsApp(force=true) — overriding waConnecting guard`)
+    }
     this.waConnecting = true
     try {
       await this._connectWhatsAppInner()
+    } catch (err) {
+      console.error(`[WA:${this.userId}] connectWhatsApp error:`, err && err.message)
+      // Reset state so a future call isn't blocked by stale waSocket
+      this.waSocket = null
     } finally {
       this.waConnecting = false
     }
@@ -1545,6 +1568,41 @@ class UserSession {
 
     socketInstance.ev.on('creds.update', saveCreds)
 
+    // v7.32: INITIAL-CONNECT WATCHDOG
+    // --------------------------------------------------------------------
+    // If after 30s the socket hasn't produced a QR code or opened, force a
+    // fresh connect. This catches the scenario where Baileys silently fails
+    // to generate a QR (e.g., stale auth state, network blip during init)
+    // and the user is left staring at the "Solicitar QR Code" button with
+    // no QR appearing. Without this, the user would have to manually click
+    // the force-new-QR button.
+    if (this.initialConnectWatchdog) {
+      clearTimeout(this.initialConnectWatchdog)
+      this.initialConnectWatchdog = null
+    }
+    let initialGotEvent = false
+    this.initialConnectWatchdog = setTimeout(() => {
+      if (!isCurrentSocket()) return
+      if (this.connectionState.connection === 'open') return
+      if (this.lastQrCode) return
+      if (initialGotEvent) return
+      console.warn(`[WA:${this.userId}] Initial-connect watchdog: no QR and no 'open' after 30s — forcing fresh connect`)
+      try { socketInstance.ev.removeAllListeners() } catch {}
+      try { socketInstance.end(undefined) } catch {}
+      this.waSocket = null
+      this.waConnecting = false
+      this.connectWhatsApp(true).catch(err =>
+        console.error(`[WA:${this.userId}] Watchdog reconnect error:`, err && err.message)
+      )
+    }, 30_000)
+    // Clear the watchdog as soon as we get a meaningful event
+    const clearInitialWatchdog = () => {
+      if (this.initialConnectWatchdog) {
+        clearTimeout(this.initialConnectWatchdog)
+        this.initialConnectWatchdog = null
+      }
+    }
+
     socketInstance.ev.on('connection.update', async (update) => {
       // v7.29.1: Ignore events from stale sockets. This happens when the
       // old socket (from a previous failed connect or a watchdog kill)
@@ -1562,6 +1620,8 @@ class UserSession {
       console.log(`[WA:${this.userId}] Connection update: ${connection}`)
 
       if (qr) {
+        clearInitialWatchdog()
+        initialGotEvent = true
         this.lastQrCode = qr
         console.log(`[WA:${this.userId}] QR Code generated, sending to clients`)
         this.emitWA('whatsapp:qr', { qr })
@@ -1630,6 +1690,8 @@ class UserSession {
       }
 
       if (connection === 'open') {
+        clearInitialWatchdog()
+        initialGotEvent = true
         console.log(`[WA:${this.userId}] Connected successfully!`)
         this.hasSavedSession = true
         this.reconnectAttempts = 0
@@ -2392,26 +2454,41 @@ class UserSession {
     console.log(`[WA IO:${this.userId}] QR requested by client ${socket.id}`)
     if (this.connectionState.connection === 'open') {
       this.emitTo(socket, 'whatsapp:status', { connected: true, hasSession: true })
-    } else if (this.lastQrCode) {
-      this.emitTo(socket, 'whatsapp:qr', { qr: this.lastQrCode })
-    } else {
-      // v7.29.1: clear any pending reconnect and force a fresh connect.
-      // Previously, this just nulled waSocket but left waReconnectTimer
-      // running, so the timer would fire LATER and start a SECOND
-      // socket → race condition → reconnect loop.
-      if (this.waReconnectTimer) {
-        clearTimeout(this.waReconnectTimer)
-        this.waReconnectTimer = null
-      }
-      if (this.waSocket) {
-        try { this.waSocket.ev.removeAllListeners() } catch {}
-        try { this.waSocket.end(undefined) } catch {}
-        this.waSocket = null
-      }
-      this.lastQrCode = null
-      this.reconnectAttempts = 0
-      this.connectWhatsApp()
+      return
     }
+    if (this.lastQrCode) {
+      // We already have a QR — just re-emit it to this socket (could be a
+      // newly-connected client that missed the original whatsapp:qr event).
+      console.log(`[WA IO:${this.userId}] Re-emitting cached QR to client ${socket.id}`)
+      this.emitTo(socket, 'whatsapp:qr', { qr: this.lastQrCode })
+      return
+    }
+    // v7.32: Force a fresh connect. Previously this called connectWhatsApp()
+    // without force=true, which would silently return early if the initial
+    // start() connect was still in-flight (waConnecting=true). The result
+    // was that the user killed the existing socket but no new one was
+    // created → no QR ever appeared.
+    console.log(`[WA IO:${this.userId}] No QR cached — forcing fresh connectWhatsApp()`)
+    if (this.waReconnectTimer) {
+      clearTimeout(this.waReconnectTimer)
+      this.waReconnectTimer = null
+    }
+    if (this.waSocket) {
+      try { this.waSocket.ev.removeAllListeners() } catch {}
+      try { this.waSocket.end(undefined) } catch {}
+      this.waSocket = null
+    }
+    this.lastQrCode = null
+    this.reconnectAttempts = 0
+    // Emit a "connecting" status so the UI shows a loading spinner
+    this.emitWA('whatsapp:status', {
+      connected: false,
+      reason: 'connecting',
+      hasSession: this.hasSavedSession,
+    })
+    // Force=true so we override the waConnecting guard if the initial
+    // connect from start() is still in-flight.
+    this.connectWhatsApp(true)
   }
 
   // ------------------------------------------------------------------
@@ -2492,8 +2569,10 @@ class UserSession {
       this.emitWA('whatsapp:status', { connected: false, reason: 'disconnected', hasSession: false })
       this.emitWA('whatsapp:conversations', [])
 
-      // Start a fresh connect — Baileys will generate a new QR
-      this.connectWhatsApp().catch(err => {
+      // v7.32: force=true so we override waConnecting guard if a previous
+      // connect is still in-flight. Without force, this would silently
+      // return early if start()'s connect hadn't finished yet.
+      this.connectWhatsApp(true).catch(err => {
         console.error(`[WA:${this.userId}] Force-new-QR connect error:`, err.message)
       })
 

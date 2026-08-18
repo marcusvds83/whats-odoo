@@ -446,6 +446,33 @@ export default function HomePage() {
     }
   }, [authLoading, isAuthenticated, router])
 
+  // v7.32: Auto-request QR when user opens the WhatsApp tab and there's no
+  // connection and no QR yet. Previously the user had to manually click
+  // "Solicitar QR Code" every time — now the QR is requested automatically
+  // the moment they navigate to the WhatsApp tab (if needed).
+  // Runs only when: (a) user just switched to the whatsapp tab, (b) socket
+  // is connected to the server, (c) WA is not yet connected, (d) no QR
+  // is currently displayed. The check is debounced 1.5s to let the
+  // onWAConnection initial status arrive first.
+  useEffect(() => {
+    if (activeTab !== 'whatsapp') return
+    if (!isAuthenticated) return
+    if (wa.status.connected) return
+    if (wa.qrCode) return
+    // Wait 1.5s for the initial whatsapp:status from onWAConnection to arrive
+    const t = setTimeout(() => {
+      // Re-check after the delay — status may have arrived in the meantime
+      if (wa.status.connected) return
+      if (wa.qrCode) return
+      // Only request if we don't already have a saved session (otherwise
+      // Baileys is trying to restore it — we don't want to interrupt that)
+      if (wa.status.hasSession) return
+      console.log('[WA Auto-Trigger] Requesting QR automatically (no session, no QR, not connected)')
+      wa.requestQR()
+    }, 1500)
+    return () => clearTimeout(t)
+  }, [activeTab, isAuthenticated, wa.status.connected, wa.status.hasSession, wa.qrCode, wa.requestQR])
+
   // v7.29.3: ALL hooks must be declared BEFORE any early return — otherwise
   // React's rules of hooks are violated (hooks called in different orders
   // between renders) and the page crashes with "Application error: a
@@ -509,7 +536,7 @@ export default function HomePage() {
             {!sidebarCollapsed && (
               <div className="hidden lg:block min-w-0">
                 <p className="text-sm font-bold leading-tight truncate">Whats-Odoo</p>
-                <p className="text-[10px] text-muted-foreground">v7.31 Firebase status + force QR</p>
+                <p className="text-[10px] text-muted-foreground">v7.32 fix WA connect + auto-QR</p>
               </div>
             )}
           </div>
