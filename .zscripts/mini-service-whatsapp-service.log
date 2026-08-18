@@ -255,3 +255,14 @@ $ bun x tsx index.ts
 [WA] Connection update: close
 [WA] Connection closed. Status: 408, Reconnect: true
 [WA] Reconnecting in 30000ms (attempt 15)...
+[WA] Connection update: connecting
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
