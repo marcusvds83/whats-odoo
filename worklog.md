@@ -1099,3 +1099,27 @@ Stage Summary:
   1. Open the Users tab to see the new Firebase status banner — this will immediately reveal WHY users aren't in Firebase (env var missing vs init failed)
   2. Click "Migrar agora" to backfill existing SQLite users into Firestore
   3. If stuck in WhatsApp "reconnecting", click "Solicitar novo QR Code" to clear the stale saved session and force a fresh QR
+
+---
+Task ID: setup-firebase-render
+Agent: main
+Task: Diagnose why users aren't appearing in Firestore and QR button isn't working, despite code being at v7.31 with all fixes.
+
+Work Log:
+- Explored /home/z/my-project/whats-odoo-src/ first — turned out to be OLD v4.0 (no Firebase, no auth, no users, single-user). Wrong project root.
+- Located the actual production app at /home/z/my-project/ root (v7.31.0, last commit 93bf4df).
+- Read full source: firebase-admin.ts, user-store.ts, wa-firestore-auth-state.cjs, user-session.js (QR handlers), QRCodePanel.tsx, use-whatsapp.ts (forceNewQR), server.js (startup auto-migration at lines 230-256).
+- Verified that the QR button code is FULLY correct: onRequestQR clears reconnect timer + kills stale socket + connectWhatsApp(); onForceNewQR also clears Firestore doc + filesystem auth files + conversations. forceNewQR is correctly wired from use-whatsapp.ts (line 442) → QRCodePanel onForceNewQR prop → page.tsx (line 648).
+- Verified that the auto-migration runs on startup (server.js:243) and is idempotent (preserves user ids).
+- Verified render.yaml declares FIREBASE_SERVICE_ACCOUNT with sync:false — meaning the user must paste it manually in the Render dashboard.
+- Inspected the user's Firestore rules: `allow read, write: if false` on /users/{userId}. This is CORRECT — the Admin SDK bypasses rules, so server-side access works fine. The user doesn't need to change the rules.
+- Root cause identified: FIREBASE_SERVICE_ACCOUNT env var is NOT set on Render → isFirestoreConfigured() returns false → userStore silently falls back to SQLite → users never written to Firestore → "não aparece nada no firestone".
+- Secondary effect: wa-firestore-auth-state.cjs falls back to filesystem MultiFileAuthState → on Render sleep/wake the filesystem state can become stale → Baileys tries to restore a dead session → no QR generated → button appears "broken".
+
+Stage Summary:
+- Code is fully ready at v7.31 — no code changes needed.
+- Created /home/z/my-project/scripts/validate-firebase.js — validates a service account JSON file or env var, prints the single-line JSON ready for Render, and tests Firestore read/write connectivity before deploying.
+- Created /home/z/my-project/download/SETUP-FIREBASE-RENDER.md — step-by-step Portuguese guide for the user covering: download service account JSON from Firebase Console, validate locally, paste as FIREBASE_SERVICE_ACCOUNT env var on Render, redeploy, verify via /api/auth/debug.
+- Recommended user also add `match /wa_auth_states/{userId} { allow read, write: if false; }` to Firestore rules (defense in depth, same pattern as users).
+- No git commits or code changes made — production matches 93bf4df and is correct.
+- Action required from user: paste FIREBASE_SERVICE_ACCOUNT into Render dashboard + redeploy.

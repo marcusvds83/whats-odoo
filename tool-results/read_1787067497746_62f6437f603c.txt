@@ -1,0 +1,1672 @@
+     1→     1→// =============================================================================
+     2→     2→// Whats-Odoo v3.1 — Single-Process Server
+     3→     3→// =============================================================================
+     4→     4→// Merges Next.js frontend + WhatsApp Baileys + Odoo XML-RPC into ONE process.
+     5→     5→// Previous architecture: 3 processes (server.js + tsx whatsapp + tsx odoo) = OOM
+     6→     6→// New architecture:      1 process = ~250MB (fits in Render 512MB)
+     7→     7→// =============================================================================
+     8→     8→
+     9→     9→const { createServer } = require('http')
+    10→    10→const { parse } = require('url')
+    11→    11→const next = require('next')
+    12→    12→const { Server } = require('socket.io')
+    13→    13→const { existsSync, mkdirSync } = require('fs')
+    14→    14→const { join } = require('path')
+    15→    15→const { readFileSync, writeFileSync } = require('fs')
+    16→    16→
+    17→    17→// Ensure production mode on Render
+    18→    18→if (!process.env.NODE_ENV) process.env.NODE_ENV = 'production'
+    19→    19→const dev = process.env.NODE_ENV !== 'production'
+    20→    20→const hostname = process.env.HOSTNAME || '0.0.0.0'
+    21→    21→const port = parseInt(process.env.PORT || '10000', 10)
+    22→    22→
+    23→    23→// ========== WhatsApp Configuration ==========
+    24→    24→const DATA_DIR = process.env.DATA_DIR || join(process.cwd(), 'data')
+    25→    25→const AUTH_FOLDER = join(DATA_DIR, 'auth_store')
+    26→    26→if (!existsSync(AUTH_FOLDER)) mkdirSync(AUTH_FOLDER, { recursive: true })
+    27→    27→
+    28→    28→// ========== Odoo Configuration ==========
+    29→    29→let odooConfig = {
+    30→    30→  url: '',
+    31→    31→  db: '',
+    32→    32→  username: '',
+    33→    33→  password: '',
+    34→    34→  uid: null,
+    35→    35→}
+    36→    36→
+    37→    37→// Auto-sync settings
+    38→    38→let autoSyncSettings = {
+    39→    39→  enabled: true,
+    40→    40→  autoCreateContact: true,
+    41→    41→  autoCreateLead: true,
+    42→    42→  autoPostMessages: true,
+    43→    43→  autoCreateActivity: true,
+    44→    44→  leadPrefix: '[WhatsApp] ',
+    45→    45→  leadTeamId: null,
+    46→    46→  leadUserId: null,
+    47→    47→}
+    48→    48→
+    49→    49→// Cache of available fields per model (auto-detected)
+    50→    50→const modelFieldsCache = new Map()
+    51→    51→// Cache of phone -> Odoo record IDs
+    52→    52→const phoneToPartnerCache = new Map()
+    53→    53→
+    54→    54→// ========== WhatsApp State ==========
+    55→    55→let waSocket = null
+    56→    56→let connectionState = { connection: 'close', lastDisconnect: undefined }
+    57→    57→let reconnectAttempts = 0
+    58→    58→
+    59→    59→// Deduplication: track recently processed message IDs
+    60→    60→const processedMessageIds = new Set()
+    61→    61→const MAX_DEDUP_IDS = 1000 // reduced for memory savings
+    62→    62→
+    63→    63→// In-memory conversation/message store
+    64→    64→const MAX_MESSAGES_PER_CONVERSATION = 100 // reduced from 200 for memory
+    65→    65→const conversations = new Map()
+    66→    66→
+    67→    67→// In-memory WhatsApp contacts store
+    68→    68→const waContacts = new Map() // jid -> { jid, name, phone, notify }
+    69→    69→const MAX_CONTACTS = 5000 // limit for memory savings
+    70→    70→
+    71→    71→// Baileys modules (loaded async)
+    72→    72→let makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion,
+    73→    73→    makeCacheableSignalKeyStore, Browsers, Boom, pino
+    74→    74→
+    75→    75→// xmlrpc module (loaded async)
+    76→    76→let xmlrpc
+    77→    77→
+    78→    78→// Global Socket.io instance
+    79→    79→let io = null
+    80→    80→let waNamespace = null
+    81→    81→let odooNamespace = null
+    82→    82→
+    83→    83→// ========== Load ESM/CJS modules dynamically ==========
+    84→    84→async function loadModules() {
+    85→    85→  console.log('[Server] Loading modules...')
+    86→    86→
+    87→    87→  // Baileys (WhatsApp) — MUST use dynamic import(), it's ESM-only
+    88→    88→  console.log('[Server] Loading Baileys (ESM dynamic import)...')
+    89→    89→  try {
+    90→    90→    const baileys = await import('@whiskeysockets/baileys')
+    91→    91→    makeWASocket = baileys.makeWASocket
+    92→    92→    useMultiFileAuthState = baileys.useMultiFileAuthState
+    93→    93→    DisconnectReason = baileys.DisconnectReason
+    94→    94→    fetchLatestBaileysVersion = baileys.fetchLatestBaileysVersion
+    95→    95→    makeCacheableSignalKeyStore = baileys.makeCacheableSignalKeyStore
+    96→    96→    Browsers = baileys.Browsers
+    97→    97→    console.log('[Server] Baileys loaded OK — makeWASocket:', typeof makeWASocket, 'Browsers:', typeof Browsers)
+    98→    98→  } catch (err) {
+    99→    99→    console.error('[Server] CRITICAL: Failed to load Baileys:', err.message)
+   100→   100→    console.error('[Server] WhatsApp will NOT work! Check @whiskeysockets/baileys is installed.')
+   101→   101→  }
+   102→   102→
+   103→   103→  // @hapi/boom — ESM-only too
+   104→   104→  try {
+   105→   105→    const boom = await import('@hapi/boom')
+   106→   106→    Boom = boom.Boom
+   107→   107→    console.log('[Server] Boom loaded OK')
+   108→   108→  } catch (err) {
+   109→   109→    console.error('[Server] Failed to load @hapi/boom:', err.message)
+   110→   110→  }
+   111→   111→
+   112→   112→  // Pino logger — CJS compatible
+   113→   113→  try {
+   114→   114→    pino = require('pino')
+   115→   115→    console.log('[Server] Pino loaded OK (CJS)')
+   116→   116→  } catch {
+   117→   117→    try {
+   118→   118→      pino = (await import('pino')).default
+   119→   119→      console.log('[Server] Pino loaded OK (ESM)')
+   120→   120→    } catch (err) {
+   121→   121→      console.error('[Server] Failed to load pino:', err.message)
+   122→   122→      // Fallback: silent no-op logger
+   123→   123→      pino = () => ({ info: () => {}, error: () => {}, warn: () => {}, child: () => ({ info: () => {}, error: () => {}, warn: () => {} }) })
+   124→   124→    }
+   125→   125→  }
+   126→   126→
+   127→   127→  // xmlrpc — CJS compatible
+   128→   128→  try {
+   129→   129→    xmlrpc = require('xmlrpc')
+   130→   130→    console.log('[Server] xmlrpc loaded OK (CJS)')
+   131→   131→  } catch {
+   132→   132→    try {
+   133→   133→      xmlrpc = await import('xmlrpc')
+   134→   134→      console.log('[Server] xmlrpc loaded OK (ESM)')
+   135→   135→    } catch (err) {
+   136→   136→      console.error('[Server] Failed to load xmlrpc:', err.message)
+   137→   137→    }
+   138→   138→  }
+   139→   139→
+   140→   140→  console.log('[Server] All modules loaded — makeWASocket:', typeof makeWASocket, 'Browsers:', typeof Browsers, 'pino:', typeof pino)
+   141→   141→}
+   142→   142→
+   143→   143→// =============================================================================
+   144→   144→// SECTION: WhatsApp Helper Functions
+   145→   145→// =============================================================================
+   146→   146→
+   147→   147→function extractPhone(jid) {
+   148→   148→  const match = jid.match(/^(\d+)@/)
+   149→   149→  return match ? match[1] : null
+   150→   150→}
+   151→   151→
+   152→   152→function getOrCreateConversation(jid, pushName) {
+   153→   153→  if (!conversations.has(jid)) {
+   154→   154→    conversations.set(jid, {
+   155→   155→      jid,
+   156→   156→      name: null,
+   157→   157→      phone: extractPhone(jid),
+   158→   158→      pushName: pushName || null,
+   159→   159→      avatarUrl: null,
+   160→   160→      lastMessage: null,
+   161→   161→      lastMessageAt: null,
+   162→   162→      unreadCount: 0,
+   163→   163→      messages: [],
+   164→   164→    })
+   165→   165→  }
+   166→   166→  const conv = conversations.get(jid)
+   167→   167→  if (pushName && !conv.pushName) {
+   168→   168→    conv.pushName = pushName
+   169→   169→  }
+   170→   170→  return conv
+   171→   171→}
+   172→   172→
+   173→   173→function serializeConversation(conv) {
+   174→   174→  return {
+   175→   175→    jid: conv.jid,
+   176→   176→    name: conv.name,
+   177→   177→    phone: conv.phone,
+   178→   178→    pushName: conv.pushName,
+   179→   179→    avatarUrl: conv.avatarUrl,
+   180→   180→    lastMessage: conv.lastMessage,
+   181→   181→    lastMessageAt: conv.lastMessageAt?.toISOString() || null,
+   182→   182→    unreadCount: conv.unreadCount,
+   183→   183→    messageCount: conv.messages.length,
+   184→   184→  }
+   185→   185→}
+   186→   186→
+   187→   187→// =============================================================================
+   188→   188→// SECTION: Odoo XML-RPC Client
+   189→   189→// =============================================================================
+   190→   190→
+   191→   191→function makeXmlRpcClient(path) {
+   192→   192→  const url = new URL(odooConfig.url)
+   193→   193→  const isHttps = url.protocol === 'https:'
+   194→   194→  const options = {
+   195→   195→    host: url.hostname,
+   196→   196→    port: parseInt(url.port) || (isHttps ? 443 : 80),
+   197→   197→    path,
+   198→   198→  }
+   199→   199→  return isHttps ? xmlrpc.createSecureClient(options) : xmlrpc.createClient(options)
+   200→   200→}
+   201→   201→
+   202→   202→function odooAuthenticate() {
+   203→   203→  return new Promise((resolve, reject) => {
+   204→   204→    const client = makeXmlRpcClient('/xmlrpc/2/common')
+   205→   205→    client.methodCall('authenticate', [
+   206→   206→      odooConfig.db, odooConfig.username, odooConfig.password, {},
+   207→   207→    ], (error, value) => {
+   208→   208→      if (error) return reject(error)
+   209→   209→      if (!value) return reject(new Error('Authentication failed - invalid credentials'))
+   210→   210→      resolve(value)
+   211→   211→    })
+   212→   212→  })
+   213→   213→}
+   214→   214→
+   215→   215→function odooExecuteKw(model, method, args, kwargs = {}) {
+   216→   216→  return new Promise((resolve, reject) => {
+   217→   217→    if (!odooConfig.uid) {
+   218→   218→      return reject(new Error('Not authenticated with Odoo'))
+   219→   219→    }
+   220→   220→    const client = makeXmlRpcClient('/xmlrpc/2/object')
+   221→   221→    client.methodCall('execute_kw', [
+   222→   222→      odooConfig.db, odooConfig.uid, odooConfig.password, model, method, args, kwargs,
+   223→   223→    ], (error, value) => {
+   224→   224→      if (error) reject(error)
+   225→   225→      else resolve(value)
+   226→   226→    })
+   227→   227→  })
+   228→   228→}
+   229→   229→
+   230→   230→// Smart Field Detection
+   231→   231→async function getAvailableFields(model) {
+   232→   232→  if (modelFieldsCache.has(model)) return modelFieldsCache.get(model)
+   233→   233→  try {
+   234→   234→    const fields = await odooExecuteKw(model, 'fields_get', [], { attributes: ['string', 'type'] })
+   235→   235→    const fieldNames = new Set(Object.keys(fields))
+   236→   236→    modelFieldsCache.set(model, fieldNames)
+   237→   237→    return fieldNames
+   238→   238→  } catch (error) {
+   239→   239→    console.error(`[Odoo] Failed to get fields for ${model}:`, error.message)
+   240→   240→    return new Set()
+   241→   241→  }
+   242→   242→}
+   243→   243→
+   244→   244→async function filterExistingFields(model, requestedFields) {
+   245→   245→  const available = await getAvailableFields(model)
+   246→   246→  const existing = requestedFields.filter(f => available.has(f))
+   247→   247→  if (!existing.includes('id') && available.has('id')) existing.unshift('id')
+   248→   248→  if (!existing.includes('name') && available.has('name')) existing.push('name')
+   249→   249→  return existing
+   250→   250→}
+   251→   251→
+   252→   252→async function buildSafeValues(model, values) {
+   253→   253→  const available = await getAvailableFields(model)
+   254→   254→  const safe = {}
+   255→   255→  for (const [key, value] of Object.entries(values)) {
+   256→   256→    if (available.has(key)) {
+   257→   257→      safe[key] = value
+   258→   258→    } else {
+   259→   259→      console.log(`[Odoo] Field "${key}" does not exist on ${model}, skipping`)
+   260→   260→    }
+   261→   261→  }
+   262→   262→  return safe
+   263→   263→}
+   264→   264→
+   265→   265→async function smartWriteWhatsAppNumber(model, ids, phone) {
+   266→   266→  const available = await getAvailableFields(model)
+   267→   267→  const values = {}
+   268→   268→  if (available.has('whatsapp')) values.whatsapp = phone
+   269→   269→  if (available.has('whatsapp_number')) values.whatsapp_number = phone
+   270→   270→  if (available.has('phone')) values.phone = phone
+   271→   271→  if (available.has('mobile') && !values.whatsapp) values.mobile = phone
+   272→   272→  if (Object.keys(values).length === 0) return false
+   273→   273→  return odooWrite(model, ids, values)
+   274→   274→}
+   275→   275→
+   276→   276→// High-level Odoo Operations
+   277→   277→async function odooSearch(model, domain, fields = [], limit = 80, offset = 0) {
+   278→   278→  const safeFields = fields.length > 0 ? await filterExistingFields(model, fields) : []
+   279→   279→  return odooExecuteKw(model, 'search_read', [domain], {
+   280→   280→    fields: safeFields.length > 0 ? safeFields : undefined,
+   281→   281→    limit, offset,
+   282→   282→  })
+   283→   283→}
+   284→   284→
+   285→   285→async function odooRead(model, ids, fields = []) {
+   286→   286→  const safeFields = fields.length > 0 ? await filterExistingFields(model, fields) : []
+   287→   287→  return odooExecuteKw(model, 'read', [ids], {
+   288→   288→    fields: safeFields.length > 0 ? safeFields : undefined,
+   289→   289→  })
+   290→   290→}
+   291→   291→
+   292→   292→async function odooCreate(model, values) {
+   293→   293→  const safeValues = await buildSafeValues(model, values)
+   294→   294→  return odooExecuteKw(model, 'create', [safeValues])
+   295→   295→}
+   296→   296→
+   297→   297→async function odooWrite(model, ids, values) {
+   298→   298→  const safeValues = await buildSafeValues(model, values)
+   299→   299→  return odooExecuteKw(model, 'write', [ids, safeValues])
+   300→   300→}
+   301→   301→
+   302→   302→async function odooSearchOrCreate(model, domain, values) {
+   303→   303→  const existing = await odooExecuteKw(model, 'search', [domain], { limit: 1 })
+   304→   304→  if (existing && existing.length > 0) {
+   305→   305→    const safeValues = await buildSafeValues(model, values)
+   306→   306→    await odooWrite(model, existing, safeValues)
+   307→   307→    return { id: existing[0], created: false }
+   308→   308→  }
+   309→   309→  const safeValues = await buildSafeValues(model, values)
+   310→   310→  const newId = await odooCreate(model, safeValues)
+   311→   311→  return { id: newId, created: true }
+   312→   312→}
+   313→   313→
+   314→   314→async function odooPostMessage(model, recordId, message) {
+   315→   315→  return odooExecuteKw(model, 'message_post', [recordId], {
+   316→   316→    body: message,
+   317→   317→    message_type: 'comment',
+   318→   318→    subtype_xmlid: 'mail.mt_comment',
+   319→   319→  })
+   320→   320→}
+   321→   321→
+   322→   322→async function odooCreateActivity(model, recordId, summary, note) {
+   323→   323→  try {
+   324→   324→    const activityTypeId = await findWhatsAppActivityType()
+   325→   325→    const values = {
+   326→   326→      res_model: model,
+   327→   327→      res_id: recordId,
+   328→   328→      summary,
+   329→   329→      note,
+   330→   330→      activity_type_id: activityTypeId || 1,
+   331→   331→    }
+   332→   332→    if (autoSyncSettings.leadUserId) values.user_id = autoSyncSettings.leadUserId
+   333→   333→    return await odooExecuteKw('mail.activity', 'create', [values])
+   334→   334→  } catch (error) {
+   335→   335→    console.error('[Odoo] Failed to create activity:', error.message)
+   336→   336→    return 0
+   337→   337→  }
+   338→   338→}
+   339→   339→
+   340→   340→async function findWhatsAppActivityType() {
+   341→   341→  try {
+   342→   342→    const types = await odooExecuteKw('mail.activity.type', 'search_read', [
+   343→   343→      [['name', 'ilike', 'WhatsApp']],
+   344→   344→    ], { fields: ['id', 'name'], limit: 1 })
+   345→   345→    if (types && types.length > 0) return types[0].id
+   346→   346→  } catch { /* Activity type might not exist */ }
+   347→   347→  return null
+   348→   348→}
+   349→   349→
+   350→   350→async function odooGetFields(model, attributes = ['string', 'help', 'type', 'required', 'readonly']) {
+   351→   351→  return odooExecuteKw(model, 'fields_get', [], { attributes })
+   352→   352→}
+   353→   353→
+   354→   354→function escapeHtml(text) {
+   355→   355→  return text
+   356→   356→    .replace(/&/g, '&amp;')
+   357→   357→    .replace(/</g, '&lt;')
+   358→   358→    .replace(/>/g, '&gt;')
+   359→   359→    .replace(/\n/g, '<br/>')
+   360→   360→}
+   361→   361→
+   362→   362→// =============================================================================
+   363→   363→// SECTION: Auto-Sync Engine (DIRECT function calls, no Socket.io bridge)
+   364→   364→// =============================================================================
+   365→   365→
+   366→   366→async function autoSyncWhatsAppMessage(data) {
+   367→   367→  const result = {
+   368→   368→    partnerId: null,
+   369→   369→    leadId: null,
+   370→   370→    mailMessageId: null,
+   371→   371→    activityId: null,
+   372→   372→    created: { partner: false, lead: false },
+   373→   373→    errors: [],
+   374→   374→  }
+   375→   375→
+   376→   376→  if (!autoSyncSettings.enabled || !odooConfig.uid) return result
+   377→   377→
+   378→   378→  console.log(`[AutoSync] Processing message from ${data.phone} (${data.pushName || 'unknown'})`)
+   379→   379→
+   380→   380→  try {
+   381→   381→    // Step 1: Create or update contact
+   382→   382→    if (autoSyncSettings.autoCreateContact) {
+   383→   383→      const contactName = data.pushName || `WhatsApp ${data.phone}`
+   384→   384→      const domain = ['|', ['phone', 'ilike', data.phone], ['mobile', 'ilike', data.phone]]
+   385→   385→      const contactValues = { name: contactName, phone: data.phone, mobile: data.phone }
+   386→   386→
+   387→   387→      const partnerFields = await getAvailableFields('res.partner')
+   388→   388→      if (partnerFields.has('whatsapp')) contactValues.whatsapp = data.phone
+   389→   389→      if (partnerFields.has('whatsapp_number')) contactValues.whatsapp_number = data.phone
+   390→   390→
+   391→   391→      const partnerResult = await odooSearchOrCreate('res.partner', domain, contactValues)
+   392→   392→      result.partnerId = partnerResult.id
+   393→   393→      result.created.partner = partnerResult.created
+   394→   394→
+   395→   395→      const cached = phoneToPartnerCache.get(data.phone)
+   396→   396→      if (cached) {
+   397→   397→        cached.partnerId = partnerResult.id
+   398→   398→      } else {
+   399→   399→        phoneToPartnerCache.set(data.phone, { partnerId: partnerResult.id, leadId: null, leadCreated: false })
+   400→   400→      }
+   401→   401→      console.log(`[AutoSync] Contact ${partnerResult.created ? 'created' : 'updated'}: res.partner#${partnerResult.id}`)
+   402→   402→    }
+   403→   403→
+   404→   404→    // Step 2: Create lead for new conversations
+   405→   405→    if (autoSyncSettings.autoCreateLead && !data.fromMe && result.partnerId) {
+   406→   406→      const cached = phoneToPartnerCache.get(data.phone)
+   407→   407→      if (cached && cached.leadId && cached.leadCreated) {
+   408→   408→        result.leadId = cached.leadId
+   409→   409→      } else {
+   410→   410→        const existingLeads = await odooSearch('crm.lead', [
+   411→   411→          ['partner_id', '=', result.partnerId],
+   412→   412→          ['name', 'like', autoSyncSettings.leadPrefix],
+   413→   413→          ['type', '=', 'lead'],
+   414→   414→        ], ['id', 'name'], 1)
+   415→   415→
+   416→   416→        if (existingLeads && existingLeads.length > 0) {
+   417→   417→          result.leadId = existingLeads[0].id
+   418→   418→          if (cached) { cached.leadId = existingLeads[0].id; cached.leadCreated = true }
+   419→   419→          console.log(`[AutoSync] Found existing lead: crm.lead#${existingLeads[0].id}`)
+   420→   420→        } else {
+   421→   421→          const leadName = `${autoSyncSettings.leadPrefix}${data.pushName || data.phone}`
+   422→   422→          const leadValues = {
+   423→   423→            name: leadName,
+   424→   424→            type: 'lead',
+   425→   425→            partner_id: result.partnerId,
+   426→   426→            phone: data.phone,
+   427→   427→            description: `Conversa iniciada via WhatsApp em ${new Date().toLocaleString('pt-BR')}`,
+   428→   428→          }
+   429→   429→
+   430→   430→          const leadFields = await getAvailableFields('crm.lead')
+   431→   431→          if (leadFields.has('whatsapp_number')) leadValues.whatsapp_number = data.phone
+   432→   432→
+   433→   433→          if (autoSyncSettings.leadTeamId) leadValues.team_id = autoSyncSettings.leadTeamId
+   434→   434→          if (autoSyncSettings.leadUserId) leadValues.user_id = autoSyncSettings.leadUserId
+   435→   435→
+   436→   436→          result.leadId = await odooCreate('crm.lead', leadValues)
+   437→   437→          result.created.lead = true
+   438→   438→
+   439→   439→          if (cached) {
+   440→   440→            cached.leadId = result.leadId
+   441→   441→            cached.leadCreated = true
+   442→   442→          } else {
+   443→   443→            phoneToPartnerCache.set(data.phone, { partnerId: result.partnerId, leadId: result.leadId, leadCreated: true })
+   444→   444→          }
+   445→   445→          console.log(`[AutoSync] Lead created: crm.lead#${result.leadId}`)
+   446→   446→        }
+   447→   447→      }
+   448→   448→    }
+   449→   449→
+   450→   450→    // Step 3: Post message in Odoo chatter
+   451→   451→    if (autoSyncSettings.autoPostMessages && !data.fromMe) {
+   452→   452→      const targetModel = result.leadId ? 'crm.lead' : (result.partnerId ? 'res.partner' : null)
+   453→   453→      const targetId = result.leadId || result.partnerId
+   454→   454→      if (targetModel && targetId) {
+   455→   455→        const direction = data.fromMe ? 'Enviada' : 'Recebida'
+   456→   456→        const mediaLabel = data.mediaType ? ` [${data.mediaType}]` : ''
+   457→   457→        const msgBody = data.textContent
+   458→   458→          ? `<p><strong>📱 WhatsApp ${direction}:</strong>${mediaLabel}</p><p>${escapeHtml(data.textContent)}</p>`
+   459→   459→          : `<p><strong>📱 WhatsApp ${direction}:</strong>${mediaLabel} [Mídia]</p>`
+   460→   460→        try {
+   461→   461→          result.mailMessageId = await odooPostMessage(targetModel, targetId, msgBody)
+   462→   462→          console.log(`[AutoSync] Message posted on ${targetModel}#${targetId}`)
+   463→   463→        } catch (error) {
+   464→   464→          result.errors.push(`Failed to post message: ${error.message}`)
+   465→   465→        }
+   466→   466→      }
+   467→   467→    }
+   468→   468→
+   469→   469→    // Step 4: Create activity notification for first message of a new lead
+   470→   470→    if (autoSyncSettings.autoCreateActivity && result.created.lead && result.leadId) {
+   471→   471→      const summary = 'Nova mensagem WhatsApp'
+   472→   472→      const note = `Contato ${data.pushName || data.phone} iniciou uma conversa via WhatsApp.\n\nMensagem: ${data.textContent || '[Mídia]'}`
+   473→   473→      try {
+   474→   474→        result.activityId = await odooCreateActivity('crm.lead', result.leadId, summary, note)
+   475→   475→      } catch (error) {
+   476→   476→        result.errors.push(`Failed to create activity: ${error.message}`)
+   477→   477→      }
+   478→   478→    }
+   479→   479→  } catch (error) {
+   480→   480→    result.errors.push(`Auto-sync error: ${error.message}`)
+   481→   481→    console.error('[AutoSync] Error:', error.message)
+   482→   482→  }
+   483→   483→
+   484→   484→  // Emit sync result to all connected clients
+   485→   485→  if (odooNamespace) {
+   486→   486→    odooNamespace.emit('odoo:autosync:result', { phone: data.phone, ...result })
+   487→   487→  }
+   488→   488→
+   489→   489→  return result
+   490→   490→}
+   491→   491→
+   492→   492→// =============================================================================
+   493→   493→// SECTION: WhatsApp Baileys Connection
+   494→   494→// =============================================================================
+   495→   495→
+   496→   496→// waLogger is created AFTER loadModules() in main(). This is a placeholder.
+   497→   497→let waLogger = { info: () => {}, error: () => {}, warn: () => {}, child: () => ({ info: () => {}, error: () => {}, warn: () => {} }) }
+   498→   498→
+   499→   499→async function connectWhatsApp() {
+   500→   500→  // Guard: ensure Baileys modules are loaded
+   501→   501→  if (typeof makeWASocket !== 'function' || typeof useMultiFileAuthState !== 'function') {
+   502→   502→    console.error('[WA] Cannot connect: Baileys modules not loaded. WhatsApp will not work.')
+   503→   503→    if (waNamespace) waNamespace.emit('whatsapp:status', { connected: false, reason: 'modules_not_loaded' })
+   504→   504→    return
+   505→   505→  }
+   506→   506→
+   507→   507→  try {
+   508→   508→  const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER)
+   509→   509→  const { version } = await fetchLatestBaileysVersion()
+   510→   510→
+   511→   511→  waSocket = makeWASocket({
+   512→   512→    version,
+   513→   513→    logger: waLogger,
+   514→   514→    auth: {
+   515→   515→      creds: state.creds,
+   516→   516→      keys: makeCacheableSignalKeyStore(state.keys, waLogger),
+   517→   517→    },
+   518→   518→    browser: Browsers.ubuntu('Chrome'),
+   519→   519→    printQRInTerminal: false,
+   520→   520→    connectTimeoutMs: 60_000,
+   521→   521→    defaultQueryTimeoutMs: 30_000,
+   522→   522→    keepAliveIntervalMs: 30_000, // increased from 25s for better stability
+   523→   523→    markOnlineOnConnect: true,
+   524→   524→    syncFullHistory: true, // Pull conversations from phone so user can create leads
+   525→   525→    // Memory optimization: limit message history sync
+   526→   526→    messageCaching: false,
+   527→   527→  })
+   528→   528→
+   529→   529→  // Save credentials on update
+   530→   530→  waSocket.ev.on('creds.update', saveCreds)
+   531→   531→
+   532→   532→  // Connection events
+   533→   533→  waSocket.ev.on('connection.update', async (update) => {
+   534→   534→    const { connection, lastDisconnect, qr } = update
+   535→   535→    connectionState = { connection, lastDisconnect }
+   536→   536→
+   537→   537→    console.log(`[WA] Connection update: ${connection}`)
+   538→   538→
+   539→   539→    if (qr) {
+   540→   540→      console.log('[WA] QR Code generated, sending to clients')
+   541→   541→      if (waNamespace) waNamespace.emit('whatsapp:qr', { qr })
+   542→   542→    }
+   543→   543→
+   544→   544→    if (connection === 'close') {
+   545→   545→      const statusCode = lastDisconnect?.error?.output?.statusCode
+   546→   546→      const shouldReconnect = statusCode !== DisconnectReason.loggedOut
+   547→   547→
+   548→   548→      console.log(`[WA] Connection closed. Status: ${statusCode}, Reconnect: ${shouldReconnect}`)
+   549→   549→
+   550→   550→      if (waNamespace) waNamespace.emit('whatsapp:status', {
+   551→   551→        connected: false,
+   552→   552→        reason: statusCode === DisconnectReason.loggedOut ? 'logged_out' : 'disconnected',
+   553→   553→      })
+   554→   554→
+   555→   555→      if (shouldReconnect) {
+   556→   556→        reconnectAttempts++
+   557→   557→        // Exponential backoff: 2s, 4s, 8s, 16s, 30s, 30s, 30s...
+   558→   558→        const delay = Math.min(2000 * Math.pow(2, Math.min(reconnectAttempts - 1, 4)), 30000)
+   559→   559→        // Infinite reconnects (no max) — Render will restart the dyno if truly stuck
+   560→   560→        console.log(`[WA] Reconnecting in ${delay}ms (attempt ${reconnectAttempts})`)
+   561→   561→        setTimeout(() => connectWhatsApp(), delay)
+   562→   562→      }
+   563→   563→    }
+   564→   564→
+   565→   565→    if (connection === 'open') {
+   566→   566→      reconnectAttempts = 0
+   567→   567→      console.log('[WA] Connected successfully!')
+   568→   568→      if (waNamespace) waNamespace.emit('whatsapp:status', { connected: true })
+   569→   569→
+   570→   570→      // Get profile picture for connected user
+   571→   571→      try {
+   572→   572→        const meId = waSocket?.user?.id
+   573→   573→        if (meId) {
+   574→   574→          const profilePicUrl = await waSocket.profilePictureUrl(meId, 'image')
+   575→   575→          if (waNamespace) waNamespace.emit('whatsapp:me', {
+   576→   576→            id: meId,
+   577→   577→            name: waSocket?.user?.name,
+   578→   578→            profilePicUrl,
+   579→   579→          })
+   580→   580→        }
+   581→   581→      } catch { /* Profile pic might not be available */ }
+   582→   582→    }
+   583→   583→  })
+   584→   584→
+   585→   585→  } catch (err) {
+   586→   586→    console.error('[WA] connectWhatsApp error:', err.message)
+   587→   587→    if (waNamespace) waNamespace.emit('whatsapp:status', { connected: false, reason: 'connection_error' })
+   588→   588→    // Retry after delay
+   589→   589→    reconnectAttempts++
+   590→   590→    const delay = Math.min(5000 * reconnectAttempts, 60000)
+   591→   591→    console.log(`[WA] Will retry connection in ${delay}ms`)
+   592→   592→    setTimeout(() => connectWhatsApp(), delay)
+   593→   593→    return
+   594→   594→  }
+   595→   595→
+   596→   596→  // ========== Contacts Sync ==========
+   597→   597→  waSocket.ev.on('contacts.upsert', (contacts) => {
+   598→   598→    console.log(`[WA] Contacts upsert: ${contacts.length} contacts`)
+   599→   599→    for (const contact of contacts) {
+   600→   600→      if (!contact.id) continue
+   601→   601→      // Skip group contacts and broadcast
+   602→   602→      if (contact.id.includes('@g.us') || contact.id === 'status@broadcast') continue
+   603→   603→      const phone = extractPhone(contact.id)
+   604→   604→      if (!phone) continue
+   605→   605→      waContacts.set(contact.id, {
+   606→   606→        jid: contact.id,
+   607→   607→        name: contact.name || contact.notify || null,
+   608→   608→        phone,
+   609→   609→        notify: contact.notify || null,
+   610→   610→      })
+   611→   611→    }
+   612→   612→    // Trim if too many
+   613→   613→    if (waContacts.size > MAX_CONTACTS) {
+   614→   614→      const entries = Array.from(waContacts.keys())
+   615→   615→      const toRemove = entries.slice(0, entries.length - MAX_CONTACTS)
+   616→   616→      toRemove.forEach(k => waContacts.delete(k))
+   617→   617→    }
+   618→   618→    // Emit to clients
+   619→   619→    if (waNamespace) {
+   620→   620→      const contactList = Array.from(waContacts.values())
+   621→   621→      waNamespace.emit('whatsapp:contacts', contactList)
+   622→   622→    }
+   623→   623→  })
+   624→   624→
+   625→   625→  waSocket.ev.on('contacts.update', (updates) => {
+   626→   626→    for (const update of updates) {
+   627→   627→      if (!update.id) continue
+   628→   628→      const existing = waContacts.get(update.id)
+   629→   629→      if (existing) {
+   630→   630→        if (update.name) existing.name = update.name
+   631→   631→        if (update.notify) existing.notify = update.notify
+   632→   632→      }
+   633→   633→    }
+   634→   634→    if (waNamespace) {
+   635→   635→      const contactList = Array.from(waContacts.values())
+   636→   636→      waNamespace.emit('whatsapp:contacts', contactList)
+   637→   637→    }
+   638→   638→  })
+   639→   639→
+   640→   640→  // ========== Chats/Conversations Sync ==========
+   641→   641→  waSocket.ev.on('chats.upsert', (chats) => {
+   642→   642→    console.log(`[WA] Chats upsert: ${chats.length} chats`)
+   643→   643→    for (const chat of chats) {
+   644→   644→      if (!chat.id) continue
+   645→   645→      if (chat.id.includes('@g.us') || chat.id === 'status@broadcast') continue
+   646→   646→      const conv = getOrCreateConversation(chat.id)
+   647→   647→      if (chat.name) conv.name = chat.name
+   648→   648→      conv.unreadCount = chat.unreadCount || 0
+   649→   649→    }
+   650→   650→    if (waNamespace) {
+   651→   651→      const convList = Array.from(conversations.values()).map(serializeConversation)
+   652→   652→      waNamespace.emit('whatsapp:conversations', convList)
+   653→   653→    }
+   654→   654→  })
+   655→   655→
+   656→   656→  // Message events
+   657→   657→  waSocket.ev.on('messages.upsert', async ({ messages, type }) => {
+   658→   658→    console.log(`[WA] Messages upsert: ${type}, count: ${messages.length}`)
+   659→   659→
+   660→   660→    for (const msg of messages) {
+   661→   661→      if (!msg.key) continue
+   662→   662→
+   663→   663→      const jid = msg.key.remoteJid
+   664→   664→      const fromMe = msg.key.fromMe || false
+   665→   665→      const pushName = msg.pushName || null
+   666→   666→      const msgKeyId = msg.key.id || ''
+   667→   667→
+   668→   668→      // Skip status/broadcast messages
+   669→   669→      if (jid === 'status@broadcast') continue
+   670→   670→
+   671→   671→      // ========== DEDUPLICATION ==========
+   672→   672→      // Skip our own echoed messages from Baileys (fromMe + append = echo)
+   673→   673→      if (fromMe && type === 'append') {
+   674→   674→        if (msgKeyId) processedMessageIds.add(msgKeyId)
+   675→   675→        continue
+   676→   676→      }
+   677→   677→
+   678→   678→      // Check dedup set
+   679→   679→      if (msgKeyId && processedMessageIds.has(msgKeyId)) {
+   680→   680→        console.log(`[WA] Skipping duplicate message: ${msgKeyId}`)
+   681→   681→        continue
+   682→   682→      }
+   683→   683→      if (msgKeyId) {
+   684→   684→        processedMessageIds.add(msgKeyId)
+   685→   685→        // Prevent memory leak
+   686→   686→        if (processedMessageIds.size > MAX_DEDUP_IDS) {
+   687→   687→          const entries = Array.from(processedMessageIds)
+   688→   688→          const toRemove = entries.slice(0, entries.length - MAX_DEDUP_IDS / 2)
+   689→   689→          toRemove.forEach(id => processedMessageIds.delete(id))
+   690→   690→        }
+   691→   691→      }
+   692→   692→
+   693→   693→      // Get or create conversation
+   694→   694→      const conv = getOrCreateConversation(jid, fromMe ? undefined : pushName)
+   695→   695→
+   696→   696→      // Extract text content
+   697→   697→      const textContent =
+   698→   698→        msg.message?.conversation ||
+   699→   699→        msg.message?.extendedTextMessage?.text ||
+   700→   700→        msg.message?.imageMessage?.caption ||
+   701→   701→        msg.message?.videoMessage?.caption ||
+   702→   702→        msg.message?.documentMessage?.caption ||
+   703→   703→        null
+   704→   704→
+   705→   705→      // Determine media type
+   706→   706→      let mediaType = null
+   707→   707→      if (msg.message?.imageMessage) mediaType = 'image'
+   708→   708→      else if (msg.message?.videoMessage) mediaType = 'video'
+   709→   709→      else if (msg.message?.audioMessage) mediaType = 'audio'
+   710→   710→      else if (msg.message?.documentMessage) mediaType = 'document'
+   711→   711→      else if (msg.message?.stickerMessage) mediaType = 'sticker'
+   712→   712→      else if (msg.message?.contactMessage) mediaType = 'contact'
+   713→   713→      else if (msg.message?.locationMessage) mediaType = 'location'
+   714→   714→
+   715→   715→      // Only process messages with content
+   716→   716→      if (!textContent && !mediaType) continue
+   717→   717→
+   718→   718→      const messageData = {
+   719→   719→        id: msgKeyId || Math.random().toString(36).substr(2, 9),
+   720→   720→        whatsappId: msgKeyId || null,
+   721→   721→        fromMe,
+   722→   722→        textContent,
+   723→   723→        mediaType,
+   724→   724→        timestamp: new Date((msg.messageTimestamp || Date.now() / 1000) * 1000),
+   725→   725→        status: fromMe ? 'delivered' : 'received',
+   726→   726→      }
+   727→   727→
+   728→   728→      // Add to conversation
+   729→   729→      conv.messages.push(messageData)
+   730→   730→      if (conv.messages.length > MAX_MESSAGES_PER_CONVERSATION) {
+   731→   731→        conv.messages = conv.messages.slice(-MAX_MESSAGES_PER_CONVERSATION)
+   732→   732→      }
+   733→   733→      conv.lastMessage = textContent || `[${mediaType}]`
+   734→   734→      conv.lastMessageAt = messageData.timestamp
+   735→   735→      if (!fromMe) conv.unreadCount++
+   736→   736→
+   737→   737→      // Try to get profile picture (lazy, only once)
+   738→   738→      try {
+   739→   739→        if (!conv.avatarUrl && waSocket) {
+   740→   740→          const picUrl = await waSocket.profilePictureUrl(jid, 'image')
+   741→   741→          conv.avatarUrl = picUrl
+   742→   742→        }
+   743→   743→      } catch { /* No profile pic */ }
+   744→   744→
+   745→   745→      // Emit to connected clients
+   746→   746→      if (waNamespace) {
+   747→   747→        waNamespace.emit('whatsapp:message', {
+   748→   748→          conversationJid: jid,
+   749→   749→          message: messageData,
+   750→   750→          conversation: serializeConversation(conv),
+   751→   751→        })
+   752→   752→        waNamespace.emit('whatsapp:conversation:update', serializeConversation(conv))
+   753→   753→      }
+   754→   754→
+   755→   755→      // ========== AUTO-SYNC TO ODOO (direct call, no bridge) ==========
+   756→   756→      if (!fromMe) {
+   757→   757→        const phone = extractPhone(jid)
+   758→   758→        if (phone) {
+   759→   759→          // Non-blocking: fire and forget, errors logged in autoSyncWhatsAppMessage
+   760→   760→          autoSyncWhatsAppMessage({
+   761→   761→            jid, phone,
+   762→   762→            pushName: conv.pushName,
+   763→   763→            textContent, mediaType, fromMe,
+   764→   764→            timestamp: messageData.timestamp.toISOString(),
+   765→   765→          }).catch(err => console.error('[AutoSync] Unhandled error:', err.message))
+   766→   766→
+   767→   767→          // Also notify frontend about the sync
+   768→   768→          if (waNamespace) {
+   769→   769→            waNamespace.emit('whatsapp:odoo-sync', { jid, phone, syncing: true })
+   770→   770→          }
+   771→   771→        }
+   772→   772→      }
+   773→   773→    }
+   774→   774→  })
+   775→   775→}
+   776→   776→
+   777→   777→// =============================================================================
+   778→   778→// SECTION: Auto-Authenticate Odoo from Environment Variables
+   779→   779→// =============================================================================
+   780→   780→
+   781→   781→async function autoAuthenticateFromEnv() {
+   782→   782→  const envUrl = process.env.ODOO_URL
+   783→   783→  const envDb = process.env.ODOO_DB
+   784→   784→  const envUsername = process.env.ODOO_USERNAME
+   785→   785→  const envPassword = process.env.ODOO_PASSWORD
+   786→   786→
+   787→   787→  if (envUrl && envDb && envUsername && envPassword) {
+   788→   788→    console.log(`[Odoo] Auto-authenticating with env vars: ${envUrl} / ${envDb} / ${envUsername}`)
+   789→   789→    try {
+   790→   790→      odooConfig = { url: envUrl, db: envDb, username: envUsername, password: envPassword, uid: null }
+   791→   791→      modelFieldsCache.clear()
+   792→   792→      phoneToPartnerCache.clear()
+   793→   793→      const uid = await odooAuthenticate()
+   794→   794→      odooConfig.uid = uid
+   795→   795→      console.log(`[Odoo] Auto-authenticated as ${envUsername} (uid: ${uid})`)
+   796→   796→
+   797→   797→      if (odooNamespace) {
+   798→   798→        odooNamespace.emit('odoo:status', {
+   799→   799→          connected: true,
+   800→   800→          url: odooConfig.url,
+   801→   801→          db: odooConfig.db,
+   802→   802→          username: odooConfig.username,
+   803→   803→        })
+   804→   804→      }
+   805→   805→    } catch (error) {
+   806→   806→      console.error(`[Odoo] Auto-authentication failed: ${error.message}`)
+   807→   807→    }
+   808→   808→  } else {
+   809→   809→    console.log('[Odoo] No ODOO_URL/DB/USERNAME/PASSWORD env vars. Waiting for manual connection.')
+   810→   810→  }
+   811→   811→}
+   812→   812→
+   813→   813→// =============================================================================
+   814→   814→// SECTION: Socket.io /whatsapp Namespace Handlers
+   815→   815→// =============================================================================
+   816→   816→
+   817→   817→function setupWhatsAppNamespace(namespace) {
+   818→   818→  namespace.on('connection', (socket) => {
+   819→   819→    console.log(`[WA IO] Client connected: ${socket.id}`)
+   820→   820→
+   821→   821→    // Send current status
+   822→   822→    socket.emit('whatsapp:status', {
+   823→   823→      connected: connectionState.connection === 'open',
+   824→   824→    })
+   825→   825→
+   826→   826→    // Send current conversations list
+   827→   827→    const convList = Array.from(conversations.values()).map(serializeConversation)
+   828→   828→    socket.emit('whatsapp:conversations', convList)
+   829→   829→
+   830→   830→    // Send current contacts list
+   831→   831→    const contactList = Array.from(waContacts.values())
+   832→   832→    socket.emit('whatsapp:contacts', contactList)
+   833→   833→
+   834→   834→    // Request QR code regeneration
+   835→   835→    socket.on('whatsapp:request-qr', () => {
+   836→   836→      reconnectAttempts = 0
+   837→   837→      if (connectionState.connection !== 'open' && waSocket) {
+   838→   838→        socket.emit('whatsapp:status', { connected: false, reason: 'connecting' })
+   839→   839→      } else if (!waSocket) {
+   840→   840→        connectWhatsApp()
+   841→   841→      }
+   842→   842→    })
+   843→   843→
+   844→   844→    // Get conversation messages
+   845→   845→    socket.on('whatsapp:get-messages', (data, callback) => {
+   846→   846→      const conv = conversations.get(data.jid)
+   847→   847→      callback?.(conv ? { messages: conv.messages.slice(-100) } : { messages: [] })
+   848→   848→    })
+   849→   849→
+   850→   850→    // Get conversation info
+   851→   851→    socket.on('whatsapp:get-conversation-info', (data, callback) => {
+   852→   852→      const conv = conversations.get(data.jid)
+   853→   853→      callback?.(conv
+   854→   854→        ? { success: true, conversation: serializeConversation(conv), messages: conv.messages.slice(-100) }
+   855→   855→        : { success: false, conversation: null, messages: [] })
+   856→   856→    })
+   857→   857→
+   858→   858→    // Send a text message
+   859→   859→    socket.on('whatsapp:send-message', async (data, callback) => {
+   860→   860→      try {
+   861→   861→        if (!waSocket || connectionState.connection !== 'open') {
+   862→   862→          return callback?.({ success: false, error: 'WhatsApp not connected' })
+   863→   863→        }
+   864→   864→
+   865→   865→        const sent = await waSocket.sendMessage(data.jid, { text: data.text })
+   866→   866→        const conv = getOrCreateConversation(data.jid)
+   867→   867→        const msgKeyId = sent.key.id || ''
+   868→   868→        const messageData = {
+   869→   869→          id: msgKeyId || Math.random().toString(36).substr(2, 9),
+   870→   870→          whatsappId: msgKeyId || null,
+   871→   871→          fromMe: true,
+   872→   872→          textContent: data.text,
+   873→   873→          mediaType: null,
+   874→   874→          timestamp: new Date(),
+   875→   875→          status: 'sent',
+   876→   876→        }
+   877→   877→
+   878→   878→        // Mark as processed to prevent duplicate from Baileys echo
+   879→   879→        if (msgKeyId) processedMessageIds.add(msgKeyId)
+   880→   880→
+   881→   881→        conv.messages.push(messageData)
+   882→   882→        if (conv.messages.length > MAX_MESSAGES_PER_CONVERSATION) {
+   883→   883→          conv.messages = conv.messages.slice(-MAX_MESSAGES_PER_CONVERSATION)
+   884→   884→        }
+   885→   885→        conv.lastMessage = data.text
+   886→   886→        conv.lastMessageAt = messageData.timestamp
+   887→   887→
+   888→   888→        if (waNamespace) {
+   889→   889→          waNamespace.emit('whatsapp:message', {
+   890→   890→            conversationJid: data.jid,
+   891→   891→            message: messageData,
+   892→   892→            conversation: serializeConversation(conv),
+   893→   893→          })
+   894→   894→          waNamespace.emit('whatsapp:conversation:update', serializeConversation(conv))
+   895→   895→        }
+   896→   896→
+   897→   897→        callback?.({ success: true, messageId: sent.key.id })
+   898→   898→      } catch (error) {
+   899→   899→        console.error('[WA] Send message error:', error.message)
+   900→   900→        callback?.({ success: false, error: error.message })
+   901→   901→      }
+   902→   902→    })
+   903→   903→
+   904→   904→    // Send media message
+   905→   905→    socket.on('whatsapp:send-media', async (data, callback) => {
+   906→   906→      try {
+   907→   907→        if (!waSocket || connectionState.connection !== 'open') {
+   908→   908→          return callback?.({ success: false, error: 'WhatsApp not connected' })
+   909→   909→        }
+   910→   910→
+   911→   911→        let sent
+   912→   912→        if (data.type === 'image') {
+   913→   913→          sent = await waSocket.sendMessage(data.jid, { image: { url: data.url }, caption: data.caption })
+   914→   914→        } else if (data.type === 'document') {
+   915→   915→          sent = await waSocket.sendMessage(data.jid, { document: { url: data.url }, fileName: data.fileName || 'document', mimetype: data.mimeType, caption: data.caption })
+   916→   916→        } else if (data.type === 'video') {
+   917→   917→          sent = await waSocket.sendMessage(data.jid, { video: { url: data.url }, caption: data.caption })
+   918→   918→        } else if (data.type === 'audio') {
+   919→   919→          sent = await waSocket.sendMessage(data.jid, { audio: { url: data.url }, mimetype: data.mimeType || 'audio/mp4' })
+   920→   920→        } else {
+   921→   921→          return callback?.({ success: false, error: 'Unsupported media type' })
+   922→   922→        }
+   923→   923→
+   924→   924→        const conv = getOrCreateConversation(data.jid)
+   925→   925→        const msgKeyId = sent.key.id || ''
+   926→   926→        const messageData = {
+   927→   927→          id: msgKeyId || Math.random().toString(36).substr(2, 9),
+   928→   928→          whatsappId: msgKeyId || null,
+   929→   929→          fromMe: true,
+   930→   930→          textContent: data.caption || null,
+   931→   931→          mediaType: data.type,
+   932→   932→          timestamp: new Date(),
+   933→   933→          status: 'sent',
+   934→   934→        }
+   935→   935→
+   936→   936→        if (msgKeyId) processedMessageIds.add(msgKeyId)
+   937→   937→
+   938→   938→        conv.messages.push(messageData)
+   939→   939→        conv.lastMessage = data.caption || `[${data.type}]`
+   940→   940→        conv.lastMessageAt = messageData.timestamp
+   941→   941→
+   942→   942→        if (waNamespace) {
+   943→   943→          waNamespace.emit('whatsapp:message', {
+   944→   944→            conversationJid: data.jid,
+   945→   945→            message: messageData,
+   946→   946→            conversation: serializeConversation(conv),
+   947→   947→          })
+   948→   948→        }
+   949→   949→
+   950→   950→        callback?.({ success: true, messageId: sent.key.id })
+   951→   951→      } catch (error) {
+   952→   952→        console.error('[WA] Send media error:', error.message)
+   953→   953→        callback?.({ success: false, error: error.message })
+   954→   954→      }
+   955→   955→    })
+   956→   956→
+   957→   957→    // Mark conversation as read
+   958→   958→    socket.on('whatsapp:mark-read', async (data, callback) => {
+   959→   959→      try {
+   960→   960→        if (!waSocket || connectionState.connection !== 'open') {
+   961→   961→          return callback?.({ success: false, error: 'WhatsApp not connected' })
+   962→   962→        }
+   963→   963→        const conv = conversations.get(data.jid)
+   964→   964→        if (conv) {
+   965→   965→          conv.unreadCount = 0
+   966→   966→          if (waNamespace) waNamespace.emit('whatsapp:conversation:update', serializeConversation(conv))
+   967→   967→        }
+   968→   968→        await waSocket.readMessages([{ remoteJid: data.jid, id: '' }])
+   969→   969→        callback?.({ success: true })
+   970→   970→      } catch (error) {
+   971→   971→        callback?.({ success: false, error: error.message })
+   972→   972→      }
+   973→   973→    })
+   974→   974→
+   975→   975→    // Disconnect WhatsApp
+   976→   976→    socket.on('whatsapp:disconnect', async (callback) => {
+   977→   977→      try {
+   978→   978→        if (waSocket) {
+   979→   979→          await waSocket.logout('User requested disconnect')
+   980→   980→          waSocket = null
+   981→   981→          connectionState = { connection: 'close' }
+   982→   982→          if (waNamespace) waNamespace.emit('whatsapp:status', { connected: false, reason: 'logged_out' })
+   983→   983→          callback?.({ success: true })
+   984→   984→        } else {
+   985→   985→          callback?.({ success: false, error: 'Not connected' })
+   986→   986→        }
+   987→   987→      } catch (error) {
+   988→   988→        callback?.({ success: false, error: error.message })
+   989→   989→      }
+   990→   990→    })
+   991→   991→
+   992→   992→    // ========== Check if phone is on WhatsApp ==========
+   993→   993→    socket.on('whatsapp:check-number', async (data, callback) => {
+   994→   994→      try {
+   995→   995→        if (!waSocket || connectionState.connection !== 'open') {
+   996→   996→          return callback?.({ success: false, error: 'WhatsApp not connected' })
+   997→   997→        }
+   998→   998→        const phone = data.phone.replace(/[^0-9]/g, '')
+   999→   999→        if (!phone) return callback?.({ success: false, error: 'Invalid phone number' })
+  1000→  1000→
+  1001→  1001→        const [result] = await waSocket.onWhatsApp(`${phone}@s.whatsapp.net`)
+  1002→  1002→        if (result && result.exists) {
+  1003→  1003→          callback?.({ success: true, exists: true, jid: result.jid })
+  1004→  1004→        } else {
+  1005→  1005→          callback?.({ success: true, exists: false, jid: null })
+  1006→  1006→        }
+  1007→  1007→      } catch (error) {
+  1008→  1008→        callback?.({ success: false, error: error.message })
+  1009→  1009→      }
+  1010→  1010→    })
+  1011→  1011→
+  1012→  1012→    // ========== Start new conversation by phone ==========
+  1013→  1013→    socket.on('whatsapp:start-conversation', async (data, callback) => {
+  1014→  1014→      try {
+  1015→  1015→        if (!waSocket || connectionState.connection !== 'open') {
+  1016→  1016→          return callback?.({ success: false, error: 'WhatsApp not connected' })
+  1017→  1017→        }
+  1018→  1018→        const phone = data.phone.replace(/[^0-9]/g, '')
+  1019→  1019→        if (!phone) return callback?.({ success: false, error: 'Invalid phone number' })
+  1020→  1020→
+  1021→  1021→        const jid = data.jid || `${phone}@s.whatsapp.net`
+  1022→  1022→
+  1023→  1023→        // Verify number is on WhatsApp (unless jid already provided)
+  1024→  1024→        if (!data.jid) {
+  1025→  1025→          try {
+  1026→  1026→            const [result] = await waSocket.onWhatsApp(jid)
+  1027→  1027→            if (!result || !result.exists) {
+  1028→  1028→              return callback?.({ success: false, error: 'Este numero nao esta no WhatsApp' })
+  1029→  1029→            }
+  1030→  1030→          } catch (err) {
+  1031→  1031→            console.error('[WA] onWhatsApp check error:', err.message)
+  1032→  1032→            // Continue anyway - might still work
+  1033→  1033→          }
+  1034→  1034→        }
+  1035→  1035→
+  1036→  1036→        // Create or get conversation
+  1037→  1037→        const conv = getOrCreateConversation(jid, data.name || null)
+  1038→  1038→
+  1039→  1039→        // Try to get profile picture
+  1040→  1040→        try {
+  1041→  1041→          if (!conv.avatarUrl && waSocket) {
+  1042→  1042→            const picUrl = await waSocket.profilePictureUrl(jid, 'image')
+  1043→  1043→            conv.avatarUrl = picUrl
+  1044→  1044→          }
+  1045→  1045→        } catch { /* No profile pic */ }
+  1046→  1046→
+  1047→  1047→        const serialized = serializeConversation(conv)
+  1048→  1048→
+  1049→  1049→        // Emit to all clients
+  1050→  1050→        if (waNamespace) {
+  1051→  1051→          waNamespace.emit('whatsapp:conversation:update', serialized)
+  1052→  1052→        }
+  1053→  1053→
+  1054→  1054→        callback?.({ success: true, conversation: serialized, jid })
+  1055→  1055→      } catch (error) {
+  1056→  1056→        console.error('[WA] Start conversation error:', error.message)
+  1057→  1057→        callback?.({ success: false, error: error.message })
+  1058→  1058→      }
+  1059→  1059→    })
+  1060→  1060→
+  1061→  1061→    // ========== Get WhatsApp contacts ==========
+  1062→  1062→    socket.on('whatsapp:get-contacts', (data, callback) => {
+  1063→  1063→      const contactList = Array.from(waContacts.values())
+  1064→  1064→      if (callback) {
+  1065→  1065→        callback?.({ success: true, data: contactList })
+  1066→  1066→      }
+  1067→  1067→    })
+  1068→  1068→
+  1069→  1069→    // Get profile picture
+  1070→  1070→    socket.on('whatsapp:get-profile-pic', async (data, callback) => {
+  1071→  1071→      try {
+  1072→  1072→        if (!waSocket || connectionState.connection !== 'open') {
+  1073→  1073→          return callback?.({ success: false, url: null })
+  1074→  1074→        }
+  1075→  1075→        const url = await waSocket.profilePictureUrl(data.jid, 'image')
+  1076→  1076→        const conv = conversations.get(data.jid)
+  1077→  1077→        if (conv) conv.avatarUrl = url
+  1078→  1078→        callback?.({ success: true, url })
+  1079→  1079→      } catch {
+  1080→  1080→        callback?.({ success: false, url: null })
+  1081→  1081→      }
+  1082→  1082→    })
+  1083→  1083→
+  1084→  1084→    socket.on('disconnect', () => {
+  1085→  1085→      // console.log(`[WA IO] Client disconnected: ${socket.id}`)
+  1086→  1086→    })
+  1087→  1087→  })
+  1088→  1088→}
+  1089→  1089→
+  1090→  1090→// =============================================================================
+  1091→  1091→// SECTION: Socket.io /odoo Namespace Handlers
+  1092→  1092→// =============================================================================
+  1093→  1093→
+  1094→  1094→function setupOdooNamespace(namespace) {
+  1095→  1095→  namespace.on('connection', (socket) => {
+  1096→  1096→    console.log(`[Odoo IO] Client connected: ${socket.id}`)
+  1097→  1097→
+  1098→  1098→    socket.emit('odoo:status', {
+  1099→  1099→      connected: !!odooConfig.uid,
+  1100→  1100→      url: odooConfig.url,
+  1101→  1101→      db: odooConfig.db,
+  1102→  1102→      username: odooConfig.username,
+  1103→  1103→    })
+  1104→  1104→    socket.emit('odoo:autosync:settings', autoSyncSettings)
+  1105→  1105→
+  1106→  1106→    // ===== Authentication =====
+  1107→  1107→    socket.on('odoo:authenticate', async (data, callback) => {
+  1108→  1108→      try {
+  1109→  1109→        odooConfig = { ...data, uid: null }
+  1110→  1110→        modelFieldsCache.clear()
+  1111→  1111→        phoneToPartnerCache.clear()
+  1112→  1112→        const uid = await odooAuthenticate()
+  1113→  1113→        odooConfig.uid = uid
+  1114→  1114→        console.log(`[Odoo] Authenticated as ${data.username} (uid: ${uid})`)
+  1115→  1115→        namespace.emit('odoo:status', {
+  1116→  1116→          connected: true,
+  1117→  1117→          url: odooConfig.url,
+  1118→  1118→          db: odooConfig.db,
+  1119→  1119→          username: odooConfig.username,
+  1120→  1120→        })
+  1121→  1121→        callback?.({ success: true, uid })
+  1122→  1122→      } catch (error) {
+  1123→  1123→        console.error('[Odoo] Auth error:', error.message)
+  1124→  1124→        callback?.({ success: false, error: error.message })
+  1125→  1125→      }
+  1126→  1126→    })
+  1127→  1127→
+  1128→  1128→    // ===== Disconnect =====
+  1129→  1129→    socket.on('odoo:disconnect', (callback) => {
+  1130→  1130→      odooConfig = { url: '', db: '', username: '', password: '', uid: null }
+  1131→  1131→      modelFieldsCache.clear()
+  1132→  1132→      phoneToPartnerCache.clear()
+  1133→  1133→      namespace.emit('odoo:status', { connected: false })
+  1134→  1134→      callback?.({ success: true })
+  1135→  1135→    })
+  1136→  1136→
+  1137→  1137→    // ===== Auto-Sync Settings =====
+  1138→  1138→    socket.on('odoo:autosync:update-settings', async (data, callback) => {
+  1139→  1139→      try {
+  1140→  1140→        autoSyncSettings = { ...autoSyncSettings, ...data }
+  1141→  1141→        console.log('[Odoo] Auto-sync settings updated')
+  1142→  1142→        namespace.emit('odoo:autosync:settings', autoSyncSettings)
+  1143→  1143→        callback?.({ success: true, settings: autoSyncSettings })
+  1144→  1144→      } catch (error) {
+  1145→  1145→        callback?.({ success: false, error: error.message })
+  1146→  1146→      }
+  1147→  1147→    })
+  1148→  1148→
+  1149→  1149→    socket.on('odoo:autosync:get-settings', (callback) => {
+  1150→  1150→      callback?.({ success: true, settings: autoSyncSettings })
+  1151→  1151→    })
+  1152→  1152→
+  1153→  1153→    // ===== Auto-Sync Trigger (called internally now, but kept for compatibility) =====
+  1154→  1154→    socket.on('odoo:autosync:message', async (data, callback) => {
+  1155→  1155→      try {
+  1156→  1156→        const result = await autoSyncWhatsAppMessage(data)
+  1157→  1157→        callback?.({ success: true, ...result })
+  1158→  1158→      } catch (error) {
+  1159→  1159→        callback?.({ success: false, error: error.message })
+  1160→  1160→      }
+  1161→  1161→    })
+  1162→  1162→
+  1163→  1163→    // ===== Contacts =====
+  1164→  1164→    socket.on('odoo:contacts:search', async (data, callback) => {
+  1165→  1165→      try {
+  1166→  1166→        const domain = data.query
+  1167→  1167→          ? ['|', '|', ['name', 'ilike', data.query], ['phone', 'ilike', data.query], ['mobile', 'ilike', data.query]]
+  1168→  1168→          : []
+  1169→  1169→        const records = await odooSearch('res.partner', domain, [
+  1170→  1170→          'name', 'phone', 'mobile', 'email', 'whatsapp', 'image_128',
+  1171→  1171→          'is_company', 'country_id', 'state_id', 'city',
+  1172→  1172→        ], data.limit || 20)
+  1173→  1173→        callback?.({ success: true, data: records })
+  1174→  1174→      } catch (error) {
+  1175→  1175→        callback?.({ success: false, error: error.message })
+  1176→  1176→      }
+  1177→  1177→    })
+  1178→  1178→
+  1179→  1179→    socket.on('odoo:contacts:create', async (data, callback) => {
+  1180→  1180→      try {
+  1181→  1181→        const values = { name: data.name }
+  1182→  1182→        if (data.phone) values.phone = data.phone
+  1183→  1183→        if (data.mobile) values.mobile = data.mobile
+  1184→  1184→        if (data.whatsapp) values.whatsapp = data.whatsapp
+  1185→  1185→        if (data.email) values.email = data.email
+  1186→  1186→        const id = await odooCreate('res.partner', values)
+  1187→  1187→        callback?.({ success: true, id })
+  1188→  1188→        namespace.emit('odoo:record:created', { model: 'res.partner', id, values })
+  1189→  1189→      } catch (error) {
+  1190→  1190→        callback?.({ success: false, error: error.message })
+  1191→  1191→      }
+  1192→  1192→    })
+  1193→  1193→
+  1194→  1194→    socket.on('odoo:contacts:search-or-create', async (data, callback) => {
+  1195→  1195→      try {
+  1196→  1196→        const domain = ['|', ['phone', 'ilike', data.phone], ['mobile', 'ilike', data.phone]]
+  1197→  1197→        const values = { name: data.name || `WhatsApp ${data.phone}`, phone: data.phone, mobile: data.phone }
+  1198→  1198→        const result = await odooSearchOrCreate('res.partner', domain, values)
+  1199→  1199→        callback?.({ success: true, ...result })
+  1200→  1200→      } catch (error) {
+  1201→  1201→        callback?.({ success: false, error: error.message })
+  1202→  1202→      }
+  1203→  1203→    })
+  1204→  1204→
+  1205→  1205→    // ===== CRM Leads =====
+  1206→  1206→    socket.on('odoo:leads:search', async (data, callback) => {
+  1207→  1207→      try {
+  1208→  1208→        const domain = data.query
+  1209→  1209→          ? ['|', ['name', 'ilike', data.query], ['partner_name', 'ilike', data.query]]
+  1210→  1210→          : []
+  1211→  1211→        const records = await odooSearch('crm.lead', domain, [
+  1212→  1212→          'name', 'partner_id', 'partner_name', 'phone', 'mobile', 'email_from',
+  1213→  1213→          'type', 'stage_id', 'probability', 'user_id', 'team_id',
+  1214→  1214→          'create_date', 'write_date', 'whatsapp_number',
+  1215→  1215→        ], data.limit || 20)
+  1216→  1216→        callback?.({ success: true, data: records })
+  1217→  1217→      } catch (error) {
+  1218→  1218→        callback?.({ success: false, error: error.message })
+  1219→  1219→      }
+  1220→  1220→    })
+  1221→  1221→
+  1222→  1222→    socket.on('odoo:leads:create', async (data, callback) => {
+  1223→  1223→      try {
+  1224→  1224→        const values = { name: data.name }
+  1225→  1225→
+  1226→  1226→        // Check if 'type' field exists on crm.lead before setting it
+  1227→  1227→        // Some Odoo SaaS instances may not have the 'type' field or it may not accept 'lead'
+  1228→  1228→        const leadFields = await getAvailableFields('crm.lead')
+  1229→  1229→        if (leadFields.has('type') && data.type) {
+  1230→  1230→          values.type = data.type
+  1231→  1231→        } else if (leadFields.has('type')) {
+  1232→  1232→          values.type = 'lead'
+  1233→  1233→        } else {
+  1234→  1234→          console.log('[Odoo] Field "type" does not exist on crm.lead, skipping')
+  1235→  1235→        }
+  1236→  1236→
+  1237→  1237→        if (data.phone) values.phone = data.phone
+  1238→  1238→        if (data.partner_id) values.partner_id = data.partner_id
+  1239→  1239→        if (data.partner_name) values.partner_name = data.partner_name
+  1240→  1240→        if (data.description) values.description = data.description
+  1241→  1241→        if (data.whatsapp_number) values.whatsapp_number = data.whatsapp_number
+  1242→  1242→
+  1243→  1243→        console.log(`[Odoo] Creating lead with values: ${JSON.stringify(Object.keys(values))}`)
+  1244→  1244→
+  1245→  1245→        const id = await odooCreate('crm.lead', values)
+  1246→  1246→        console.log(`[Odoo] Lead created successfully: crm.lead#${id}`)
+  1247→  1247→        callback?.({ success: true, id })
+  1248→  1248→        namespace.emit('odoo:record:created', { model: 'crm.lead', id, values })
+  1249→  1249→      } catch (error) {
+  1250→  1250→        console.error(`[Odoo] Lead creation failed: ${error.message}`)
+  1251→  1251→        console.error(`[Odoo] Lead creation data: name=${data.name}, type=${data.type}, phone=${data.phone}`)
+  1252→  1252→        callback?.({ success: false, error: `Erro ao criar lead: ${error.message}` })
+  1253→  1253→      }
+  1254→  1254→    })
+  1255→  1255→
+  1256→  1256→    // ===== Sales =====
+  1257→  1257→    socket.on('odoo:sales:search', async (data, callback) => {
+  1258→  1258→      try {
+  1259→  1259→        const domain = data.query
+  1260→  1260→          ? ['|', ['name', 'ilike', data.query], ['partner_id', 'ilike', data.query]]
+  1261→  1261→          : []
+  1262→  1262→        const records = await odooSearch('sale.order', domain, [
+  1263→  1263→          'name', 'partner_id', 'state', 'date_order', 'amount_total',
+  1264→  1264→          'user_id', 'team_id', 'whatsapp_number',
+  1265→  1265→        ], data.limit || 20)
+  1266→  1266→        callback?.({ success: true, data: records })
+  1267→  1267→      } catch (error) {
+  1268→  1268→        callback?.({ success: false, error: error.message })
+  1269→  1269→      }
+  1270→  1270→    })
+  1271→  1271→
+  1272→  1272→    socket.on('odoo:sales:create', async (data, callback) => {
+  1273→  1273→      try {
+  1274→  1274→        const values = { partner_id: data.partner_id }
+  1275→  1275→        if (data.whatsapp_number) values.whatsapp_number = data.whatsapp_number
+  1276→  1276→        const id = await odooCreate('sale.order', values)
+  1277→  1277→        callback?.({ success: true, id })
+  1278→  1278→        namespace.emit('odoo:record:created', { model: 'sale.order', id, values })
+  1279→  1279→      } catch (error) {
+  1280→  1280→        callback?.({ success: false, error: error.message })
+  1281→  1281→      }
+  1282→  1282→    })
+  1283→  1283→
+  1284→  1284→    // ===== Projects =====
+  1285→  1285→    socket.on('odoo:projects:search', async (data, callback) => {
+  1286→  1286→      try {
+  1287→  1287→        const domain = []
+  1288→  1288→        if (data.query) domain.push('|', ['name', 'ilike', data.query], ['description', 'ilike', data.query])
+  1289→  1289→        if (data.project_id) domain.push(['project_id', '=', data.project_id])
+  1290→  1290→        const records = await odooSearch('project.task', domain, [
+  1291→  1291→          'name', 'description', 'project_id', 'stage_id', 'user_ids',
+  1292→  1292→          'partner_id', 'priority', 'create_date', 'date_deadline', 'whatsapp_number',
+  1293→  1293→        ], data.limit || 20)
+  1294→  1294→        callback?.({ success: true, data: records })
+  1295→  1295→      } catch (error) {
+  1296→  1296→        callback?.({ success: false, error: error.message })
+  1297→  1297→      }
+  1298→  1298→    })
+  1299→  1299→
+  1300→  1300→    socket.on('odoo:projects:create', async (data, callback) => {
+  1301→  1301→      try {
+  1302→  1302→        const values = { name: data.name }
+  1303→  1303→        if (data.project_id) values.project_id = data.project_id
+  1304→  1304→        if (data.partner_id) values.partner_id = data.partner_id
+  1305→  1305→        if (data.description) values.description = data.description
+  1306→  1306→        if (data.whatsapp_number) values.whatsapp_number = data.whatsapp_number
+  1307→  1307→        const id = await odooCreate('project.task', values)
+  1308→  1308→        callback?.({ success: true, id })
+  1309→  1309→        namespace.emit('odoo:record:created', { model: 'project.task', id, values })
+  1310→  1310→      } catch (error) {
+  1311→  1311→        callback?.({ success: false, error: error.message })
+  1312→  1312→      }
+  1313→  1313→    })
+  1314→  1314→
+  1315→  1315→    socket.on('odoo:projects:list', async (data, callback) => {
+  1316→  1316→      try {
+  1317→  1317→        const records = await odooSearch('project.project', [], [
+  1318→  1318→          'name', 'label_tasks', 'user_id', 'partner_id',
+  1319→  1319→        ], data.limit || 50)
+  1320→  1320→        callback?.({ success: true, data: records })
+  1321→  1321→      } catch (error) {
+  1322→  1322→        callback?.({ success: false, error: error.message })
+  1323→  1323→      }
+  1324→  1324→    })
+  1325→  1325→
+  1326→  1326→    // ===== Link Conversation =====
+  1327→  1327→    socket.on('odoo:link-conversation', async (data, callback) => {
+  1328→  1328→      try {
+  1329→  1329→        const phone = data.phone || data.jid.split('@')[0]
+  1330→  1330→        await smartWriteWhatsAppNumber(data.model, [data.recordId], phone)
+  1331→  1331→        try {
+  1332→  1332→          await odooPostMessage(data.model, data.recordId,
+  1333→  1333→            `<p><strong>[WhatsApp Middleware]</strong> Conversa vinculada — Número: ${phone}</p>`)
+  1334→  1334→        } catch { /* Chatter might not be available */ }
+  1335→  1335→        callback?.({ success: true })
+  1336→  1336→        namespace.emit('odoo:conversation:linked', { jid: data.jid, model: data.model, recordId: data.recordId })
+  1337→  1337→      } catch (error) {
+  1338→  1338→        callback?.({ success: false, error: error.message })
+  1339→  1339→      }
+  1340→  1340→    })
+  1341→  1341→
+  1342→  1342→    // ===== Search Records Across Multiple Models =====
+  1343→  1343→    socket.on('odoo:search-records', async (data, callback) => {
+  1344→  1344→      try {
+  1345→  1345→        const { query, models, limit } = data
+  1346→  1346→        const searchLimit = limit || 10
+  1347→  1347→        const results = []
+  1348→  1348→
+  1349→  1349→        const modelConfigs = {
+  1350→  1350→          'res.partner': {
+  1351→  1351→            domain: query ? ['|', '|', ['name', 'ilike', query], ['phone', 'ilike', query], ['mobile', 'ilike', query]] : [],
+  1352→  1352→            fields: ['name', 'phone', 'mobile', 'email', 'whatsapp', 'is_company'],
+  1353→  1353→            label: 'Contato',
+  1354→  1354→          },
+  1355→  1355→          'crm.lead': {
+  1356→  1356→            domain: query ? ['|', ['name', 'ilike', query], ['partner_name', 'ilike', query]] : [],
+  1357→  1357→            fields: ['name', 'partner_id', 'phone', 'type', 'stage_id', 'probability'],
+  1358→  1358→            label: 'Lead',
+  1359→  1359→          },
+  1360→  1360→          'sale.order': {
+  1361→  1361→            domain: query ? ['|', ['name', 'ilike', query], ['partner_id', 'ilike', query]] : [],
+  1362→  1362→            fields: ['name', 'partner_id', 'state', 'date_order', 'amount_total'],
+  1363→  1363→            label: 'Venda',
+  1364→  1364→          },
+  1365→  1365→          'project.task': {
+  1366→  1366→            domain: query ? ['|', ['name', 'ilike', query], ['description', 'ilike', query]] : [],
+  1367→  1367→            fields: ['name', 'project_id', 'stage_id', 'partner_id', 'priority'],
+  1368→  1368→            label: 'Tarefa',
+  1369→  1369→          },
+  1370→  1370→        }
+  1371→  1371→
+  1372→  1372→        const modelsToSearch = models && models.length > 0
+  1373→  1373→          ? models.filter(m => modelConfigs[m])
+  1374→  1374→          : Object.keys(modelConfigs)
+  1375→  1375→
+  1376→  1376→        for (const model of modelsToSearch) {
+  1377→  1377→          const config = modelConfigs[model]
+  1378→  1378→          try {
+  1379→  1379→            const records = await odooSearch(model, config.domain, config.fields, searchLimit)
+  1380→  1380→            if (records && records.length > 0) {
+  1381→  1381→              for (const record of records) {
+  1382→  1382→                results.push({
+  1383→  1383→                  model,
+  1384→  1384→                  modelLabel: config.label,
+  1385→  1385→                  recordId: record.id,
+  1386→  1386→                  name: record.name || `#${record.id}`,
+  1387→  1387→                  details: record,
+  1388→  1388→                })
+  1389→  1389→              }
+  1390→  1390→            }
+  1391→  1391→          } catch (err) {
+  1392→  1392→            console.error(`[Odoo] Search error on ${model}:`, err.message)
+  1393→  1393→          }
+  1394→  1394→        }
+  1395→  1395→
+  1396→  1396→        callback?.({ success: true, data: results })
+  1397→  1397→      } catch (error) {
+  1398→  1398→        callback?.({ success: false, error: error.message })
+  1399→  1399→      }
+  1400→  1400→    })
+  1401→  1401→
+  1402→  1402→    // ===== Link and Post Conversation to Chatter =====
+  1403→  1403→    socket.on('odoo:link-and-post-chatter', async (data, callback) => {
+  1404→  1404→      try {
+  1405→  1405→        const { jid, model, recordId, phone, messages, postToChatter } = data
+  1406→  1406→        const phoneNum = phone || (jid ? jid.split('@')[0] : '')
+  1407→  1407→
+  1408→  1408→        // Step 1: Link the conversation (write WhatsApp number to the record)
+  1409→  1409→        try {
+  1410→  1410→          await smartWriteWhatsAppNumber(model, [recordId], phoneNum)
+  1411→  1411→        } catch (err) {
+  1412→  1412→          console.error(`[Odoo] Failed to write WhatsApp number to ${model}#${recordId}:`, err.message)
+  1413→  1413→        }
+  1414→  1414→
+  1415→  1415→        // Step 2: Post link notification to chatter
+  1416→  1416→        try {
+  1417→  1417→          await odooPostMessage(model, recordId,
+  1418→  1418→            `<p><strong>[WhatsApp Middleware]</strong> Conversa vinculada — Número: ${phoneNum}</p>`)
+  1419→  1419→        } catch { /* Chatter might not be available */ }
+  1420→  1420→
+  1421→  1421→        // Step 3: Post conversation messages to chatter if requested
+  1422→  1422→        let messagesPosted = 0
+  1423→  1423→        if (postToChatter && messages && messages.length > 0) {
+  1424→  1424→          // Build a single consolidated message with the conversation history
+  1425→  1425→          const lines = []
+  1426→  1426→          lines.push(`<p><strong>📱 Histórico da Conversa WhatsApp</strong></p>`)
+  1427→  1427→          lines.push(`<p><em>Número: ${phoneNum} | Mensagens: ${messages.length}</em></p>`)
+  1428→  1428→          lines.push(`<hr/>`)
+  1429→  1429→
+  1430→  1430→          for (const msg of messages) {
+  1431→  1431→            const time = new Date(msg.timestamp).toLocaleString('pt-BR')
+  1432→  1432→            const direction = msg.fromMe ? 'Enviada' : 'Recebida'
+  1433→  1433→            const mediaLabel = msg.mediaType ? ` [${msg.mediaType}]` : ''
+  1434→  1434→            const content = msg.textContent
+  1435→  1435→              ? escapeHtml(msg.textContent)
+  1436→  1436→              : `<em>[Mídia${mediaLabel}]</em>`
+  1437→  1437→            const sender = msg.fromMe ? 'Você' : 'Contato'
+  1438→  1438→            lines.push(`<p><strong>${time} — ${sender} (${direction}):</strong>${mediaLabel}<br/>${content}</p>`)
+  1439→  1439→          }
+  1440→  1440→
+  1441→  1441→          try {
+  1442→  1442→            await odooPostMessage(model, recordId, lines.join(''))
+  1443→  1443→            messagesPosted = messages.length
+  1444→  1444→            console.log(`[Odoo] Posted ${messagesPosted} messages to ${model}#${recordId} chatter`)
+  1445→  1445→          } catch (err) {
+  1446→  1446→            console.error(`[Odoo] Failed to post conversation to ${model}#${recordId}:`, err.message)
+  1447→  1447→          }
+  1448→  1448→        }
+  1449→  1449→
+  1450→  1450→        callback?.({ success: true, messagesPosted })
+  1451→  1451→        namespace.emit('odoo:conversation:linked', { jid, model, recordId })
+  1452→  1452→      } catch (error) {
+  1453→  1453→        console.error(`[Odoo] link-and-post-chatter error:`, error.message)
+  1454→  1454→        callback?.({ success: false, error: error.message })
+  1455→  1455→      }
+  1456→  1456→    })
+  1457→  1457→
+  1458→  1458→    // ===== Log Message =====
+  1459→  1459→    socket.on('odoo:log-message', async (data, callback) => {
+  1460→  1460→      try {
+  1461→  1461→        const body = data.fromWhatsApp
+  1462→  1462→          ? `<p><strong>[WhatsApp]</strong> ${data.message}</p>`
+  1463→  1463→          : data.message
+  1464→  1464→        await odooPostMessage(data.model, data.recordId, body)
+  1465→  1465→        callback?.({ success: true })
+  1466→  1466→      } catch (error) {
+  1467→  1467→        callback?.({ success: false, error: error.message })
+  1468→  1468→      }
+  1469→  1469→    })
+  1470→  1470→
+  1471→  1471→    // ===== Get Model Fields =====
+  1472→  1472→    socket.on('odoo:fields', async (data, callback) => {
+  1473→  1473→      try {
+  1474→  1474→        const fields = await odooGetFields(data.model)
+  1475→  1475→        callback?.({ success: true, data: fields })
+  1476→  1476→      } catch (error) {
+  1477→  1477→        callback?.({ success: false, error: error.message })
+  1478→  1478→      }
+  1479→  1479→    })
+  1480→  1480→
+  1481→  1481→    // ===== Check Custom Fields =====
+  1482→  1482→    socket.on('odoo:check-fields', async (data, callback) => {
+  1483→  1483→      try {
+  1484→  1484→        const available = await getAvailableFields(data.model)
+  1485→  1485→        const result = {}
+  1486→  1486→        for (const field of data.fields) result[field] = available.has(field)
+  1487→  1487→        callback?.({ success: true, data: result })
+  1488→  1488→      } catch (error) {
+  1489→  1489→        callback?.({ success: false, error: error.message })
+  1490→  1490→      }
+  1491→  1491→    })
+  1492→  1492→
+  1493→  1493→    // ===== Generic CRUD =====
+  1494→  1494→    socket.on('odoo:search', async (data, callback) => {
+  1495→  1495→      try {
+  1496→  1496→        const records = await odooSearch(data.model, data.domain, data.fields || [], data.limit || 20)
+  1497→  1497→        callback?.({ success: true, data: records })
+  1498→  1498→      } catch (error) {
+  1499→  1499→        callback?.({ success: false, error: error.message })
+  1500→  1500→      }
+  1501→  1501→    })
+  1502→  1502→
+  1503→  1503→    socket.on('odoo:read', async (data, callback) => {
+  1504→  1504→      try {
+  1505→  1505→        const records = await odooRead(data.model, data.ids, data.fields || [])
+  1506→  1506→        callback?.({ success: true, data: records })
+  1507→  1507→      } catch (error) {
+  1508→  1508→        callback?.({ success: false, error: error.message })
+  1509→  1509→      }
+  1510→  1510→    })
+  1511→  1511→
+  1512→  1512→    socket.on('odoo:write', async (data, callback) => {
+  1513→  1513→      try {
+  1514→  1514→        const result = await odooWrite(data.model, data.ids, data.values)
+  1515→  1515→        callback?.({ success: true, data: result })
+  1516→  1516→      } catch (error) {
+  1517→  1517→        callback?.({ success: false, error: error.message })
+  1518→  1518→      }
+  1519→  1519→    })
+  1520→  1520→
+  1521→  1521→    // ===== Teams & Users =====
+  1522→  1522→    socket.on('odoo:teams:search', async (data, callback) => {
+  1523→  1523→      try {
+  1524→  1524→        const records = await odooSearch('crm.team', [], ['name', 'user_id'], data.limit || 20)
+  1525→  1525→        callback?.({ success: true, data: records })
+  1526→  1526→      } catch (error) {
+  1527→  1527→        callback?.({ success: false, error: error.message })
+  1528→  1528→      }
+  1529→  1529→    })
+  1530→  1530→
+  1531→  1531→    socket.on('odoo:users:search', async (data, callback) => {
+  1532→  1532→      try {
+  1533→  1533→        const records = await odooSearch('res.users', [], ['name', 'login', 'image_128'], data.limit || 20)
+  1534→  1534→        callback?.({ success: true, data: records })
+  1535→  1535→      } catch (error) {
+  1536→  1536→        callback?.({ success: false, error: error.message })
+  1537→  1537→      }
+  1538→  1538→    })
+  1539→  1539→
+  1540→  1540→    socket.on('disconnect', () => {
+  1541→  1541→      // console.log(`[Odoo IO] Client disconnected: ${socket.id}`)
+  1542→  1542→    })
+  1543→  1543→  })
+  1544→  1544→}
+  1545→  1545→
+  1546→  1546→// =============================================================================
+  1547→  1547→// SECTION: Memory Monitoring
+  1548→  1548→// =============================================================================
+  1549→  1549→
+  1550→  1550→function logMemoryUsage() {
+  1551→  1551→  const used = process.memoryUsage()
+  1552→  1552→  const mb = (bytes) => Math.round(bytes / 1024 / 1024)
+  1553→  1553→  console.log(`[Memory] RSS: ${mb(used.rss)}MB | Heap: ${mb(used.heapUsed)}/${mb(used.heapTotal)}MB | External: ${mb(used.external)}MB`)
+  1554→  1554→}
+  1555→  1555→
+  1556→  1556→// =============================================================================
+  1557→  1557→// SECTION: Main Startup
+  1558→  1558→// =============================================================================
+  1559→  1559→
+  1560→  1560→async function main() {
+  1561→  1561→  console.log('============================================')
+  1562→  1562→  console.log('  Whats-Odoo v4.0 — Single-Process Server')
+  1563→  1563→  console.log('============================================')
+  1564→  1564→
+  1565→  1565→  // 1. Load modules
+  1566→  1566→  await loadModules()
+  1567→  1567→
+  1568→  1568→  // pino module is now loaded — waLogger will be initialized in step 5 below
+  1569→  1569→
+  1570→  1570→  // 2. Initialize Next.js
+  1571→  1571→  console.log('[Server] Initializing Next.js...')
+  1572→  1572→  const app = next({ dev, hostname, port })
+  1573→  1573→  const handle = app.getRequestHandler()
+  1574→  1574→  await app.prepare()
+  1575→  1575→  console.log('[Server] Next.js ready')
+  1576→  1576→
+  1577→  1577→  // 3. Create HTTP server
+  1578→  1578→  const httpServer = createServer((req, res) => {
+  1579→  1579→    const parsedUrl = parse(req.url, true)
+  1580→  1580→    handle(req, res, parsedUrl)
+  1581→  1581→  })
+  1582→  1582→
+  1583→  1583→  // 4. Setup Socket.io
+  1584→  1584→  io = new Server(httpServer, {
+  1585→  1585→    path: '/socket.io',
+  1586→  1586→    cors: { origin: '*', methods: ['GET', 'POST'] },
+  1587→  1587→    pingTimeout: 60000,
+  1588→  1588→    pingInterval: 25000,
+  1589→  1589→  })
+  1590→  1590→
+  1591→  1591→  waNamespace = io.of('/whatsapp')
+  1592→  1592→  odooNamespace = io.of('/odoo')
+  1593→  1593→
+  1594→  1594→  // Setup namespace handlers (direct, no bridge!)
+  1595→  1595→  setupWhatsAppNamespace(waNamespace)
+  1596→  1596→  setupOdooNamespace(odooNamespace)
+  1597→  1597→
+  1598→  1598→  // 5. Initialize WhatsApp logger now that pino is loaded — MUST be before connectWhatsApp()
+  1599→  1599→  try {
+  1600→  1600→    waLogger = pino({ level: 'silent' })
+  1601→  1601→    console.log('[Server] WhatsApp logger initialized (pino level=silent)')
+  1602→  1602→  } catch (err) {
+  1603→  1603→    console.error('[Server] Failed to create pino logger:', err.message)
+  1604→  1604→    waLogger = { info: () => {}, error: () => {}, warn: () => {}, child: () => ({ info: () => {}, error: () => {}, warn: () => {} }) }
+  1605→  1605→  }
+  1606→  1606→
+  1607→  1607→  // 6. Initialize WhatsApp (non-blocking) — waLogger must already be set above
+  1608→  1608→  console.log('[Server] Initializing WhatsApp... makeWASocket:', typeof makeWASocket, 'waLogger type:', typeof waLogger)
+  1609→  1609→  if (typeof makeWASocket !== 'function') {
+  1610→  1610→    console.error('[Server] CRITICAL: makeWASocket is not a function! WhatsApp will not work.')
+  1611→  1611→    console.error('[Server] This usually means @whiskeysockets/baileys is not installed correctly.')
+  1612→  1612→  } else {
+  1613→  1613→    connectWhatsApp().catch(err => {
+  1614→  1614→      console.error('[WA] Initial connection error:', err.message)
+  1615→  1615→      // Retry after 10 seconds if initial connection fails
+  1616→  1616→      setTimeout(() => {
+  1617→  1617→        console.log('[WA] Retrying initial connection...')
+  1618→  1618→        connectWhatsApp().catch(retryErr => console.error('[WA] Retry connection error:', retryErr.message))
+  1619→  1619→      }, 10000)
+  1620→  1620→    })
+  1621→  1621→  }
+  1622→  1622→
+  1623→  1623→  // 7. Auto-authenticate Odoo from env vars (non-blocking)
+  1624→  1624→  autoAuthenticateFromEnv().catch(err => console.error('[Odoo] Auto-auth error:', err.message))
+  1625→  1625→
+  1626→  1626→  // 8. Start HTTP server
+  1627→  1627→  httpServer.listen(port, hostname, () => {
+  1628→  1628→    console.log(`[Server] > Ready on http://${hostname}:${port}`)
+  1629→  1629→    console.log('[Server] WhatsApp namespace: /whatsapp')
+  1630→  1630→    console.log('[Server] Odoo namespace: /odoo')
+  1631→  1631→    logMemoryUsage()
+  1632→  1632→  })
+  1633→  1633→
+  1634→  1634→  // Periodic memory monitoring (every 5 minutes)
+  1635→  1635→  setInterval(() => {
+  1636→  1636→    logMemoryUsage()
+  1637→  1637→    // Force garbage collection if available (node --expose-gc)
+  1638→  1638→    if (global.gc) {
+  1639→  1639→      global.gc()
+  1640→  1640→      console.log('[Memory] GC triggered')
+  1641→  1641→    }
+  1642→  1642→  }, 5 * 60 * 1000)
+  1643→  1643→}
+  1644→  1644→
+  1645→  1645→// Graceful shutdown
+  1646→  1646→process.on('SIGTERM', () => {
+  1647→  1647→  console.log('[Server] SIGTERM received, shutting down...')
+  1648→  1648→  if (waSocket) waSocket.end(undefined)
+  1649→  1649→  process.exit(0)
+  1650→  1650→})
+  1651→  1651→
+  1652→  1652→process.on('SIGINT', () => {
+  1653→  1653→  console.log('[Server] SIGINT received, shutting down...')
+  1654→  1654→  if (waSocket) waSocket.end(undefined)
+  1655→  1655→  process.exit(0)
+  1656→  1656→})
+  1657→  1657→
+  1658→  1658→// Prevent unhandled errors from crashing
+  1659→  1659→process.on('uncaughtException', (err) => {
+  1660→  1660→  console.error('[Server] Uncaught exception:', err.message)
+  1661→  1661→})
+  1662→  1662→
+  1663→  1663→process.on('unhandledRejection', (reason) => {
+  1664→  1664→  console.error('[Server] Unhandled rejection:', reason?.message || reason)
+  1665→  1665→})
+  1666→  1666→
+  1667→  1667→// Start!
+  1668→  1668→main().catch(err => {
+  1669→  1669→  console.error('[Server] Fatal error:', err)
+  1670→  1670→  process.exit(1)
+  1671→  1671→})
+  1672→  1672→

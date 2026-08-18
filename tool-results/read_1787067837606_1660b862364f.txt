@@ -1,0 +1,2002 @@
+     1→// ====================================================================
+     2→// Whats-Odoo v7.23 — PER-USER SESSION
+     3→// --------------------------------------------------------------------
+     4→// Each logged-in middleware user has their own UserSession instance:
+     5→//   - Own Baileys WhatsApp socket (data/auth_<userId>/creds.json)
+     6→//   - Own conversations/messages state (in-memory Map + data/conv_state_<userId>.json)
+     7→//   - Own Odoo connection (per-user creds from DB, falling back to global OdooConfig)
+     8→//   - Own socket.io event routing (only sees their own QR codes + conversations)
+     9→//
+    10→// This file is CommonJS because server.js is CommonJS.
+    11→//
+    12→// The SessionManager lazily creates/starts a UserSession on the first
+    13→// socket.io connection from a logged-in user. Sessions stay alive after
+    14→// the socket disconnects (so WhatsApp stays connected); they are only
+    15→// destroyed by SessionManager.invalidate(userId) — currently only called
+    16→// on server shutdown.
+    17→//
+    18→// The pure helpers (normalizeJid, escapeHtml, etc.) are exported for
+    19→// server.js to use directly when wiring socket handlers.
+    20→// ====================================================================
+    21→
+    22→const path = require('path')
+    23→const fs = require('fs')
+    24→const { createClient, createSecureClient } = require('xmlrpc')
+    25→const { PrismaClient } = require('@prisma/client')
+    26→
+    27→// v7.30: Firestore-backed Baileys auth state — persists WhatsApp sessions
+    28→// across deploys even if the disk is wiped. Falls back to filesystem
+    29→// (useMultiFileAuthState) if Firestore is not configured.
+    30→const { usePersistentAuthState } = require('./wa-firestore-auth-state.cjs')
+    31→
+    32→const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data')
+    33→
+    34→// ====================================================================
+    35→// PURE HELPERS — module-level (don't touch per-user state)
+    36→// ====================================================================
+    37→
+    38→// Baileys can deliver JIDs in several forms:
+    39→//   5511999888777@s.whatsapp.net            — canonical DM
+    40→//   5511999888777:7@s.whatsapp.net          — DM with device suffix (multi-device send)
+    41→//   5511999888777:7:3@s.whatsapp.net        — DM with device + agent suffix
+    42→//   5511999888777@lid                        — Linked Identity (newer protocol)
+    43→// We normalize everything to canonical form: <digits>@s.whatsapp.net
+    44→function normalizeJid(jid) {
+    45→  if (!jid || typeof jid !== 'string') return null
+    46→  const atIdx = jid.indexOf('@')
+    47→  if (atIdx < 0) return null
+    48→  const server = jid.slice(atIdx + 1)
+    49→  if (server !== 's.whatsapp.net') return null
+    50→  const userCombined = jid.slice(0, atIdx)
+    51→  const user = userCombined.split(':')[0].split('_')[0]
+    52→  if (!/^\d{7,}$/.test(user)) return null
+    53→  return `${user}@s.whatsapp.net`
+    54→}
+    55→
+    56→function isValidPhoneJid(jid) {
+    57→  return normalizeJid(jid) !== null
+    58→}
+    59→
+    60→function extractPhone(jid) {
+    61→  const normalized = normalizeJid(jid)
+    62→  return normalized ? normalized.split('@')[0] : null
+    63→}
+    64→
+    65→// Compatibility alias — many call sites use jidNormalizedUser()
+    66→function jidNormalizedUser(jid) {
+    67→  return normalizeJid(jid) || jid
+    68→}
+    69→
+    70→// Normalize a phone number (strip non-digits) to a WhatsApp JID
+    71→function normalizePhoneToJid(phone) {
+    72→  if (!phone) return null
+    73→  const digits = String(phone).replace(/\D/g, '')
+    74→  if (digits.length < 7) return null
+    75→  return `${digits}@s.whatsapp.net`
+    76→}
+    77→
+    78→function escapeHtml(text) {
+    79→  return String(text || '')
+    80→    .replace(/&/g, '&amp;')
+    81→    .replace(/</g, '&lt;')
+    82→    .replace(/>/g, '&gt;')
+    83→    .replace(/\n/g, '<br/>')
+    84→}
+    85→
+    86→function stripHtml(html) {
+    87→  if (!html) return ''
+    88→  let text = String(html)
+    89→    .replace(/<br\s*\/?>/gi, '\n')
+    90→    .replace(/<\/p>/gi, '\n')
+    91→    .replace(/<p[^>]*>/gi, '')
+    92→    .replace(/<[^>]+>/g, '')
+    93→    .replace(/&nbsp;/g, ' ')
+    94→    .replace(/&amp;/g, '&')
+    95→    .replace(/&lt;/g, '<')
+    96→    .replace(/&gt;/g, '>')
+    97→    .replace(/&quot;/g, '"')
+    98→    .replace(/&#39;/g, "'")
+    99→    .trim()
+   100→  text = text.replace(/\n{3,}/g, '\n\n')
+   101→  return text
+   102→}
+   103→
+   104→// v7.28: Parse a chatter body produced by buildChatterBody() back into clean
+   105→// message components (direction, timestamp, text). The chatter body format is:
+   106→//   <div><strong>📱 WhatsApp {Enviada|Recebida}:</strong> {ts}<br/>{mediaLine}<span>{text}</span></div>
+   107→// We want to extract ONLY the user-visible text (the <span> content), detect
+   108→// the direction from "Enviada" vs "Recebida", and parse the timestamp.
+   109→// Falls back to stripHtml() for any non-conforming body (e.g. messages posted
+   110→// by other Odoo users from the web UI — those are returned as-is, plain text).
+   111→function parseChatterBody(body) {
+   112→  if (!body) return { fromMe: false, timestamp: null, text: '' }
+   113→  const s = String(body)
+   114→
+   115→  // Detect direction from the "WhatsApp Enviada/Recebida:" marker
+   116→  const isSent = /WhatsApp\s+Enviada/i.test(s)
+   117→  const fromMe = isSent
+   118→
+   119→  // Extract timestamp from "(...)" — buildChatterBody uses toLocaleString('pt-BR')
+   120→  // inside parentheses as part of the label. Actually buildChatterBody does NOT
+   121→  // wrap in parens — it inserts the timestamp directly after the colon.
+   122→  // But older messages may have the "(date)" format. Support both.
+   123→  let timestamp = null
+   124→  const parenMatch = s.match(/\(([^)]+)\)/)
+   125→  if (parenMatch) {
+   126→    const parsed = new Date(parenMatch[1])
+   127→    if (!isNaN(parsed.getTime())) timestamp = parsed
+   128→  }
+   129→
+   130→  // Extract the text content from the <span>...</span> block (the real message)
+   131→  let text = ''
+   132→  const spanMatch = s.match(/<span[^>]*>([\s\S]*?)<\/span>/i)
+   133→  if (spanMatch) {
+   134→    text = stripHtml(spanMatch[1])
+   135→  } else {
+   136→    // No <span> — this isn't a WhatsApp chatter message produced by us.
+   137→    // It's probably a note posted by a human via the Odoo UI, or a different
+   138→    // format entirely. Strip HTML and return the whole body as plain text.
+   139→    text = stripHtml(s)
+   140→    // If the body still starts with the WhatsApp metadata header, strip it.
+   141→    // This handles the case where buildChatterBody emitted no <span> because
+   142→    // textContent was empty (media-only message).
+   143→    const headerMatch = text.match(/^📱\s*WhatsApp\s+(Enviada|Recebida)[:\s]*(.*)$/is)
+   144→    if (headerMatch) {
+   145→      // For media-only messages, the "text" will be empty after the header.
+   146→      // Strip the header line and keep the remaining content (media label).
+   147→      const remaining = text.slice(headerMatch[0].length).trim()
+   148→      // Try to detect a media label line like "🎙️ Áudio"
+   149→      const mediaMatch = remaining.match(/^([🎙️🖼️📄🎬🏷️][^\n]*)/)
+   150→      text = mediaMatch ? mediaMatch[1] : remaining
+   151→    }
+   152→  }
+   153→
+   154→  // Try to parse timestamp from the label after the colon (no parens case)
+   155→  if (!timestamp) {
+   156→    // Look for a date pattern like "14/08/2026, 10:30:45" or "14/08/2026 10:30"
+   157→    const dateMatch = s.match(/(\d{1,2}\/\d{1,2}\/\d{4})[,\s]+(\d{1,2}:\d{2}(?::\d{2})?)/)
+   158→    if (dateMatch) {
+   159→      const [_, d, t] = dateMatch
+   160→      // pt-BR format: DD/MM/YYYY HH:MM:SS
+   161→      const parsed = new Date(`${d.split('/').reverse().join('-')}T${t}`)
+   162→      if (!isNaN(parsed.getTime())) timestamp = parsed
+   163→    }
+   164→  }
+   165→
+   166→  return { fromMe, timestamp, text }
+   167→}
+   168→
+   169→// Extract a display name from a message's pushName field
+   170→function pushNameFallback(msg) {
+   171→  return msg?.pushName || null
+   172→}
+   173→
+   174→// v7.19: Build a plain-text transcript of the WhatsApp conversation that will
+   175→// be written to the `description` field (Notes) of the CRM lead/opportunity.
+   176→function buildConversationTranscript(messages) {
+   177→  if (!Array.isArray(messages) || messages.length === 0) return ''
+   178→  const sorted = [...messages].sort(
+   179→    (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+   180→  )
+   181→  const lines = sorted.map((m) => {
+   182→    const direction = m.fromMe ? 'Eu' : 'Contato'
+   183→    const dateLabel = new Date(m.timestamp).toLocaleString('pt-BR')
+   184→    const mediaLabel = m.mediaType ? ` [${m.mediaType}]` : ''
+   185→    const text = m.textContent && m.textContent.trim() ? m.textContent : '[Mídia]'
+   186→    return `[${dateLabel}] ${direction}${mediaLabel}: ${text}`
+   187→  })
+   188→  return `Conversa WhatsApp:\n${lines.join('\n')}`
+   189→}
+   190→
+   191→// ====================================================================
+   192→// UserSession — encapsulates ALL per-user state
+   193→// ====================================================================
+   194→
+   195→class UserSession {
+   196→  constructor({ userId, user, io, prisma }) {
+   197→    this.userId = userId
+   198→    this.user = user              // Prisma User record (with odooUrl etc.)
+   199→    this.io = io                  // socket.io server instance (for namespaces)
+   200→    this.prisma = prisma          // shared PrismaClient
+   201→
+   202→    // ===== Per-user paths =====
+   203→    this.authFolder = path.join(DATA_DIR, `auth_${userId}`)
+   204→    this.stateFile = path.join(DATA_DIR, `conv_state_${userId}.json`)
+   205→    this.mediaDir = path.join(DATA_DIR, 'media')  // shared (filenames are random cuids)
+   206→
+   207→    // ===== WhatsApp state =====
+   208→    this.waSocket = null
+   209→    this.connectionState = { connection: 'close' }
+   210→    this.hasSavedSession = fs.existsSync(path.join(this.authFolder, 'creds.json'))
+   211→    this.lastQrCode = null
+   212→    this.reconnectAttempts = 0
+   213→    this.watchdogTimer = null
+   214→    this.waConnecting = false        // v7.29: re-entrancy guard for connectWhatsApp
+   215→    this.waReconnectTimer = null     // v7.29: single pending reconnect timer
+   216→    this.conversations = new Map()
+   217→    this.contactNames = new Map()
+   218→    this.deviceContacts = new Map()
+   219→    this.lidToPhoneMap = new Map()
+   220→    this.syncState = { isSyncing: false, progress: 0, totalChats: 0, totalContacts: 0, totalMessages: 0 }
+   221→    this.lastPersistTs = 0
+   222→    this.conversationDirty = false
+   223→
+   224→    // v7.15: Ring buffer of recent `messages.upsert` events for debugging.
+   225→    this.recentUpsertEvents = []
+   226→    this.MAX_RECENT_EVENTS = 50
+   227→
+   228→    // ===== Odoo state — initialized from user record =====
+   229→    // Per-user creds take precedence; if empty, loadOdooConfig() will fall
+   230→    // back to the global OdooConfig row from the DB.
+   231→    this.odooConfig = {
+   232→      url: user.odooUrl || '',
+   233→      db: user.odooDb || '',
+   234→      username: user.odooUsername || '',
+   235→      password: user.odooPassword || '',
+   236→      uid: null,
+   237→    }
+   238→    this.usingGlobalOdooConfig = !(this.odooConfig.url && this.odooConfig.db && this.odooConfig.username && this.odooConfig.password)
+   239→
+   240→    this.autoSyncSettings = {
+   241→      enabled: true,
+   242→      autoCreateContact: true,
+   243→      autoCreateLead: false,       // v7.19: default OFF per user request
+   244→      autoPostMessages: true,
+   245→      autoCreateActivity: false,
+   246→      leadPrefix: '[WhatsApp] ',
+   247→      leadTeamId: null,
+   248→      leadUserId: null,
+   249→    }
+   250→    this.odooReauthTimer = null
+   251→    this.modelFieldsCache = new Map()
+   252→    this.phoneToPartnerCache = new Map()
+   253→    // Track which WhatsApp message IDs have already been posted to Odoo chatter
+   254→    this.postedChatterIds = new Set()
+   255→    // Track active lead IDs by phone (refreshed on every auto-sync)
+   256→    this.phoneToActiveLeadCache = new Map()
+   257→
+   258→    // v7.21: Odoo chatter history sync state
+   259→    this.odooHistorySyncInProgress = false
+   260→    this.odooHistorySyncLastRun = null
+   261→
+   262→    // ===== Socket.io bookkeeping =====
+   263→    this.connectedSockets = new Set()  // socket.io Socket instances subscribed to this user
+   264→    this.persistTimer = null
+   265→    this.isStarted = false
+   266→    this.isStarting = false
+   267→  }
+   268→
+   269→  // ------------------------------------------------------------------
+   270→  // Emit helpers — send only to sockets subscribed to THIS user
+   271→  // ------------------------------------------------------------------
+   272→  emitWA(event, data) {
+   273→    for (const s of this.connectedSockets) {
+   274→      try { s.emit(event, data) } catch {}
+   275→    }
+   276→  }
+   277→  emitOdoo(event, data) {
+   278→    for (const s of this.connectedSockets) {
+   279→      try { s.emit(event, data) } catch {}
+   280→    }
+   281→  }
+   282→  // Emit to a specific socket (used for the initial burst on connection)
+   283→  emitTo(socket, event, data) {
+   284→    try { socket.emit(event, data) } catch {}
+   285→  }
+   286→
+   287→  markDirty() { this.conversationDirty = true }
+   288→
+   289→  logUpsertEvent(event) {
+   290→    try {
+   291→      this.recentUpsertEvents.push({ ts: new Date().toISOString(), ...event })
+   292→      while (this.recentUpsertEvents.length > this.MAX_RECENT_EVENTS) this.recentUpsertEvents.shift()
+   293→    } catch {}
+   294→  }
+   295→
+   296→  // ------------------------------------------------------------------
+   297→  // Lifecycle
+   298→  // ------------------------------------------------------------------
+   299→
+   300→  async loadOdooConfig() {
+   301→    // If per-user creds are already set, nothing to do
+   302→    if (this.odooConfig.url && this.odooConfig.db && this.odooConfig.username && this.odooConfig.password) {
+   303→      this.usingGlobalOdooConfig = false
+   304→      return
+   305→    }
+   306→    // Fall back to global OdooConfig table
+   307→    try {
+   308→      const globalConfig = await this.prisma.odooConfig.findFirst({
+   309→        where: { active: true },
+   310→        orderBy: { updatedAt: 'desc' },
+   311→      })
+   312→      if (globalConfig) {
+   313→        this.odooConfig = {
+   314→          url: globalConfig.url,
+   315→          db: globalConfig.db,
+   316→          username: globalConfig.username,
+   317→          password: globalConfig.password,
+   318→          uid: null,
+   319→        }
+   320→        this.usingGlobalOdooConfig = true
+   321→        console.log(`[UserSession:${this.userId}] Using GLOBAL OdooConfig (no per-user creds set)`)
+   322→      } else {
+   323→        this.usingGlobalOdooConfig = true
+   324→        console.log(`[UserSession:${this.userId}] No Odoo config (per-user or global) — Odoo features disabled`)
+   325→      }
+   326→    } catch (err) {
+   327→      console.error(`[UserSession:${this.userId}] loadOdooConfig failed: ${err.message}`)
+   328→    }
+   329→  }
+   330→
+   331→  async start() {
+   332→    if (this.isStarted || this.isStarting) return
+   333→    this.isStarting = true
+   334→    try {
+   335→      fs.mkdirSync(this.authFolder, { recursive: true })
+   336→      fs.mkdirSync(this.mediaDir, { recursive: true })
+   337→
+   338→      this.loadConversationsFromDisk()
+   339→
+   340→      // Persist conversations every 30 seconds (debounced — only if changed)
+   341→      this.persistTimer = setInterval(() => {
+   342→        if (this.conversationDirty && Date.now() - this.lastPersistTs > 25_000) {
+   343→          this.conversationDirty = false
+   344→          this.lastPersistTs = Date.now()
+   345→          this.persistConversationsToDisk()
+   346→        }
+   347→      }, 30_000)
+   348→
+   349→      // v7.30: Also check Firestore for an existing WhatsApp session.
+   350→      // If Firestore has creds for this user but the local filesystem
+   351→      // doesn't (e.g., after a deploy that wiped the disk), we still
+   352→      // have a saved session. Updates hasSavedSession before logging.
+   353→      try {
+   354→        const { getFirestoreOrNull } = require('./wa-firestore-auth-state.cjs')
+   355→        const db = getFirestoreOrNull()
+   356→        if (db && !this.hasSavedSession) {
+   357→          const snap = await db.collection('wa_auth_states').doc(String(this.userId)).get()
+   358→          if (snap.exists && snap.data() && snap.data().creds) {
+   359→            this.hasSavedSession = true
+   360→            console.log(`[UserSession:${this.userId}] Found saved session in Firestore (no local creds.json)`)
+   361→          }
+   362→        }
+   363→      } catch (err) {
+   364→        console.warn(`[UserSession:${this.userId}] Firestore session check failed:`, err && err.message)
+   365→      }
+   366→
+   367→      console.log(`[UserSession:${this.userId}] Starting — user=${this.user.email}, hasSavedSession=${this.hasSavedSession}, usingGlobalOdooConfig=${this.usingGlobalOdooConfig}`)
+   368→
+   369→      // Load Odoo config from DB (if needed) before starting auto-auth
+   370→      await this.loadOdooConfig()
+   371→
+   372→      // Start WA + Odoo (fire-and-forget — they self-retry internally)
+   373→      this.connectWhatsApp().catch(err => console.error(`[UserSession:${this.userId}] WA startup error:`, err.message))
+   374→      this.startOdooAutoAuth().catch(err => console.error(`[UserSession:${this.userId}] Odoo startup error:`, err.message))
+   375→
+   376→      this.isStarted = true
+   377→    } finally {
+   378→      this.isStarting = false
+   379→    }
+   380→  }
+   381→
+   382→  stop() {
+   383→    try {
+   384→      if (this.persistTimer) { clearInterval(this.persistTimer); this.persistTimer = null }
+   385→      if (this.watchdogTimer) { clearInterval(this.watchdogTimer); this.watchdogTimer = null }
+   386→      if (this.waReconnectTimer) { clearTimeout(this.waReconnectTimer); this.waReconnectTimer = null }
+   387→      if (this.odooReauthTimer) { clearInterval(this.odooReauthTimer); this.odooReauthTimer = null }
+   388→      try { this.waSocket?.end(undefined) } catch {}
+   389→      this.persistConversationsToDisk()
+   390→      console.log(`[UserSession:${this.userId}] Stopped`)
+   391→    } catch (err) {
+   392→      console.error(`[UserSession:${this.userId}] Stop error:`, err.message)
+   393→    }
+   394→  }
+   395→
+   396→  // v7.24 (R6): Pre-deploy backup — dump this user's WA creds + conversation
+   397→  // state to Odoo chatter so the data survives even if the disk is wiped
+   398→  // during a Render deploy. Posted as a mail.message on a designated
+   399→  // res.partner (the user's own partner if findable, otherwise partner 1).
+   400→  //
+   401→  // Format: subject `[BACKUP-CREDS] User <email> — <timestamp>`, body is
+   402→  // JSON-stringified { creds, conversations }. If the JSON is too large
+   403→  // (>600 KB per chunk — Odoo's chatter body limit is ~1MB), it's split
+   404→  // into N chunks posted as separate messages with subject suffix `[1/N]`.
+   405→  //
+   406→  // Returns: { success, chunksPosted, partnerId, error? }
+   407→  async backupToOdoo() {
+   408→    if (!this.odooConfig.uid) {
+   409→      return { success: false, chunksPosted: 0, error: 'Odoo not authenticated' }
+   410→    }
+   411→    try {
+   412→      // Persist current state to disk first (so the backup reflects the
+   413→      // latest conversations, not the last periodic save).
+   414→      this.persistConversationsToDisk()
+   415→
+   416→      // Read creds.json
+   417→      const credsPath = path.join(this.authFolder, 'creds.json')
+   418→      let credsJson = null
+   419→      try {
+   420→        if (fs.existsSync(credsPath)) {
+   421→          credsJson = JSON.parse(fs.readFileSync(credsPath, 'utf8'))
+   422→        }
+   423→      } catch (err) {
+   424→        console.warn(`[Backup:${this.userId}] Could not read creds.json:`, err.message)
+   425→      }
+   426→
+   427→      // Read conv_state_<userId>.json
+   428→      let convState = null
+   429→      try {
+   430→        if (fs.existsSync(this.stateFile)) {
+   431→          convState = JSON.parse(fs.readFileSync(this.stateFile, 'utf8'))
+   432→        }
+   433→      } catch (err) {
+   434→        console.warn(`[Backup:${this.userId}] Could not read conv state:`, err.message)
+   435→      }
+   436→
+   437→      // Build the JSON payload
+   438→      const payload = JSON.stringify({
+   439→        userId: this.userId,
+   440→        email: this.user.email,
+   441→        backedUpAt: new Date().toISOString(),
+   442→        version: '7.24',
+   443→        creds: credsJson,
+   444→        conversations: convState,
+   445→      })
+   446→
+   447→      // Find a partner to post to. Strategy: look up res.partner by the
+   448→      // user's email; if not found, fall back to partner id 1
+   449→      // (Administrator in most Odoo installs).
+   450→      let backupPartnerId = 1
+   451→      try {
+   452→        const partners = await this.odooExecuteKw('res.partner', 'search_read', [
+   453→          [['email', '=', this.user.email]],
+   454→        ], { fields: ['id', 'name'], limit: 1 })
+   455→        if (partners && partners.length > 0) {
+   456→          backupPartnerId = partners[0].id
+   457→        } else {
+   458→          // Fall back: try admin user's partner (res.users where login = 'admin')
+   459→          const adminUsers = await this.odooExecuteKw('res.users', 'search_read', [
+   460→            [['login', '=', 'admin']],
+   461→          ], { fields: ['partner_id'], limit: 1 })
+   462→          if (adminUsers && adminUsers.length > 0 && adminUsers[0].partner_id) {
+   463→            backupPartnerId = adminUsers[0].partner_id[0]
+   464→          }
+   465→        }
+   466→      } catch (err) {
+   467→        console.warn(`[Backup:${this.userId}] Partner lookup failed, using id=1:`, err.message)
+   468→      }
+   469→
+   470→      // Split into chunks of ~600 KB (base64 expansion + Odoo overhead
+   471→      // means 600 KB raw → ~800 KB on the wire, safely under 1 MB).
+   472→      const CHUNK_SIZE = 600_000
+   473→      const chunks = []
+   474→      for (let i = 0; i < payload.length; i += CHUNK_SIZE) {
+   475→        chunks.push(payload.slice(i, i + CHUNK_SIZE))
+   476→      }
+   477→      if (chunks.length === 0) chunks.push('')
+   478→
+   479→      const tsLabel = new Date().toISOString()
+   480→      const subject = `[BACKUP-CREDS] User ${this.user.email} — ${tsLabel}`
+   481→      const total = chunks.length
+   482→
+   483→      for (let i = 0; i < chunks.length; i++) {
+   484→        const partNum = i + 1
+   485→        const body = `<div><strong>${subject}</strong> [${partNum}/${total}]<br/>` +
+   486→          `<em>Backup dos dados de conexão e conversas — não editar.</em>` +
+   487→          `<pre style="font-size:10px; white-space:pre-wrap; word-break:break-all;">${escapeHtml(chunks[i])}</pre></div>`
+   488→        try {
+   489→          await this.odooPostMessage('res.partner', backupPartnerId, body)
+   490→        } catch (err) {
+   491→          console.error(`[Backup:${this.userId}] Chunk ${partNum}/${total} failed:`, err.message)
+   492→          return { success: false, chunksPosted: i, partnerId: backupPartnerId, error: err.message }
+   493→        }
+   494→      }
+   495→
+   496→      console.log(`[Backup:${this.userId}] ✓ Posted ${total} chunk(s) to partner ${backupPartnerId}`)
+   497→      return { success: true, chunksPosted: total, partnerId: backupPartnerId }
+   498→    } catch (err) {
+   499→      console.error(`[Backup:${this.userId}] Error:`, err.message)
+   500→      return { success: false, chunksPosted: 0, error: err.message }
+   501→    }
+   502→  }
+   503→
+   504→  // ------------------------------------------------------------------
+   505→  // Persistence — conversations/contacts/messages to per-user JSON file
+   506→  // ------------------------------------------------------------------
+   507→
+   508→  persistConversationsToDisk() {
+   509→    try {
+   510→      const snapshot = {
+   511→        version: 1,
+   512→        userId: this.userId,
+   513→        savedAt: new Date().toISOString(),
+   514→        conversations: Array.from(this.conversations.values()).map(c => ({
+   515→          jid: c.jid,
+   516→          name: c.name,
+   517→          phone: c.phone,
+   518→          pushName: c.pushName,
+   519→          avatarUrl: c.avatarUrl,
+   520→          lastMessage: c.lastMessage,
+   521→          lastMessageAt: c.lastMessageAt ? c.lastMessageAt.toISOString() : null,
+   522→          unreadCount: c.unreadCount,
+   523→          messages: c.messages.map(m => ({
+   524→            ...m,
+   525→            timestamp: m.timestamp instanceof Date ? m.timestamp.toISOString() : m.timestamp,
+   526→          })),
+   527→        })),
+   528→        contactNames: Array.from(this.contactNames.entries()),
+   529→        deviceContacts: Array.from(this.deviceContacts.values()),
+   530→        lidToPhoneMap: Array.from(this.lidToPhoneMap.entries()),
+   531→      }
+   532→      fs.writeFileSync(this.stateFile, JSON.stringify(snapshot), 'utf8')
+   533→      console.log(`[UserSession:${this.userId}] Persisted ${snapshot.conversations.length} conversations to disk`)
+   534→    } catch (err) {
+   535→      console.error(`[UserSession:${this.userId}] Failed to persist conversations: ${err.message}`)
+   536→    }
+   537→  }
+   538→
+   539→  loadConversationsFromDisk() {
+   540→    try {
+   541→      if (!fs.existsSync(this.stateFile)) {
+   542→        console.log(`[UserSession:${this.userId}] No saved conversation state — starting fresh`)
+   543→        return
+   544→      }
+   545→      const raw = fs.readFileSync(this.stateFile, 'utf8')
+   546→      const snapshot = JSON.parse(raw)
+   547→      if (!snapshot || snapshot.version !== 1) {
+   548→        console.log(`[UserSession:${this.userId}] Saved conversation state is old format — ignoring`)
+   549→        return
+   550→      }
+   551→
+   552→      let loaded = 0
+   553→      for (const c of snapshot.conversations || []) {
+   554→        if (!c.jid || !isValidPhoneJid(c.jid)) continue
+   555→        this.conversations.set(c.jid, {
+   556→          jid: c.jid,
+   557→          name: c.name || null,
+   558→          phone: c.phone || extractPhone(c.jid),
+   559→          pushName: c.pushName || null,
+   560→          avatarUrl: c.avatarUrl || null,
+   561→          lastMessage: c.lastMessage || null,
+   562→          lastMessageAt: c.lastMessageAt ? new Date(c.lastMessageAt) : null,
+   563→          unreadCount: c.unreadCount || 0,
+   564→          messages: (c.messages || []).map(m => ({
+   565→            ...m,
+   566→            timestamp: m.timestamp ? new Date(m.timestamp) : new Date(),
+   567→          })),
+   568→        })
+   569→        loaded++
+   570→      }
+   571→
+   572→      for (const [jid, name] of snapshot.contactNames || []) {
+   573→        this.contactNames.set(jid, name)
+   574→      }
+   575→      for (const c of snapshot.deviceContacts || []) {
+   576→        if (c.jid) this.deviceContacts.set(c.jid, c)
+   577→      }
+   578→      for (const [lid, phone] of snapshot.lidToPhoneMap || []) {
+   579→        this.lidToPhoneMap.set(lid, phone)
+   580→      }
+   581→
+   582→      console.log(`[UserSession:${this.userId}] ✓ Loaded ${loaded} conversations, ${this.contactNames.size} contact names, ${this.deviceContacts.size} device contacts (saved ${snapshot.savedAt})`)
+   583→    } catch (err) {
+   584→      console.error(`[UserSession:${this.userId}] Failed to load conversations from disk: ${err.message}`)
+   585→    }
+   586→  }
+   587→
+   588→  // ------------------------------------------------------------------
+   589→  // Conversation helpers
+   590→  // ------------------------------------------------------------------
+   591→
+   592→  getOrCreateConversation(jid, pushName) {
+   593→    const normalizedJid = normalizeJid(jid)
+   594→    if (!normalizedJid) return null
+   595→    const cachedName = this.contactNames.get(normalizedJid) || null
+   596→    const phone = extractPhone(normalizedJid)
+   597→
+   598→    if (!this.conversations.has(normalizedJid)) {
+   599→      this.conversations.set(normalizedJid, {
+   600→        jid: normalizedJid,
+   601→        name: cachedName || pushName || null,
+   602→        phone,
+   603→        pushName: pushName || null,
+   604→        avatarUrl: null,
+   605→        lastMessage: null,
+   606→        lastMessageAt: new Date(),
+   607→        unreadCount: 0,
+   608→        messages: [],
+   609→      })
+   610→    }
+   611→    const conv = this.conversations.get(normalizedJid)
+   612→    if (cachedName) {
+   613→      conv.name = cachedName
+   614→    } else if (pushName && !conv.name) {
+   615→      conv.pushName = pushName
+   616→    }
+   617→
+   618→    // Also track in deviceContacts phonebook
+   619→    const displayName = cachedName || pushName || phone
+   620→    if (phone) {
+   621→      if (!this.deviceContacts.has(normalizedJid)) {
+   622→        this.deviceContacts.set(normalizedJid, { jid: normalizedJid, phone, name: displayName, avatarUrl: null })
+   623→      } else if (cachedName) {
+   624→        this.deviceContacts.get(normalizedJid).name = cachedName
+   625→      }
+   626→    }
+   627→
+   628→    return conv
+   629→  }
+   630→
+   631→  serializeConversation(conv) {
+   632→    if (!conv) return null
+   633→    return {
+   634→      jid: conv.jid,
+   635→      name: conv.name,
+   636→      phone: conv.phone,
+   637→      pushName: conv.pushName,
+   638→      avatarUrl: conv.avatarUrl,
+   639→      lastMessage: conv.lastMessage,
+   640→      lastMessageAt: conv.lastMessageAt ? conv.lastMessageAt.toISOString() : null,
+   641→      unreadCount: conv.unreadCount,
+   642→      messageCount: conv.messages.length,
+   643→    }
+   644→  }
+   645→
+   646→  getSortedConversations() {
+   647→    // v7.20: Conversas tab shows BOTH actual conversations AND device contacts
+   648→    // that don't have a conversation yet. Unified list.
+   649→    const conversationJids = new Set(this.conversations.keys())
+   650→    const deviceContactEntries = []
+   651→    for (const contact of this.deviceContacts.values()) {
+   652→      if (conversationJids.has(contact.jid)) continue
+   653→      deviceContactEntries.push({
+   654→        jid: contact.jid,
+   655→        name: contact.name,
+   656→        phone: contact.phone,
+   657→        pushName: null,
+   658→        avatarUrl: contact.avatarUrl || null,
+   659→        lastMessage: null,
+   660→        lastMessageAt: null,
+   661→        unreadCount: 0,
+   662→        messageCount: 0,
+   663→        _isDeviceContact: true,
+   664→      })
+   665→    }
+   666→
+   667→    return Array.from(this.conversations.values())
+   668→      .filter(conv => isValidPhoneJid(conv.jid))
+   669→      .map(c => this.serializeConversation(c))
+   670→      .filter(Boolean)
+   671→      .concat(deviceContactEntries)
+   672→      .sort((a, b) => {
+   673→        const tA = a.lastMessageAt ? new Date(a.lastMessageAt).getTime() : 0
+   674→        const tB = b.lastMessageAt ? new Date(b.lastMessageAt).getTime() : 0
+   675→        if (tA === 0 && tB === 0) {
+   676→          return (a.name || a.phone || '').localeCompare(b.name || b.phone || '')
+   677→        }
+   678→        return tB - tA
+   679→      })
+   680→  }
+   681→
+   682→  updateConversationName(jid, contactName) {
+   683→    const normalizedJid = normalizeJid(jid)
+   684→    if (!normalizedJid) return
+   685→    this.contactNames.set(normalizedJid, contactName)
+   686→    const phone = extractPhone(normalizedJid)
+   687→    const existing = this.deviceContacts.get(normalizedJid)
+   688→    if (existing) {
+   689→      existing.name = contactName
+   690→    } else if (phone) {
+   691→      this.deviceContacts.set(normalizedJid, { jid: normalizedJid, phone, name: contactName, avatarUrl: null })
+   692→    }
+   693→    const conv = this.conversations.get(normalizedJid)
+   694→    if (conv) conv.name = contactName
+   695→  }
+   696→
+   697→  getDeviceContactsList() {
+   698→    return Array.from(this.deviceContacts.values())
+   699→      .sort((a, b) => (a.name || '').localeCompare(b.name || ''))
+   700→  }
+   701→
+   702→  // ------------------------------------------------------------------
+   703→  // Odoo XML-RPC methods (all use this.odooConfig)
+   704→  // ------------------------------------------------------------------
+   705→
+   706→  makeXmlRpcClient(p) {
+   707→    const url = new URL(this.odooConfig.url)
+   708→    const isHttps = url.protocol === 'https:'
+   709→    const options = {
+   710→      host: url.hostname,
+   711→      port: parseInt(url.port) || (isHttps ? 443 : 80),
+   712→      path: p,
+   713→    }
+   714→    return isHttps ? createSecureClient(options) : createClient(options)
+   715→  }
+   716→
+   717→  odooAuthenticate() {
+   718→    return new Promise((resolve, reject) => {
+   719→      // v7.29.2: 30s timeout on auth — same reasoning as odooExecuteKw
+   720→      let settled = false
+   721→      const timer = setTimeout(() => {
+   722→        if (settled) return
+   723→        settled = true
+   724→        reject(new Error('Odoo authenticate timeout after 30s'))
+   725→      }, 30_000)
+   726→      try {
+   727→        const client = this.makeXmlRpcClient('/xmlrpc/2/common')
+   728→        client.methodCall('authenticate', [this.odooConfig.db, this.odooConfig.username, this.odooConfig.password, {}], (error, value) => {
+   729→          if (settled) return
+   730→          settled = true
+   731→          clearTimeout(timer)
+   732→          if (error) reject(error)
+   733→          else if (!value) reject(new Error('Authentication failed - invalid credentials'))
+   734→          else resolve(value)
+   735→        })
+   736→      } catch (err) {
+   737→        if (settled) return
+   738→        settled = true
+   739→        clearTimeout(timer)
+   740→        reject(err)
+   741→      }
+   742→    })
+   743→  }
+   744→
+   745→  odooExecuteKw(model, method, args, kwargs = {}) {
+   746→    return new Promise((resolve, reject) => {
+   747→      if (!this.odooConfig.uid) {
+   748→        reject(new Error('Not authenticated with Odoo'))
+   749→        return
+   750→      }
+   751→      // v7.29.2: Add 30s timeout. Without this, if Odoo hangs (network
+   752→      // glitch, server slow), the Promise never resolves and the calling
+   753→      // code stays blocked forever — which blocks the WA message handler
+   754→      // and the user perceives it as "the page fell".
+   755→      let settled = false
+   756→      const timer = setTimeout(() => {
+   757→        if (settled) return
+   758→        settled = true
+   759→        reject(new Error(`Odoo ${model}.${method} timeout after 30s`))
+   760→      }, 30_000)
+   761→      try {
+   762→        const client = this.makeXmlRpcClient('/xmlrpc/2/object')
+   763→        client.methodCall('execute_kw', [this.odooConfig.db, this.odooConfig.uid, this.odooConfig.password, model, method, args, kwargs], (error, value) => {
+   764→          if (settled) return
+   765→          settled = true
+   766→          clearTimeout(timer)
+   767→          if (error) reject(error)
+   768→          else resolve(value)
+   769→        })
+   770→      } catch (err) {
+   771→        if (settled) return
+   772→        settled = true
+   773→        clearTimeout(timer)
+   774→        reject(err)
+   775→      }
+   776→    })
+   777→  }
+   778→
+   779→  async getAvailableFields(model) {
+   780→    if (this.modelFieldsCache.has(model)) return this.modelFieldsCache.get(model)
+   781→    try {
+   782→      const fields = await this.odooExecuteKw(model, 'fields_get', [], { attributes: ['string', 'type'] })
+   783→      const fieldNames = new Set(Object.keys(fields))
+   784→      this.modelFieldsCache.set(model, fieldNames)
+   785→      console.log(`[Odoo:${this.userId}] Model ${model} has ${fieldNames.size} fields`)
+   786→      return fieldNames
+   787→    } catch (error) {
+   788→      console.error(`[Odoo:${this.userId}] Failed to get fields for ${model}:`, error.message)
+   789→      return new Set()
+   790→    }
+   791→  }
+   792→
+   793→  async filterExistingFields(model, requestedFields) {
+   794→    const available = await this.getAvailableFields(model)
+   795→    const existing = requestedFields.filter(f => available.has(f))
+   796→    if (!existing.includes('id') && available.has('id')) existing.unshift('id')
+   797→    if (!existing.includes('name') && available.has('name')) existing.push('name')
+   798→    return existing
+   799→  }
+   800→
+   801→  async buildSafeValues(model, values) {
+   802→    const available = await this.getAvailableFields(model)
+   803→    const safe = {}
+   804→    for (const [key, value] of Object.entries(values)) {
+   805→      if (available.has(key)) safe[key] = value
+   806→    }
+   807→    return safe
+   808→  }
+   809→
+   810→  async odooSearch(model, domain, fields = [], limit = 80, offset = 0) {
+   811→    const safeFields = fields.length > 0 ? await this.filterExistingFields(model, fields) : []
+   812→    return this.odooExecuteKw(model, 'search_read', [domain], {
+   813→      fields: safeFields.length > 0 ? safeFields : undefined,
+   814→      limit,
+   815→      offset,
+   816→    })
+   817→  }
+   818→
+   819→  // v7.20: Build a phone-number search domain that ONLY uses fields the model has
+   820→  async buildPhoneSearchDomain(model, phone, candidateFields = ['phone', 'mobile', 'whatsapp', 'whatsapp_number']) {
+   821→    if (!phone) return []
+   822→    const available = await this.getAvailableFields(model)
+   823→    const usable = candidateFields.filter(f => available.has(f))
+   824→    if (usable.length === 0) {
+   825→      return [['name', 'ilike', phone]]
+   826→    }
+   827→    if (usable.length === 1) {
+   828→      return [[usable[0], 'ilike', phone]]
+   829→    }
+   830→    const domain = []
+   831→    for (let i = 0; i < usable.length - 1; i++) domain.push('|')
+   832→    for (const f of usable) domain.push([f, 'ilike', phone])
+   833→    return domain
+   834→  }
+   835→
+   836→  async odooRead(model, ids, fields = []) {
+   837→    const safeFields = fields.length > 0 ? await this.filterExistingFields(model, fields) : []
+   838→    return this.odooExecuteKw(model, 'read', [ids], {
+   839→      fields: safeFields.length > 0 ? safeFields : undefined,
+   840→    })
+   841→  }
+   842→
+   843→  async odooCreate(model, values) {
+   844→    const safeValues = await this.buildSafeValues(model, values)
+   845→    return this.odooExecuteKw(model, 'create', [safeValues])
+   846→  }
+   847→
+   848→  async odooWrite(model, ids, values) {
+   849→    const safeValues = await this.buildSafeValues(model, values)
+   850→    return this.odooExecuteKw(model, 'write', [ids, safeValues])
+   851→  }
+   852→
+   853→  async odooSearchOrCreate(model, domain, values) {
+   854→    const existing = await this.odooExecuteKw(model, 'search', [domain], { limit: 1 })
+   855→    if (existing && existing.length > 0) {
+   856→      const safeValues = await this.buildSafeValues(model, values)
+   857→      await this.odooWrite(model, existing, safeValues)
+   858→      return { id: existing[0], created: false }
+   859→    }
+   860→    const safeValues = await this.buildSafeValues(model, values)
+   861→    const newId = await this.odooCreate(model, safeValues)
+   862→    return { id: newId, created: true }
+   863→  }
+   864→
+   865→  async odooPostMessage(model, recordId, message) {
+   866→    return this.odooExecuteKw(model, 'message_post', [recordId], {
+   867→      body: message,
+   868→      message_type: 'comment',
+   869→      subtype_xmlid: 'mail.mt_comment',
+   870→    })
+   871→  }
+   872→
+   873→  // v7.24 (R7): Post a message to Odoo chatter WITH media attachments.
+   874→  // Uploads the media as an ir.attachment (base64), then includes it in
+   875→  // the mail.message via attachment_ids. The body also gets a media
+   876→  // indicator line (🎙️ Áudio / 🖼️ Imagem / 📄 Documento / 🎬 Vídeo).
+   877→  // Emojis in the text content are preserved (UTF-8 is native to XML-RPC).
+   878→  //
+   879→  // mediaOpts: { mediaBase64, mimeType, fileName, mediaType } | null
+   880→  // Returns: { mailMessageId, attachmentIds }
+   881→  async odooPostMessageWithMedia(model, recordId, body, mediaOpts = null) {
+   882→    const attachmentIds = []
+   883→
+   884→    if (mediaOpts && mediaOpts.mediaBase64 && mediaOpts.mimeType) {
+   885→      try {
+   886→        const safeName = mediaOpts.fileName || `midia-${Date.now()}`
+   887→        const attachmentId = await this.odooExecuteKw('ir.attachment', 'create', [{
+   888→          name: safeName,
+   889→          datas: mediaOpts.mediaBase64,
+   890→          mimetype: mediaOpts.mimeType,
+   891→          res_model: model,
+   892→          res_id: recordId,
+   893→        }])
+   894→        if (attachmentId) {
+   895→          attachmentIds.push(attachmentId)
+   896→          console.log(`[Odoo:${this.userId}] ✓ Attachment uploaded: ${safeName} (id=${attachmentId})`)
+   897→        }
+   898→      } catch (err) {
+   899→        console.error(`[Odoo:${this.userId}] Attachment create failed:`, err.message)
+   900→      }
+   901→    }
+   902→
+   903→    // Build the mail.message payload. attachment_ids uses the Odoo
+   904→    // command tuple [6, 0, ids] = "replace the list with these ids".
+   905→    const kwargs = {
+   906→      body,
+   907→      message_type: 'comment',
+   908→      subtype_xmlid: 'mail.mt_comment',
+   909→    }
+   910→    if (attachmentIds.length > 0) {
+   911→      kwargs.attachment_ids = [[6, 0, attachmentIds]]
+   912→    }
+   913→
+   914→    const mailMessageId = await this.odooExecuteKw(model, 'message_post', [recordId], kwargs)
+   915→    return { mailMessageId, attachmentIds }
+   916→  }
+   917→
+   918→  // v7.24 (R7): Build the chatter body for a WhatsApp message that may
+   919→  // include media. Preserves emojis in the text content (no HTML escape
+   920→  // of UTF-8 emoji characters — only escapes HTML metacharacters).
+   921→  buildChatterBody(direction, timestamp, textContent, mediaOpts = null) {
+   922→    const tsLabel = new Date(timestamp).toLocaleString('pt-BR')
+   923→    let mediaLine = ''
+   924→    if (mediaOpts) {
+   925→      const t = mediaOpts.mediaType
+   926→      if (t === 'audio') mediaLine = '🎙️ Áudio<br/>'
+   927→      else if (t === 'image') mediaLine = '🖼️ Imagem<br/>'
+   928→      else if (t === 'document') mediaLine = `📄 ${escapeHtml(mediaOpts.fileName || 'Documento')}<br/>`
+   929→      else if (t === 'video') mediaLine = '🎬 Vídeo<br/>'
+   930→      else if (t === 'sticker') mediaLine = '🏷️ Sticker<br/>'
+   931→    }
+   932→    const textHtml = textContent ? `<span>${escapeHtml(textContent)}</span>` : ''
+   933→    return `<div><strong>📱 WhatsApp ${direction}:</strong> ${tsLabel}<br/>${mediaLine}${textHtml}</div>`
+   934→  }
+   935→
+   936→  async findWhatsAppActivityType() {
+   937→    try {
+   938→      const types = await this.odooExecuteKw('mail.activity.type', 'search_read', [[['name', 'ilike', 'WhatsApp']]], { fields: ['id', 'name'], limit: 1 })
+   939→      if (types && types.length > 0) return types[0].id
+   940→    } catch {}
+   941→    return null
+   942→  }
+   943→
+   944→  async odooCreateActivity(model, recordId, summary, note) {
+   945→    try {
+   946→      const activityTypeId = await this.findWhatsAppActivityType()
+   947→      const values = {
+   948→        res_model: model,
+   949→        res_id: recordId,
+   950→        summary,
+   951→        note,
+   952→        activity_type_id: activityTypeId || 1,
+   953→      }
+   954→      if (this.autoSyncSettings.leadUserId) values.user_id = this.autoSyncSettings.leadUserId
+   955→      return await this.odooExecuteKw('mail.activity', 'create', [values])
+   956→    } catch (error) {
+   957→      console.error(`[Odoo:${this.userId}] Failed to create activity:`, error.message)
+   958→      return 0
+   959→    }
+   960→  }
+   961→
+   962→  async autoSyncWhatsAppMessage(data) {
+   963→    const result = {
+   964→      partnerId: null, leadId: null, mailMessageId: null, activityId: null,
+   965→      created: { partner: false, lead: false }, errors: [],
+   966→      chatterPosted: false, chatterLeadPosted: false,
+   967→    }
+   968→
+   969→    if (!this.autoSyncSettings.enabled) {
+   970→      console.log(`[AutoSync:${this.userId}] SKIP — autoSyncSettings.enabled is false`)
+   971→      return result
+   972→    }
+   973→    if (!this.odooConfig.uid) {
+   974→      console.log(`[AutoSync:${this.userId}] SKIP — Odoo not authenticated (uid is null)`)
+   975→      return result
+   976→    }
+   977→
+   978→    // Dedup by whatsappId (or fallback id) — never post the same message twice
+   979→    const dedupKey = data.dedupId
+   980→      ? `${data.jid}|${data.dedupId}`
+   981→      : `${data.jid}|${data.fromMe ? 'out' : 'in'}|${data.timestamp}|${(data.textContent || '').slice(0, 50)}`
+   982→    if (this.postedChatterIds.has(dedupKey)) {
+   983→      console.log(`[AutoSync:${this.userId}] Skipping — already posted to chatter: ${dedupKey}`)
+   984→      return result
+   985→    }
+   986→
+   987→    console.log(`[AutoSync:${this.userId}] Processing message from ${data.phone} (fromMe=${data.fromMe}, autoCreateLead=${this.autoSyncSettings.autoCreateLead})`)
+   988→
+   989→    try {
+   990→      // ===== Step 1: Always ensure partner exists (for both sent AND received) =====
+   991→      if (this.autoSyncSettings.autoCreateContact) {
+   992→        const contactName = data.pushName || `WhatsApp ${data.phone}`
+   993→        const partnerFields = await this.getAvailableFields('res.partner')
+   994→        const domain = await this.buildPhoneSearchDomain('res.partner', data.phone)
+   995→
+   996→        const contactValues = { name: contactName, phone: data.phone }
+   997→        if (partnerFields.has('mobile')) contactValues.mobile = data.phone
+   998→        if (partnerFields.has('whatsapp')) contactValues.whatsapp = data.phone
+   999→        if (partnerFields.has('whatsapp_number')) contactValues.whatsapp_number = data.phone
+  1000→
+  1001→        const partnerResult = await this.odooSearchOrCreate('res.partner', domain, contactValues)
+  1002→        result.partnerId = partnerResult.id
+  1003→        result.created.partner = partnerResult.created
+  1004→
+  1005→        const cached = this.phoneToPartnerCache.get(data.phone)
+  1006→        if (cached) cached.partnerId = partnerResult.id
+  1007→        else this.phoneToPartnerCache.set(data.phone, { partnerId: partnerResult.id, leadId: null, leadCreated: false })
+  1008→      }
+  1009→
+  1010→      // ===== Step 2: For INCOMING messages, ensure a lead exists =====
+  1011→      if (this.autoSyncSettings.autoCreateLead && !data.fromMe && result.partnerId) {
+  1012→        const cached = this.phoneToPartnerCache.get(data.phone)
+  1013→        if (cached && cached.leadId && cached.leadCreated) {
+  1014→          result.leadId = cached.leadId
+  1015→          console.log(`[AutoSync:${this.userId}] Lead reused from cache: crm.lead#${result.leadId}`)
+  1016→        } else {
+  1017→          const existingLeads = await this.odooSearch('crm.lead', [
+  1018→            ['partner_id', '=', result.partnerId],
+  1019→            ['type', '=', 'lead'],
+  1020→            ['active', '=', true],
+  1021→          ], ['id', 'name', 'stage_id'], 1)
+  1022→
+  1023→          if (existingLeads && existingLeads.length > 0) {
+  1024→            result.leadId = existingLeads[0].id
+  1025→            if (cached) { cached.leadId = existingLeads[0].id; cached.leadCreated = true }
+  1026→            else this.phoneToPartnerCache.set(data.phone, { partnerId: result.partnerId, leadId: existingLeads[0].id, leadCreated: true })
+  1027→            console.log(`[AutoSync:${this.userId}] Lead reused from Odoo search: crm.lead#${result.leadId}`)
+  1028→          } else {
+  1029→            const leadName = `${this.autoSyncSettings.leadPrefix}${data.pushName || data.phone}`
+  1030→            const leadValues = {
+  1031→              name: leadName, type: 'lead', partner_id: result.partnerId, phone: data.phone,
+  1032→              description: `Conversa iniciada via WhatsApp em ${new Date().toLocaleString('pt-BR')}`,
+  1033→            }
+  1034→            const leadFields = await this.getAvailableFields('crm.lead')
+  1035→            if (leadFields.has('whatsapp_number')) leadValues.whatsapp_number = data.phone
+  1036→            if (this.autoSyncSettings.leadTeamId) leadValues.team_id = this.autoSyncSettings.leadTeamId
+  1037→            if (this.autoSyncSettings.leadUserId) leadValues.user_id = this.autoSyncSettings.leadUserId
+  1038→
+  1039→            try {
+  1040→              result.leadId = await this.odooCreate('crm.lead', leadValues)
+  1041→              result.created.lead = true
+  1042→              if (cached) { cached.leadId = result.leadId; cached.leadCreated = true }
+  1043→              else this.phoneToPartnerCache.set(data.phone, { partnerId: result.partnerId, leadId: result.leadId, leadCreated: true })
+  1044→              console.log(`[AutoSync:${this.userId}] ✓ NEW Lead created: crm.lead#${result.leadId}`)
+  1045→            } catch (error) {
+  1046→              console.error(`[AutoSync:${this.userId}] ✗ Lead creation FAILED: ${error.message}`)
+  1047→              result.errors.push(`Lead creation failed: ${error.message}`)
+  1048→            }
+  1049→          }
+  1050→        }
+  1051→      } else if (this.autoSyncSettings.autoCreateLead && data.fromMe) {
+  1052→        console.log(`[AutoSync:${this.userId}] Lead creation skipped — outgoing message`)
+  1053→      }
+  1054→
+  1055→      // ===== Step 2.5: For OUTGOING messages, find an active lead by phone =====
+  1056→      if (data.fromMe && result.partnerId) {
+  1057→        let cachedLeadId = this.phoneToActiveLeadCache.get(data.phone)
+  1058→        if (!cachedLeadId) {
+  1059→          const cached = this.phoneToPartnerCache.get(data.phone)
+  1060→          if (cached && cached.leadId && cached.leadCreated) {
+  1061→            cachedLeadId = cached.leadId
+  1062→          } else {
+  1063→            const existingLeads = await this.odooSearch('crm.lead', [
+  1064→              ['partner_id', '=', result.partnerId],
+  1065→              ['type', '=', 'lead'],
+  1066→              ['active', '=', true],
+  1067→            ], ['id'], 1)
+  1068→            if (existingLeads && existingLeads.length > 0) {
+  1069→              cachedLeadId = existingLeads[0].id
+  1070→              if (cached) { cached.leadId = cachedLeadId; cached.leadCreated = true }
+  1071→            }
+  1072→          }
+  1073→          if (cachedLeadId) {
+  1074→            this.phoneToActiveLeadCache.set(data.phone, cachedLeadId)
+  1075→            result.leadId = cachedLeadId
+  1076→          }
+  1077→        } else {
+  1078→          result.leadId = cachedLeadId
+  1079→        }
+  1080→      }
+  1081→
+  1082→      // ===== Step 3: ALWAYS post to chatter (incoming AND outgoing) =====
+  1083→      if (this.autoSyncSettings.autoPostMessages && result.partnerId) {
+  1084→        const direction = data.fromMe ? 'Enviada' : 'Recebida'
+  1085→
+  1086→        // v7.24 (R7): Build the chatter body via the shared helper, which
+  1087→        // includes a media indicator line (🎙️/🖼️/📄/🎬) when media is
+  1088→        // present and preserves emoji characters in the text content.
+  1089→        const mediaOpts = (data.mediaBase64 && data.mimeType)
+  1090→          ? { mediaBase64: data.mediaBase64, mimeType: data.mimeType, fileName: data.fileName, mediaType: data.mediaType }
+  1091→          : (data.mediaType ? { mediaType: data.mediaType, fileName: data.fileName } : null)
+  1092→        const msgBody = this.buildChatterBody(direction, data.timestamp, data.textContent, mediaOpts)
+  1093→
+  1094→        try {
+  1095→          // v7.24 (R7): Use the media-aware post method when we have base64
+  1096→          // data — it will upload the media as an ir.attachment and link it
+  1097→          // to the mail.message. Falls back to plain text post otherwise.
+  1098→          if (data.mediaBase64 && data.mimeType) {
+  1099→            const r = await this.odooPostMessageWithMedia('res.partner', result.partnerId, msgBody, mediaOpts)
+  1100→            result.mailMessageId = r.mailMessageId
+  1101→          } else {
+  1102→            result.mailMessageId = await this.odooPostMessage('res.partner', result.partnerId, msgBody)
+  1103→          }
+  1104→          result.chatterPosted = true
+  1105→          console.log(`[AutoSync:${this.userId}] ✓ Posted to partner ${result.partnerId} chatter: ${direction}${data.mediaBase64 ? ' (with media)' : ''}`)
+  1106→        } catch (error) {
+  1107→          result.errors.push(`Failed to post to partner chatter: ${error.message}`)
+  1108→        }
+  1109→
+  1110→        if (result.leadId) {
+  1111→          try {
+  1112→            if (data.mediaBase64 && data.mimeType) {
+  1113→              await this.odooPostMessageWithMedia('crm.lead', result.leadId, msgBody, mediaOpts)
+  1114→            } else {
+  1115→              await this.odooPostMessage('crm.lead', result.leadId, msgBody)
+  1116→            }
+  1117→            result.chatterLeadPosted = true
+  1118→            console.log(`[AutoSync:${this.userId}] ✓ Posted to lead ${result.leadId} chatter: ${direction}${data.mediaBase64 ? ' (with media)' : ''}`)
+  1119→          } catch (error) {
+  1120→            result.errors.push(`Failed to post to lead chatter: ${error.message}`)
+  1121→          }
+  1122→        }
+  1123→      }
+  1124→
+  1125→      // ===== Step 4: Create activity ONLY for new leads =====
+  1126→      if (this.autoSyncSettings.autoCreateActivity && result.created.lead && result.leadId) {
+  1127→        try {
+  1128→          result.activityId = await this.odooCreateActivity('crm.lead', result.leadId, 'Nova mensagem WhatsApp', `Contato ${data.pushName || data.phone} iniciou uma conversa via WhatsApp.\n\nMensagem: ${data.textContent || '[Mídia]'}`)
+  1129→        } catch (error) {
+  1130→          result.errors.push(`Failed to create activity: ${error.message}`)
+  1131→        }
+  1132→      }
+  1133→
+  1134→      // ===== Step 5: Mark this message as posted (for dedup) =====
+  1135→      if (result.chatterPosted || result.chatterLeadPosted) {
+  1136→        this.postedChatterIds.add(dedupKey)
+  1137→        if (this.postedChatterIds.size > 5000) {
+  1138→          const firstKey = this.postedChatterIds.values().next().value
+  1139→          this.postedChatterIds.delete(firstKey)
+  1140→        }
+  1141→      }
+  1142→    } catch (error) {
+  1143→      result.errors.push(`Auto-sync error: ${error.message}`)
+  1144→      console.error(`[AutoSync:${this.userId}] Error:`, error.message)
+  1145→    }
+  1146→
+  1147→    return result
+  1148→  }
+  1149→
+  1150→  // v7.23: Renamed from autoAuthenticateFromEnv. Reads from this.odooConfig
+  1151→  // (already populated from the user record / global OdooConfig in loadOdooConfig).
+  1152→  // Same retry logic: 3 attempts with 5s delay, then a 60s background retry loop.
+  1153→  async startOdooAutoAuth() {
+  1154→    if (!this.odooConfig.url || !this.odooConfig.db || !this.odooConfig.username || !this.odooConfig.password) {
+  1155→      console.log(`[Odoo:${this.userId}] No Odoo config — skipping auto-auth`)
+  1156→      return
+  1157→    }
+  1158→    console.log(`[Odoo:${this.userId}] Auto-authenticating: ${this.odooConfig.url} / ${this.odooConfig.db} / ${this.odooConfig.username}`)
+  1159→
+  1160→    for (let attempt = 1; attempt <= 3; attempt++) {
+  1161→      try {
+  1162→        if (attempt === 1) {
+  1163→          this.modelFieldsCache.clear()
+  1164→          this.phoneToPartnerCache.clear()
+  1165→        }
+  1166→        const uid = await this.odooAuthenticate()
+  1167→        this.odooConfig.uid = uid
+  1168→        console.log(`[Odoo:${this.userId}] Auto-authenticated as ${this.odooConfig.username} (uid: ${uid}) on attempt ${attempt}`)
+  1169→        await this.getAvailableFields('res.partner')
+  1170→        await this.getAvailableFields('crm.lead')
+  1171→        this.emitOdoo('odoo:status', {
+  1172→          connected: true, url: this.odooConfig.url, db: this.odooConfig.db, username: this.odooConfig.username,
+  1173→        })
+  1174→        // v7.21: If WhatsApp is already connected, pull conversation history from Odoo
+  1175→        if (this.waSocket && this.connectionState.connection === 'open') {
+  1176→          console.log(`[Odoo:${this.userId}] WA is connected — scheduling Odoo history sync in 3s`)
+  1177→          setTimeout(() => {
+  1178→            this.syncAllConversationsFromOdoo({ silent: false }).catch(err =>
+  1179→              console.error(`[Odoo:${this.userId}] Post-auth history sync failed:`, err.message)
+  1180→            )
+  1181→          }, 3000)
+  1182→        }
+  1183→        return
+  1184→      } catch (error) {
+  1185→        console.error(`[Odoo:${this.userId}] Auto-auth attempt ${attempt}/3 failed: ${error.message}`)
+  1186→        if (attempt < 3) {
+  1187→          await new Promise(r => setTimeout(r, 5000))
+  1188→        }
+  1189→      }
+  1190→    }
+  1191→    console.error(`[Odoo:${this.userId}] All auto-auth attempts failed. Background retry every 60s.`)
+  1192→    if (!this.odooReauthTimer) {
+  1193→      this.odooReauthTimer = setInterval(async () => {
+  1194→        if (this.odooConfig.uid) {
+  1195→          clearInterval(this.odooReauthTimer)
+  1196→          this.odooReauthTimer = null
+  1197→          return
+  1198→        }
+  1199→        console.log(`[Odoo:${this.userId}] Background re-auth attempt...`)
+  1200→        try {
+  1201→          const uid = await this.odooAuthenticate()
+  1202→          this.odooConfig.uid = uid
+  1203→          console.log(`[Odoo:${this.userId}] Background re-auth SUCCESS (uid: ${uid})`)
+  1204→          await this.getAvailableFields('res.partner')
+  1205→          await this.getAvailableFields('crm.lead')
+  1206→          this.emitOdoo('odoo:status', {
+  1207→            connected: true, url: this.odooConfig.url, db: this.odooConfig.db, username: this.odooConfig.username,
+  1208→          })
+  1209→          clearInterval(this.odooReauthTimer)
+  1210→          this.odooReauthTimer = null
+  1211→          if (this.waSocket && this.connectionState.connection === 'open') {
+  1212→            console.log(`[Odoo:${this.userId}] WA is connected — scheduling Odoo history sync in 3s (post re-auth)`)
+  1213→            setTimeout(() => {
+  1214→              this.syncAllConversationsFromOdoo({ silent: false }).catch(err =>
+  1215→                console.error(`[Odoo:${this.userId}] Post re-auth history sync failed:`, err.message)
+  1216→              )
+  1217→            }, 3000)
+  1218→          }
+  1219→        } catch (error) {
+  1220→          console.log(`[Odoo:${this.userId}] Background re-auth still failing: ${error.message}`)
+  1221→        }
+  1222→      }, 60_000)
+  1223→    }
+  1224→  }
+  1225→
+  1226→  // ------------------------------------------------------------------
+  1227→  // Odoo chatter pull / history sync
+  1228→  // ------------------------------------------------------------------
+  1229→
+  1230→  async pullOdooChatterIntoConversation(jid, model, recordId, limit = 200) {
+  1231→    if (!this.odooConfig.uid) return 0
+  1232→    if (!isValidPhoneJid(jid)) return 0
+  1233→    const conv = this.conversations.get(jid)
+  1234→    if (!conv) return 0
+  1235→
+  1236→    try {
+  1237→      const domain = [
+  1238→        ['model', '=', model],
+  1239→        ['res_id', '=', recordId],
+  1240→      ]
+  1241→      const messages = await this.odooExecuteKw('mail.message', 'search_read', [domain], {
+  1242→        fields: ['id', 'body', 'author_id', 'email_from', 'date', 'message_type', 'subtype_id', 'create_date'],
+  1243→        order: 'date asc',
+  1244→        limit,
+  1245→      })
+  1246→
+  1247→      let added = 0
+  1248→      for (const msg of (messages || [])) {
+  1249→        const body = msg.body || ''
+  1250→        // v7.28: Use parseChatterBody() to extract ONLY the user-visible
+  1251→        // text from the chatter body (the content inside <span>), instead
+  1252→        // of the whole stripped-HTML which included "📱 WhatsApp Enviada: ..."
+  1253→        // metadata prefixes that made messages look ugly in the chat view.
+  1254→        const parsed = parseChatterBody(body)
+  1255→        const fromMe = parsed.fromMe
+  1256→        const plainText = parsed.text
+  1257→
+  1258→        let timestamp = parsed.timestamp
+  1259→        if (!timestamp) timestamp = new Date(msg.date || msg.create_date || Date.now())
+  1260→
+  1261→        const externalId = `odoo-${msg.id}`
+  1262→        if (conv.messages.some(m => m.whatsappId === externalId)) continue
+  1263→        const isDup = conv.messages.some(m =>
+  1264→          m.fromMe === fromMe &&
+  1265→          m.textContent === plainText &&
+  1266→          Math.abs(m.timestamp.getTime() - timestamp.getTime()) < 5000
+  1267→        )
+  1268→        if (isDup) continue
+  1269→
+  1270→        conv.messages.push({
+  1271→          id: externalId,
+  1272→          whatsappId: externalId,
+  1273→          fromMe,
+  1274→          textContent: plainText || null,
+  1275→          mediaType: null,
+  1276→          timestamp,
+  1277→          status: 'delivered',
+  1278→        })
+  1279→        added++
+  1280→      }
+  1281→
+  1282→      if (added > 0) {
+  1283→        conv.messages.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime())
+  1284→        const last = conv.messages[conv.messages.length - 1]
+  1285→        if (!conv.lastMessageAt || last.timestamp > conv.lastMessageAt) {
+  1286→          conv.lastMessageAt = last.timestamp
+  1287→          if (last.textContent) conv.lastMessage = last.textContent
+  1288→        }
+  1289→      }
+  1290→      return added
+  1291→    } catch (err) {
+  1292→      console.error(`[Odoo:${this.userId}] Chatter pull failed for ${model}#${recordId}:`, err.message)
+  1293→      return 0
+  1294→    }
+  1295→  }
+  1296→
+  1297→  // v7.21: Pull ALL conversation history from Odoo chatter.
+  1298→  async syncAllConversationsFromOdoo(opts = {}) {
+  1299→    const { silent = false, limit = 1000 } = opts
+  1300→
+  1301→    if (!this.odooConfig.uid) {
+  1302→      if (!silent) console.log(`[OdooSync:${this.userId}] SKIP — Odoo not authenticated yet`)
+  1303→      return { skipped: true, reason: 'not_authenticated' }
+  1304→    }
+  1305→    if (this.odooHistorySyncInProgress) {
+  1306→      if (!silent) console.log(`[OdooSync:${this.userId}] SKIP — another sync is already running`)
+  1307→      return { skipped: true, reason: 'already_running' }
+  1308→    }
+  1309→
+  1310→    this.odooHistorySyncInProgress = true
+  1311→    const startedAt = Date.now()
+  1312→    this.emitWA('whatsapp:odoo-sync-progress', {
+  1313→      phase: 'starting', total: 0, processed: 0, added: 0, failed: 0,
+  1314→    })
+  1315→
+  1316→    try {
+  1317→      console.log(`[OdooSync:${this.userId}] Scanning mail.message for WhatsApp chatter (limit=${limit})...`)
+  1318→      const domain = [
+  1319→        ['model', '=', 'res.partner'],
+  1320→        ['body', 'ilike', 'WhatsApp'],
+  1321→      ]
+  1322→      const messages = await this.odooExecuteKw('mail.message', 'search_read', [domain], {
+  1323→        fields: ['id', 'res_id', 'body', 'date', 'create_date'],
+  1324→        order: 'date asc',
+  1325→        limit,
+  1326→      })
+  1327→
+  1328→      if (!messages || messages.length === 0) {
+  1329→        console.log(`[OdooSync:${this.userId}] No WhatsApp chatter messages found in Odoo`)
+  1330→        this.odooHistorySyncLastRun = { at: new Date().toISOString(), partnersProcessed: 0, messagesAdded: 0, partnersFailed: 0, durationMs: Date.now() - startedAt }
+  1331→        this.emitWA('whatsapp:odoo-sync-progress', {
+  1332→          phase: 'complete', total: 0, processed: 0, added: 0, failed: 0,
+  1333→        })
+  1334→        return { partnersProcessed: 0, messagesAdded: 0, partnersFailed: 0 }
+  1335→      }
+  1336→
+  1337→      const partnerIds = [...new Set(messages.map(m => m.res_id).filter(id => typeof id === 'number' && id > 0))]
+  1338→      console.log(`[OdooSync:${this.userId}] Found ${messages.length} chatter messages across ${partnerIds.length} partners`)
+  1339→
+  1340→      this.emitWA('whatsapp:odoo-sync-progress', {
+  1341→        phase: 'fetching_partners', total: partnerIds.length, processed: 0, added: 0, failed: 0,
+  1342→      })
+  1343→
+  1344→      const partnerFields = await this.getAvailableFields('res.partner')
+  1345→      const readFields = ['id', 'name']
+  1346→      if (partnerFields.has('phone')) readFields.push('phone')
+  1347→      if (partnerFields.has('mobile')) readFields.push('mobile')
+  1348→      if (partnerFields.has('whatsapp')) readFields.push('whatsapp')
+  1349→      if (partnerFields.has('whatsapp_number')) readFields.push('whatsapp_number')
+  1350→
+  1351→      const partners = await this.odooExecuteKw('res.partner', 'read', [partnerIds], { fields: readFields })
+  1352→      const partnerMap = new Map()
+  1353→      for (const p of (partners || [])) partnerMap.set(p.id, p)
+  1354→
+  1355→      let processed = 0
+  1356→      let totalAdded = 0
+  1357→      let failed = 0
+  1358→      for (const partnerId of partnerIds) {
+  1359→        const p = partnerMap.get(partnerId)
+  1360→        if (!p) { failed++; continue }
+  1361→
+  1362→        const phoneRaw = p.phone || p.mobile || p.whatsapp || p.whatsapp_number || ''
+  1363→        const phoneDigits = String(phoneRaw).replace(/\D/g, '')
+  1364→        if (phoneDigits.length < 7) {
+  1365→          console.log(`[OdooSync:${this.userId}] Partner ${partnerId} (${p.name || '?'}) has no valid phone — skipping`)
+  1366→          failed++
+  1367→          continue
+  1368→        }
+  1369→
+  1370→        const jid = `${phoneDigits}@s.whatsapp.net`
+  1371→        if (!isValidPhoneJid(jid)) {
+  1372→          console.log(`[OdooSync:${this.userId}] Partner ${partnerId} phone "${phoneRaw}" → invalid JID — skipping`)
+  1373→          failed++
+  1374→          continue
+  1375→        }
+  1376→
+  1377→        let conv = this.conversations.get(jid)
+  1378→        if (!conv) {
+  1379→          conv = this.getOrCreateConversation(jid, p.name || null)
+  1380→          if (conv && p.name && !this.contactNames.has(jid)) {
+  1381→            this.contactNames.set(jid, p.name)
+  1382→            conv.name = p.name
+  1383→          }
+  1384→        } else if (p.name && !conv.name) {
+  1385→          conv.name = p.name
+  1386→          if (!this.contactNames.has(jid)) this.contactNames.set(jid, p.name)
+  1387→        }
+  1388→
+  1389→        if (!conv) { failed++; continue }
+  1390→
+  1391→        try {
+  1392→          const added = await this.pullOdooChatterIntoConversation(jid, 'res.partner', partnerId, 500)
+  1393→          totalAdded += added
+  1394→          processed++
+  1395→          if (added > 0) {
+  1396→            console.log(`[OdooSync:${this.userId}] ✓ Partner ${partnerId} (${p.name || phoneDigits}): +${added} messages`)
+  1397→          }
+  1398→        } catch (err) {
+  1399→          console.error(`[OdooSync:${this.userId}] Partner ${partnerId} pull failed: ${err.message}`)
+  1400→          failed++
+  1401→        }
+  1402→
+  1403→        this.emitOdoo('odoo:conversation:linked', { jid, model: 'res.partner', recordId: partnerId })
+  1404→
+  1405→        await new Promise(r => setTimeout(r, 50))
+  1406→
+  1407→        if (processed % 5 === 0) {
+  1408→          this.emitWA('whatsapp:odoo-sync-progress', {
+  1409→            phase: 'processing', total: partnerIds.length, processed, added: totalAdded, failed,
+  1410→          })
+  1411→        }
+  1412→      }
+  1413→
+  1414→      for (const [, conv] of this.conversations) {
+  1415→        conv.messages.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime())
+  1416→      }
+  1417→
+  1418→      this.markDirty()
+  1419→      this.emitWA('whatsapp:conversations', this.getSortedConversations())
+  1420→      this.emitWA('whatsapp:odoo-sync-progress', {
+  1421→        phase: 'complete', total: partnerIds.length, processed, added: totalAdded, failed,
+  1422→      })
+  1423→
+  1424→      const durationMs = Date.now() - startedAt
+  1425→      this.odooHistorySyncLastRun = { at: new Date().toISOString(), partnersProcessed: processed, messagesAdded: totalAdded, partnersFailed: failed, durationMs }
+  1426→      console.log(`[OdooSync:${this.userId}] ✓ DONE in ${durationMs}ms — partners: ${processed}, messages added: ${totalAdded}, failed: ${failed}`)
+  1427→      return { partnersProcessed: processed, messagesAdded: totalAdded, partnersFailed: failed }
+  1428→    } catch (err) {
+  1429→      console.error(`[OdooSync:${this.userId}] FAILED:`, err.message)
+  1430→      this.emitWA('whatsapp:odoo-sync-progress', {
+  1431→        phase: 'error', error: err.message,
+  1432→      })
+  1433→      return { error: err.message }
+  1434→    } finally {
+  1435→      this.odooHistorySyncInProgress = false
+  1436→    }
+  1437→  }
+  1438→
+  1439→  // ------------------------------------------------------------------
+  1440→  // WhatsApp (Baileys) connection
+  1441→  // ------------------------------------------------------------------
+  1442→
+  1443→  async loadBaileys() {
+  1444→    if (!this._baileysModule) {
+  1445→      this._baileysModule = await import('@whiskeysockets/baileys')
+  1446→    }
+  1447→    return this._baileysModule
+  1448→  }
+  1449→
+  1450→  async connectWhatsApp() {
+  1451→    // v7.29: re-entrancy guard — never start a second Baileys socket while
+  1452→    // one is still connecting. Without this, the watchdog and the
+  1453→    // connection.update reconnect timer could overlap, producing multiple
+  1454→    // sockets that fight over the same auth state → disconnect/reconnect loop.
+  1455→    if (this.waConnecting) return
+  1456→    this.waConnecting = true
+  1457→    try {
+  1458→      await this._connectWhatsAppInner()
+  1459→    } finally {
+  1460→      this.waConnecting = false
+  1461→    }
+  1462→  }
+  1463→
+  1464→  // v7.29: schedule a single reconnect; reuses/cancels any pending timer so
+  1465→  // repeated triggers never stack duplicate attempts.
+  1466→  // v7.29.1: also clear any stale waSocket reference so the watchdog stops
+  1467→  // firing on a socket that's already being replaced.
+  1468→  scheduleReconnect(reason) {
+  1469→    if (this.waReconnectTimer) {
+  1470→      console.log(`[WA:${this.userId}] Reconnect already pending — ignoring '${reason}'`)
+  1471→      return
+  1472→    }
+  1473→    this.reconnectAttempts++
+  1474→    const delay = Math.min(2000 * Math.pow(2, this.reconnectAttempts - 1), 60000)
+  1475→    console.log(`[WA:${this.userId}] ${reason} — reconnect #${this.reconnectAttempts} in ${delay}ms`)
+  1476→    // v7.29.1: null out the old socket immediately so the watchdog and
+  1477→    // connection.update handler treat subsequent events as stale.
+  1478→    if (this.waSocket) {
+  1479→      try { this.waSocket.ev.removeAllListeners() } catch {}
+  1480→      try { this.waSocket.end(undefined) } catch {}
+  1481→      this.waSocket = null
+  1482→    }
+  1483→    this.waReconnectTimer = setTimeout(() => {
+  1484→      this.waReconnectTimer = null
+  1485→      this.connectWhatsApp().catch(err =>
+  1486→        console.error(`[WA:${this.userId}] reconnect error:`, err && err.message)
+  1487→      )
+  1488→    }, delay)
+  1489→  }
+  1490→
+  1491→  async _connectWhatsAppInner() {
+  1492→    const baileys = await this.loadBaileys()
+  1493→    const {
+  1494→      makeWASocket,
+  1495→      useMultiFileAuthState,
+  1496→      DisconnectReason,
+  1497→      fetchLatestBaileysVersion,
+  1498→      makeCacheableSignalKeyStore,
+  1499→      Browsers,
+  1500→    } = baileys
+  1501→    const { Boom } = await import('@hapi/boom')
+  1502→    const P = (await import('pino')).default
+  1503→    const logger = P({ level: 'silent' })
+  1504→
+  1505→    // v7.30: Use Firestore-backed auth state when available (persists
+  1506→    // across deploys even if disk is wiped). Auto-migrates existing
+  1507→    // filesystem state to Firestore on first read. Falls back to
+  1508→    // useMultiFileAuthState (filesystem) when Firestore isn't configured.
+  1509→    const { state, saveCreds, source: authSource } = await usePersistentAuthState(this.authFolder, this.userId)
+  1510→    console.log(`[WA:${this.userId}] Auth state source: ${authSource}, hasCreds=${!!state.creds}`)
+  1511→    const { version } = await fetchLatestBaileysVersion()
+  1512→
+  1513→    // v7.29.1: capture THIS socket instance so we can ignore stale events
+  1514→    // from any previous socket that hasn't fully closed yet. Without this,
+  1515→    // the old socket fires 'close' AFTER the new socket is already open,
+  1516→    // emitting whatsapp:status { reconnecting } → UI flicker loop.
+  1517→    const socketInstance = makeWASocket({
+  1518→      version,
+  1519→      logger,
+  1520→      auth: {
+  1521→        creds: state.creds,
+  1522→        keys: makeCacheableSignalKeyStore(state.keys, logger),
+  1523→      },
+  1524→      browser: Browsers.ubuntu('Chrome'),
+  1525→      printQRInTerminal: false,
+  1526→      connectTimeoutMs: 90_000,
+  1527→      defaultQueryTimeoutMs: 60_000,
+  1528→      // v7.29.1: 10s → 30s (Baileys default). 10s was too aggressive — on
+  1529→      // Render, transient ping failures caused Baileys to close the WS
+  1530→      // and trigger a reconnect every few minutes.
+  1531→      keepAliveIntervalMs: 30_000,
+  1532→      markOnlineOnConnect: true,
+  1533→      syncFullHistory: false,
+  1534→      retryRequestDelayMs: 250,
+  1535→      maxMsgRetryCount: 5,
+  1536→      shouldIgnoreJid: (jid) => jid === 'status@broadcast',
+  1537→    })
+  1538→
+  1539→    this.waSocket = socketInstance
+  1540→    this.waSocketStartTime = Date.now()  // v7.29.1: track uptime for backoff reset
+  1541→
+  1542→    // v7.29.1: returns true if socketInstance is still the current socket.
+  1543→    // Used to ignore stale events from previous sockets.
+  1544→    const isCurrentSocket = () => this.waSocket === socketInstance
+  1545→
+  1546→    socketInstance.ev.on('creds.update', saveCreds)
+  1547→
+  1548→    socketInstance.ev.on('connection.update', async (update) => {
+  1549→      // v7.29.1: Ignore events from stale sockets. This happens when the
+  1550→      // old socket (from a previous failed connect or a watchdog kill)
+  1551→      // finally fires its own 'close' event AFTER the new socket has
+  1552→      // already been created. Without this guard, the old socket's close
+  1553→      // would emit whatsapp:status { reconnecting } to the UI even though
+  1554→      // the new socket is healthy → UI flicker / "caindo e reconectando".
+  1555→      if (!isCurrentSocket()) {
+  1556→        console.log(`[WA:${this.userId}] Ignoring stale socket event: ${update.connection}`)
+  1557→        return
+  1558→      }
+  1559→
+  1560→      const { connection, lastDisconnect, qr } = update
+  1561→      this.connectionState = { connection }
+  1562→      console.log(`[WA:${this.userId}] Connection update: ${connection}`)
+  1563→
+  1564→      if (qr) {
+  1565→        this.lastQrCode = qr
+  1566→        console.log(`[WA:${this.userId}] QR Code generated, sending to clients`)
+  1567→        this.emitWA('whatsapp:qr', { qr })
+  1568→        this.hasSavedSession = false
+  1569→      }
+  1570→
+  1571→      if (connection === 'close') {
+  1572→        const statusCode = (lastDisconnect?.error)?.output?.statusCode
+  1573→        const shouldReconnect = statusCode !== DisconnectReason.loggedOut
+  1574→        console.log(`[WA:${this.userId}] Connection closed. Status: ${statusCode}, Reconnect: ${shouldReconnect}`)
+  1575→
+  1576→        if (statusCode === DisconnectReason.loggedOut) {
+  1577→          this.hasSavedSession = false
+  1578→          this.lastQrCode = null
+  1579→          this.conversations.clear()
+  1580→          this.contactNames.clear()
+  1581→          this.deviceContacts.clear()
+  1582→          this.lidToPhoneMap.clear()
+  1583→          this.postedChatterIds.clear()
+  1584→          this.phoneToActiveLeadCache.clear()
+  1585→          try { if (fs.existsSync(this.stateFile)) fs.unlinkSync(this.stateFile) } catch {}
+  1586→          // v7.30: Also clear the Firestore auth state — otherwise on the
+  1587→          // next restart Baileys would re-hydrate the logged-out creds and
+  1588→          // immediately get a 401, looping forever.
+  1589→          try {
+  1590→            const { getFirestoreOrNull } = require('./wa-firestore-auth-state.cjs')
+  1591→            const db = getFirestoreOrNull()
+  1592→            if (db) {
+  1593→              db.collection('wa_auth_states').doc(String(this.userId)).delete()
+  1594→                .then(() => console.log(`[WA:${this.userId}] Cleared Firestore auth state (loggedOut)`))
+  1595→                .catch(err => console.warn(`[WA:${this.userId}] Could not clear Firestore auth state:`, err.message))
+  1596→            }
+  1597→          } catch {}
+  1598→          // Also delete the local filesystem auth folder so we don't
+  1599→          // accidentally re-migrate stale creds back to Firestore.
+  1600→          try {
+  1601→            if (fs.existsSync(this.authFolder)) {
+  1602→              for (const f of fs.readdirSync(this.authFolder)) {
+  1603→                if (f.endsWith('.json')) {
+  1604→                  fs.unlinkSync(path.join(this.authFolder, f))
+  1605→                }
+  1606→              }
+  1607→            }
+  1608→          } catch {}
+  1609→          this.emitWA('whatsapp:conversations', [])
+  1610→        }
+  1611→
+  1612→        // v7.29.1: If the connection was open for >5 min before closing,
+  1613→        // it was a stable session that hit a transient blip. Reset the
+  1614→        // backoff so the reconnect is fast (2s) instead of escalating.
+  1615→        const uptimeMs = this.waSocketStartTime ? (Date.now() - this.waSocketStartTime) : 0
+  1616→        if (uptimeMs > 300_000 && shouldReconnect) {  // >5 min
+  1617→          console.log(`[WA:${this.userId}] Was open for ${Math.round(uptimeMs/1000)}s — resetting backoff`)
+  1618→          this.reconnectAttempts = 0
+  1619→        }
+  1620→
+  1621→        this.emitWA('whatsapp:status', {
+  1622→          connected: false,
+  1623→          reason: statusCode === DisconnectReason.loggedOut ? 'logged_out' : 'reconnecting',
+  1624→          hasSession: this.hasSavedSession,
+  1625→        })
+  1626→
+  1627→        if (shouldReconnect) {
+  1628→          this.scheduleReconnect(`Connection closed (status=${statusCode})`)
+  1629→        }
+  1630→      }
+  1631→
+  1632→      if (connection === 'open') {
+  1633→        console.log(`[WA:${this.userId}] Connected successfully!`)
+  1634→        this.hasSavedSession = true
+  1635→        this.reconnectAttempts = 0
+  1636→        this.lastQrCode = null
+  1637→        this.emitWA('whatsapp:status', { connected: true, hasSession: true })
+  1638→
+  1639→        if (this.watchdogTimer) clearInterval(this.watchdogTimer)
+  1640→        // v7.29.1: Conservative watchdog. The previous version fired every
+  1641→        // 60s and forced reconnect whenever connectionState !== 'open',
+  1642→        // which killed the connection DURING the initial 'connecting'
+  1643→        // phase (which can take >60s on Render). The new watchdog:
+  1644→        //   - Runs every 3 minutes (not 60s)
+  1645→        //   - Skips entirely if a reconnect is already pending
+  1646→        //   - Skips if connectionState !== 'open' (let the close handler
+  1647→        //     deal with it)
+  1648→        //   - Only forces reconnect after 2 consecutive dead-WS checks
+  1649→        //     (~6 minutes of a truly dead WebSocket)
+  1650→        let deadWsCount = 0
+  1651→        this.watchdogTimer = setInterval(() => {
+  1652→          if (this.waReconnectTimer) return            // reconnect already pending
+  1653→          if (!this.waSocket) return                   // no socket to check
+  1654→          if (!isCurrentSocket()) return                // stale socket ref
+  1655→          if (this.connectionState.connection !== 'open') return  // let close handler deal
+  1656→
+  1657→          const wsState = this.waSocket.ws?.readyState
+  1658→          if (wsState === 3) {  // CLOSED
+  1659→            deadWsCount++
+  1660→            console.log(`[WA Watchdog:${this.userId}] WebSocket CLOSED (stale count=${deadWsCount}/2)`)
+  1661→            if (deadWsCount >= 2) {
+  1662→              console.log(`[WA Watchdog:${this.userId}] Dead WS for >6min, forcing reconnect...`)
+  1663→              deadWsCount = 0
+  1664→              this.emitWA('whatsapp:status', {
+  1665→                connected: false,
+  1666→                reason: 'reconnecting',
+  1667→                hasSession: this.hasSavedSession,
+  1668→              })
+  1669→              this.scheduleReconnect('Watchdog: dead WS for >6min')
+  1670→            }
+  1671→          } else {
+  1672→            deadWsCount = 0
+  1673→          }
+  1674→        }, 180_000)  // v7.29.1: 60s → 180s (3 minutes)
+  1675→
+  1676→        try {
+  1677→          const meId = this.waSocket.user?.id
+  1678→          if (meId) {
+  1679→            const profilePicUrl = await this.waSocket.profilePictureUrl(meId, 'image').catch(() => null)
+  1680→            this.emitWA('whatsapp:me', { id: meId, name: this.waSocket.user?.name, profilePicUrl })
+  1681→          }
+  1682→        } catch {}
+  1683→
+  1684→        this.markDirty()
+  1685→        this.emitWA('whatsapp:conversations', this.getSortedConversations())
+  1686→
+  1687→        // v7.16: Auto-resync app state 3s after connection to restore
+  1688→        // contacts/conversations lost from memory after a restart.
+  1689→        setTimeout(() => {
+  1690→          try {
+  1691→            if (this.waSocket && this.connectionState.connection === 'open' &&
+  1692→                typeof this.waSocket.resyncAppState === 'function') {
+  1693→              console.log(`[WA:${this.userId}] Auto-resyncing app state after connection`)
+  1694→              this.waSocket.resyncAppState(
+  1695→                ['critical_block', 'critical_unblock_low', 'regular_high', 'regular_low', 'regular'],
+  1696→                false
+  1697→              ).then(() => console.log(`[WA:${this.userId}] Auto-resync complete`)).catch(err =>
+  1698→                console.error(`[WA:${this.userId}] Auto-resync error:`, err.message)
+  1699→              )
+  1700→            }
+  1701→          } catch (err) {
+  1702→            console.error(`[WA:${this.userId}] Auto-resync trigger failed:`, err.message)
+  1703→          }
+  1704→        }, 3000)
+  1705→
+  1706→        // v7.21: 8s after WA connects, pull all conversation history from Odoo chatter
+  1707→        setTimeout(() => {
+  1708→          if (this.waSocket && this.connectionState.connection === 'open') {
+  1709→            console.log(`[WA:${this.userId}] Triggering Odoo chatter history sync (reconnect restore)`)
+  1710→            this.syncAllConversationsFromOdoo({ silent: false }).catch(err =>
+  1711→              console.error(`[WA:${this.userId}] Odoo history sync failed:`, err.message)
+  1712→            )
+  1713→          }
+  1714→        }, 8000)
+  1715→      }
+  1716→    })
+  1717→
+  1718→    this.waSocket.ev.on('messaging-history.set', async ({ chats, contacts, messages, isLatest, progress, syncType }) => {
+  1719→      console.log(`[WA:${this.userId}] History sync: progress=${progress}%, chats=${chats.length}, contacts=${Object.keys(contacts).length}, messages=${messages.length}`)
+  1720→
+  1721→      this.syncState.isSyncing = true
+  1722→      this.syncState.progress = progress || 0
+  1723→      this.emitWA('whatsapp:sync-progress', {
+  1724→        isSyncing: true, progress: progress || 0, phase: syncType || 'historical',
+  1725→        chatsCount: chats.length, contactsCount: Object.keys(contacts).length,
+  1726→      })
+  1727→
+  1728→      // Build a LID → phone JID map from messages
+  1729→      const lidToPhone = new Map()
+  1730→      for (const msg of messages) {
+  1731→        if (!msg.key) continue
+  1732→        const rawJid = msg.key.remoteJid
+  1733→        if (rawJid && rawJid.endsWith('@lid')) {
+  1734→          const phoneCandidate = msg.key.senderPn || msg.key.participant
+  1735→          if (phoneCandidate) {
+  1736→            const normalized = normalizeJid(phoneCandidate)
+  1737→            if (normalized) {
+  1738→              lidToPhone.set(rawJid, normalized)
+  1739→              this.lidToPhoneMap.set(rawJid, normalized)
+  1740→            }
+  1741→          }
+  1742→        }
+  1743→      }
+  1744→      if (lidToPhone.size > 0) {
+  1745→        console.log(`[WA:${this.userId}] Built LID→phone map: ${lidToPhone.size} entries`)
+  1746→      }
+  1747→
+  1748→      let validContactsCount = 0
+  1749→      for (const [rawJid, contact] of Object.entries(contacts)) {
+  1750→        let jid = normalizeJid(rawJid)
+  1751→        if (!jid && rawJid && rawJid.endsWith('@lid')) {
+  1752→          jid = lidToPhone.get(rawJid) || null
+  1753→        }
+  1754→        if (jid && contact?.name) {
+  1755→          this.contactNames.set(jid, contact.name)
+  1756→          const phone = extractPhone(jid)
+  1757→          if (phone) {
+  1758→            const existing = this.deviceContacts.get(jid)
+  1759→            if (existing) existing.name = contact.name
+  1760→            else this.deviceContacts.set(jid, { jid, phone, name: contact.name, avatarUrl: null })
+  1761→          }
+  1762→          validContactsCount++
+  1763→        }
+  1764→      }
+  1765→      this.syncState.totalContacts = validContactsCount
+  1766→
+  1767→      let chatsProcessed = 0
+  1768→      let lidChatsResolved = 0
+  1769→      for (const chat of chats) {
+  1770→        let jid = normalizeJid(chat.id)
+  1771→        if (!jid && chat.id && chat.id.endsWith('@lid')) {
+  1772→          jid = lidToPhone.get(chat.id) || null
+  1773→          if (jid) lidChatsResolved++
+  1774→        }
+  1775→        if (!jid) continue
+  1776→        const contactName = this.contactNames.get(jid) || null
+  1777→        if (!this.conversations.has(jid)) {
+  1778→          this.conversations.set(jid, {
+  1779→            jid, name: contactName, phone: extractPhone(jid),
+  1780→            pushName: null, avatarUrl: null, lastMessage: null,
+  1781→            lastMessageAt: chat.t ? new Date(chat.t * 1000) : null,
+  1782→            unreadCount: chat.unreadCount || 0, messages: [],
+  1783→          })
+  1784→        } else {
+  1785→          const conv = this.conversations.get(jid)
+  1786→          if (contactName) conv.name = contactName
+  1787→          if (chat.unreadCount !== undefined) conv.unreadCount = chat.unreadCount
+  1788→          if (chat.t && (!conv.lastMessageAt || new Date(chat.t * 1000) > conv.lastMessageAt)) {
+  1789→            conv.lastMessageAt = new Date(chat.t * 1000)
+  1790→          }
+  1791→        }
+  1792→        chatsProcessed++
+  1793→      }
+  1794→      if (lidChatsResolved > 0) {
+  1795→        console.log(`[WA:${this.userId}] Resolved ${lidChatsResolved} LID chats to phone JIDs`)
+  1796→      }
+  1797→      this.syncState.totalChats = chatsProcessed
+  1798→
+  1799→      let messagesProcessed = 0
+  1800→      for (const msg of messages) {
+  1801→        if (!msg.key) continue
+  1802→        const rawJid = msg.key.remoteJid
+  1803→        let jid = normalizeJid(rawJid)
+  1804→        if (!jid && rawJid && rawJid.endsWith('@lid')) {
+  1805→          jid = lidToPhone.get(rawJid) || null
+  1806→          if (!jid) {
+  1807→            const candidate = msg.key.senderPn || msg.key.participant || msg.key.senderLid
+  1808→            if (candidate) jid = normalizeJid(candidate)
+  1809→          }
+  1810→        }
+  1811→        if (!jid) continue
+  1812→
+  1813→        const fromMe = msg.key.fromMe || false
+  1814→        let m = msg.message
+  1815→        if (m?.ephemeralMessage?.message) m = m.ephemeralMessage.message
+  1816→        else if (m?.viewOnceMessage?.message) m = m.viewOnceMessage.message
+  1817→        else if (m?.viewOnceMessageV2?.message) m = m.viewOnceMessageV2.message
+  1818→        else if (m?.documentWithCaptionMessage?.message) m = m.documentWithCaptionMessage.message
+  1819→        if (!m) continue
+  1820→
+  1821→        const textContent =
+  1822→          m.conversation ||
+  1823→          m.extendedTextMessage?.text ||
+  1824→          m.imageMessage?.caption ||
+  1825→          m.videoMessage?.caption ||
+  1826→          m.documentMessage?.caption || null
+  1827→
+  1828→        let mediaType = null
+  1829→        if (m.imageMessage) mediaType = 'image'
+  1830→        else if (m.videoMessage) mediaType = 'video'
+  1831→        else if (m.audioMessage) mediaType = 'audio'
+  1832→        else if (m.pttMessage) mediaType = 'ptt'
+  1833→        else if (m.documentMessage) mediaType = 'document'
+  1834→        else if (m.stickerMessage) mediaType = 'sticker'
+  1835→
+  1836→        if (!textContent && !mediaType) continue
+  1837→
+  1838→        let conv = this.conversations.get(jid)
+  1839→        if (!conv) {
+  1840→          const contactName = this.contactNames.get(jid) || null
+  1841→          const phone = extractPhone(jid)
+  1842→          conv = {
+  1843→            jid, name: contactName || pushNameFallback(msg), phone,
+  1844→            pushName: null, avatarUrl: null, lastMessage: null,
+  1845→            lastMessageAt: null, unreadCount: 0, messages: [],
+  1846→          }
+  1847→          this.conversations.set(jid, conv)
+  1848→        }
+  1849→
+  1850→        const msgId = msg.key.id
+  1851→        if (msgId && conv.messages.some(m => m.whatsappId === msgId)) continue
+  1852→
+  1853→        const messageTimestamp = new Date((msg.messageTimestamp) * 1000 || Date.now())
+  1854→        conv.messages.push({
+  1855→          id: msgId || Math.random().toString(36).substr(2, 9),
+  1856→          whatsappId: msgId || null, fromMe, textContent, mediaType,
+  1857→          timestamp: messageTimestamp, status: fromMe ? 'delivered' : 'received',
+  1858→        })
+  1859→
+  1860→        if (textContent) conv.lastMessage = textContent
+  1861→        else if (mediaType) conv.lastMessage = `[${mediaType}]`
+  1862→
+  1863→        if (!conv.lastMessageAt || messageTimestamp > conv.lastMessageAt) {
+  1864→          conv.lastMessageAt = messageTimestamp
+  1865→        }
+  1866→        messagesProcessed++
+  1867→      }
+  1868→      this.syncState.totalMessages = messagesProcessed
+  1869→
+  1870→      const baseTime = Date.now()
+  1871→      let offset = 0
+  1872→      for (const conv of this.conversations.values()) {
+  1873→        if (!conv.lastMessageAt) {
+  1874→          conv.lastMessageAt = new Date(baseTime - offset)
+  1875→          offset += 1000
+  1876→        }
+  1877→      }
+  1878→
+  1879→      if (isLatest || progress >= 100) {
+  1880→        this.syncState.isSyncing = false
+  1881→        this.syncState.progress = 100
+  1882→        this.emitWA('whatsapp:sync-progress', {
+  1883→          isSyncing: false, progress: 100, phase: 'complete',
+  1884→          chatsCount: chatsProcessed, contactsCount: validContactsCount, messagesCount: messagesProcessed,
+  1885→        })
+  1886→      }
+  1887→      this.markDirty()
+  1888→      this.emitWA('whatsapp:conversations', this.getSortedConversations())
+  1889→    })
+  1890→
+  1891→    this.waSocket.ev.on('messages.upsert', async ({ messages, type }) => {
+  1892→      console.log(`[WA:${this.userId}] >>>>>> messages.upsert EVENT: ${messages?.length || 0} msgs (type=${type || 'n/a'}) <<<<<<`)
+  1893→      this.logUpsertEvent({
+  1894→        type: type || 'n/a',
+  1895→        count: messages?.length || 0,
+  1896→        ids: (messages || []).slice(0, 5).map(m => m?.key?.id || '?'),
+  1897→        jids: (messages || []).slice(0, 5).map(m => m?.key?.remoteJid || '?'),
+  1898→      })
+  1899→
+  1900→      for (const msg of messages || []) {
+  1901→        try {
+  1902→          if (!msg.key) {
+  1903→            console.log(`[WA:${this.userId}] upsert msg skipped — no key`)
+  1904→            continue
+  1905→          }
+  1906→
+  1907→          const rawJid = msg.key.remoteJid
+  1908→          let jid = normalizeJid(rawJid)
+  1909→          if (!jid && rawJid && rawJid.endsWith('@lid')) {
+  1910→            const candidate = msg.key.senderPn || msg.key.participant || msg.key.senderLid
+  1911→            if (candidate) {
+  1912→              jid = normalizeJid(candidate)
+  1913→              if (jid) {
+  1914→                const src = msg.key.senderPn ? 'senderPn' : (msg.key.participant ? 'participant' : 'senderLid')
+  1915→                console.log(`[WA:${this.userId}] Recovered JID from ${src}: ${jid} (rawLid=${rawJid})`)
+  1916→                this.lidToPhoneMap.set(rawJid, jid)
+  1917→              }
+  1918→            }
+  1919→          }
+  1920→
+  1921→          const fromMe = msg.key.fromMe || false
+  1922→          const pushName = msg.pushName || null
+  1923→
+  1924→          console.log(`[WA:${this.userId}] upsert msg: rawJid=${rawJid} → normalized=${jid} fromMe=${fromMe} id=${msg.key.id} senderPn=${msg.key.senderPn || 'n/a'} pushName=${pushName || 'n/a'}`)
+  1925→
+  1926→          if (rawJid === 'status@broadcast') {
+  1927→            console.log(`[WA:${this.userId}] upsert msg skipped — status broadcast`)
+  1928→            continue
+  1929→          }
+  1930→          if (rawJid && rawJid.endsWith('@g.us')) {
+  1931→            console.log(`[WA:${this.userId}] upsert msg skipped — group chat`)
+  1932→            continue
+  1933→          }
+  1934→          if (!jid) {
+  1935→            console.log(`[WA:${this.userId}] upsert msg skipped — invalid JID: ${rawJid}`)
+  1936→            try {
+  1937→              const sample = JSON.stringify(msg).slice(0, 400)
+  1938→              console.log(`[WA:${this.userId}] full msg sample:`, sample)
+  1939→              this.logUpsertEvent({ type: 'skipped-invalid-jid', rawJid, sample })
+  1940→            } catch {}
+  1941→            continue
+  1942→          }
+  1943→
+  1944→          const conv = this.getOrCreateConversation(jid, fromMe ? undefined : pushName)
+  1945→          if (!conv) {
+  1946→            console.log(`[WA:${this.userId}] upsert msg skipped — could not create conversation for ${jid}`)
+  1947→            continue
+  1948→          }
+  1949→
+  1950→          // v7.29.4: Use Baileys' own normalizeMessageContent to unwrap nested
+  1951→          // message types (ephemeralMessage, viewOnceMessage, viewOnceMessageV2,
+  1952→          // viewOnceMessageV2Extension, documentWithCaptionMessage, editedMessage).
+  1953→          // The previous manual unwrap was missing viewOnceMessageV2Extension,
+  1954→          // which is used for view-once media with captions — that caused real
+  1955→          // media messages to be silently dropped with "no text/media".
+  1956→          // Also handle deviceSentMessage separately (Baileys' normalize does NOT
+  1957→          // include it — it's only used for outgoing message echoes).
+  1958→          let m = msg.message
+  1959→          if (m?.deviceSentMessage?.message) m = m.deviceSentMessage.message
+  1960→          try {
+  1961→            const baileysMod = await this.loadBaileys()
+  1962→            const normalized = baileysMod.normalizeMessageContent?.(m)
+  1963→            if (normalized) m = normalized
+  1964→          } catch (e) {
+  1965→            // Fallback: keep the original message body if normalize fails
+  1966→          }
+  1967→
+  1968→          // v7.29.4: Silently skip protocol/control messages that have no
+  1969→          // user-visible content. These arrive with messageStubType set and
+  1970→          // msg.message either missing or containing only messageContextInfo.
+  1971→          // Skipping them loudly pollutes the logs ("no text/media" spam).
+  1972→          if (msg.messageStubType !== undefined && msg.messageStubType !== null) {
+  1973→            console.log(`[WA:${this.userId}] upsert msg skipped — stub type=${msg.messageStubType} (protocol/control message)`)
+  1974→            continue
+  1975→          }
+  1976→
+  1977→          if (!m || typeof m !== 'object') {
+  1978→            console.log(`[WA:${this.userId}] upsert msg skipped — no message body`)
+  1979→            continue
+  1980→          }
+  1981→
+  1982→          // v7.29.4: Handle reactionMessage separately — these are emoji
+  1983→          // reactions, not text/media. Skip them silently (we don't render
+  1984→          // reactions in the chat view yet).
+  1985→          if (m.reactionMessage) {
+  1986→            console.log(`[WA:${this.userId}] upsert msg skipped — reactionMessage`)
+  1987→            continue
+  1988→          }
+  1989→
+  1990→          // v7.29.4: Handle protocolMessage separately — these are protocol
+  1991→          // updates (message revoked, E2E changed, etc.) with no body.
+  1992→          if (m.protocolMessage) {
+  1993→            console.log(`[WA:${this.userId}] upsert msg skipped — protocolMessage (type=${m.protocolMessage.type})`)
+  1994→            continue
+  1995→          }
+  1996→
+  1997→          const textContent =
+  1998→            m.conversation ||
+  1999→            m.extendedTextMessage?.text ||
+  2000→            m.imageMessage?.caption ||
+
+[showing lines 1-2000 of 3726; use offset=2001 with limit to continue reading]
