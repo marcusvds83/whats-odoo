@@ -1181,3 +1181,32 @@ Stage Summary:
 - Tested with mock Firestore: state.creds is now always non-null with valid noiseKey/signedIdentityKey/signedPreKey
 - All users (including admin) should now be able to see the QR code and connect WhatsApp
 - Existing saved sessions in Firestore are NOT affected — only the "no saved session" path was broken
+
+---
+Task ID: v7.33.1
+Agent: main
+Task: Fix WhatsApp QR scan failing — connection spins forever after scan. Non-admin users also stuck on login page.
+
+Work Log:
+- User reported: "Scaneei e ficou girando eternamente.. no aparelho a msg q não foi possivel conectar ou scanear o qrcode novamente"
+- Render logs revealed the actual bug: "WA-FS-Auth: persistState failed: Value for argument 'data' is not a valid Firestore document. Cannot use 'undefined' as a Firestore value (found in field 'creds.pairingCode'). If you want to ignore undefined values, enable ignoreUndefinedProperties."
+- ROOT CAUSE: Baileys' initAuthCreds() returns an object with `pairingCode: undefined` and `lastPropHash: undefined`. Firestore REJECTS any document containing undefined values by default. So every saveCreds() call after scanning the QR failed silently, the creds were never persisted to Firestore. When the QR expired (~20s later) and the connection closed (status 515), the reconnect generated FRESH initAuthCreds() because Firestore was empty → the scan was lost forever and the user saw an infinite spinner.
+- Also: the multiple "QR Code generated" events in the logs were a side effect — each reconnect spawned a new socket with fresh creds, each generating its own QR.
+
+Secondary issue: Non-admin login stuck on login page:
+- Logs showed: "[login] SUCCESS" + cookie set, but 30s later "[middleware] NO COOKIE on /api/auth/me"
+- ROOT CAUSE: LoginPage used router.push('/') + router.refresh() after successful POST. Race condition: Set-Cookie from POST response hadn't been committed to browser's cookie jar when router.push fired the next page load → middleware saw no cookie → redirected back to /login.
+
+Fixes Applied:
+1. wa-firestore-auth-state.cjs — getFirestoreOrNull: call db.settings({ ignoreUndefinedProperties: true }) after initializing Firestore. Wrapped in try/catch since settings() throws if called twice on the same instance.
+2. firebase-admin.ts — getFirestoreDb: same fix for the user-data Firestore instance.
+3. user-lookup.cjs — getFirestore: same fix for the user-lookup Firestore instance.
+4. src/app/login/page.tsx — use window.location.href = redirectPath instead of router.push + router.refresh (hard navigation forces the browser to wait for the Set-Cookie to be committed before next request).
+5. src/app/admin/page.tsx — same hard navigation fix.
+6. Bumped version to 7.33.1.
+
+Stage Summary:
+- Firestore now accepts Baileys' creds object with undefined fields (pairingCode, lastPropHash)
+- QR scan will now persist creds to Firestore successfully
+- On QR expiration / connection close, reconnect will load saved creds from Firestore and reconnect automatically (no new QR needed)
+- Non-admin users will navigate to / successfully after login (no more cookie race condition)
