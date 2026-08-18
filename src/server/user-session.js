@@ -2414,6 +2414,96 @@ class UserSession {
     }
   }
 
+  // ------------------------------------------------------------------
+  // v7.31: Force a brand-new QR code.
+  // ------------------------------------------------------------------
+  // Clears the saved WhatsApp session (Firestore auth state + filesystem
+  // auth files), then starts a fresh connect. Baileys will generate a
+  // new QR code because there are no saved creds to restore.
+  //
+  // Use this when:
+  //   - The user clicks "Solicitar QR Code" but no QR appears (because
+  //     Baileys is trying to restore a stale saved session)
+  //   - The user is stuck in "reconnecting..." state with no QR visible
+  //   - The saved session is expired/corrupted and the user wants to
+  //     start fresh with a new phone scan
+  //
+  // This is DESTRUCTIVE — the saved session is gone after this. The user
+  // MUST scan a new QR code to reconnect. Use onRequestQR() for non-
+  // destructive reconnect attempts.
+  // ------------------------------------------------------------------
+  async onForceNewQR(socket, callback) {
+    console.log(`[WA IO:${this.userId}] Force-new-QR requested by client ${socket.id}`)
+    try {
+      // Cancel any pending reconnect
+      if (this.waReconnectTimer) {
+        clearTimeout(this.waReconnectTimer)
+        this.waReconnectTimer = null
+      }
+
+      // Kill the existing socket if any
+      if (this.waSocket) {
+        try { this.waSocket.ev.removeAllListeners() } catch {}
+        try { this.waSocket.end(undefined) } catch {}
+        this.waSocket = null
+      }
+
+      // Clear in-memory state
+      this.lastQrCode = null
+      this.reconnectAttempts = 0
+      this.connectionState = { connection: 'close' }
+      this.hasSavedSession = false
+
+      // Clear Firestore auth state
+      try {
+        const { getFirestoreOrNull } = require('./wa-firestore-auth-state.cjs')
+        const db = getFirestoreOrNull()
+        if (db) {
+          await db.collection('wa_auth_states').doc(String(this.userId)).delete()
+          console.log(`[WA:${this.userId}] Force-new-QR: Cleared Firestore auth state`)
+        }
+      } catch (err) {
+        console.warn(`[WA:${this.userId}] Force-new-QR: Could not clear Firestore auth state:`, err && err.message)
+      }
+
+      // Clear filesystem auth files
+      try {
+        if (fs.existsSync(this.authFolder)) {
+          for (const f of fs.readdirSync(this.authFolder)) {
+            if (f.endsWith('.json')) {
+              fs.unlinkSync(path.join(this.authFolder, f))
+            }
+          }
+          console.log(`[WA:${this.userId}] Force-new-QR: Cleared filesystem auth files`)
+        }
+      } catch (err) {
+        console.warn(`[WA:${this.userId}] Force-new-QR: Could not clear filesystem auth files:`, err && err.message)
+      }
+
+      // Clear conversation state (saved session is gone, contacts are stale)
+      this.conversations.clear()
+      this.contactNames.clear()
+      this.deviceContacts.clear()
+      this.lidToPhoneMap.clear()
+      this.postedChatterIds.clear()
+      this.phoneToActiveLeadCache.clear()
+
+      // Notify the client that we're starting fresh
+      this.emitWA('whatsapp:status', { connected: false, reason: 'disconnected', hasSession: false })
+      this.emitWA('whatsapp:conversations', [])
+
+      // Start a fresh connect — Baileys will generate a new QR
+      this.connectWhatsApp().catch(err => {
+        console.error(`[WA:${this.userId}] Force-new-QR connect error:`, err.message)
+      })
+
+      callback?.({ success: true })
+    } catch (err) {
+      console.error(`[WA:${this.userId}] Force-new-QR error:`, err.message)
+      callback?.({ success: false, error: err.message })
+    }
+  }
+
   onGetMessages(data, callback) {
     const jid = normalizeJid(data?.jid)
     const conv = jid ? this.conversations.get(jid) : null

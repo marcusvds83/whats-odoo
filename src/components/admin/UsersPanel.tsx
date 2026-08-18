@@ -52,6 +52,10 @@ import {
   Dices,
   Eye,
   EyeOff,
+  Flame,
+  Cloud,
+  CloudOff,
+  XCircle,
 } from 'lucide-react'
 import { useOdoo } from '@/lib/use-odoo'
 
@@ -134,6 +138,30 @@ export function UsersPanel() {
   const [isChangingPwd, setIsChangingPwd] = useState(false)
   const [pwdCopied, setPwdCopied] = useState(false)
 
+  // v7.31: Firebase/Firestore status — surfaced in the admin UI so the
+  // admin can see at-a-glance whether user records are being persisted
+  // to Firestore (survives Render sleeps/deploys) or are stuck in SQLite
+  // (wiped on every Render deploy). Defined here, populated by
+  // loadFirebaseStatus() below (after loadUsers is declared).
+  const [firebaseStatus, setFirebaseStatus] = useState<null | {
+    loading: boolean
+    configured: boolean
+    initialized: boolean
+    configSource: string | null
+    initError: string | null
+    firestoreUsers: number
+    sqliteUsers: number
+    sample: string[]
+    recommendations: string[]
+  }>(null)
+  const [isMigrating, setIsMigrating] = useState(false)
+  const [migrationResult, setMigrationResult] = useState<null | {
+    success: boolean
+    migrated: number
+    skipped: number
+    errors: string[]
+  }>(null)
+
   const loadUsers = useCallback(async () => {
     setIsLoading(true)
     setError(null)
@@ -155,6 +183,72 @@ export function UsersPanel() {
   useEffect(() => {
     loadUsers()
   }, [loadUsers])
+
+  // v7.31: Load Firebase/Firestore status from /api/auth/debug.
+  // Called on mount and via the "Atualizar status" button in the UI.
+  const loadFirebaseStatus = useCallback(async () => {
+    setFirebaseStatus(prev => prev
+      ? { ...prev, loading: true }
+      : { loading: true, configured: false, initialized: false, configSource: null, initError: null, firestoreUsers: 0, sqliteUsers: 0, sample: [], recommendations: [] })
+    try {
+      const res = await fetch('/api/auth/debug', { cache: 'no-store' })
+      const data = await res.json()
+      if (data.success) {
+        setFirebaseStatus({
+          loading: false,
+          configured: data.firebase?.configured ?? false,
+          initialized: data.firebase?.initialized ?? false,
+          configSource: data.firebase?.configSource ?? null,
+          initError: data.firebase?.initError ?? null,
+          firestoreUsers: data.firestore?.userCount ?? 0,
+          sqliteUsers: data.sqlite?.userCount ?? 0,
+          sample: data.firestore?.sampleUsers ?? [],
+          recommendations: data.recommendations ?? [],
+        })
+      } else {
+        setFirebaseStatus({
+          loading: false, configured: false, initialized: false, configSource: null,
+          initError: data.error || 'Failed to load', firestoreUsers: 0, sqliteUsers: 0,
+          sample: [], recommendations: [],
+        })
+      }
+    } catch (err: any) {
+      setFirebaseStatus({
+        loading: false, configured: false, initialized: false, configSource: null,
+        initError: err.message, firestoreUsers: 0, sqliteUsers: 0,
+        sample: [], recommendations: [],
+      })
+    }
+  }, [])
+
+  // v7.31: Manually trigger SQLite → Firestore migration.
+  const runMigration = useCallback(async () => {
+    if (isMigrating) return
+    setIsMigrating(true)
+    setMigrationResult(null)
+    try {
+      const res = await fetch('/api/auth/migrate-users', { method: 'POST' })
+      const data = await res.json()
+      setMigrationResult({
+        success: !!data.success,
+        migrated: data.migrated ?? 0,
+        skipped: data.skipped ?? 0,
+        errors: data.errors ?? [],
+      })
+      await loadFirebaseStatus()
+      await loadUsers()
+    } catch (err: any) {
+      setMigrationResult({
+        success: false, migrated: 0, skipped: 0, errors: [err.message],
+      })
+    } finally {
+      setIsMigrating(false)
+    }
+  }, [isMigrating, loadFirebaseStatus, loadUsers])
+
+  useEffect(() => {
+    loadFirebaseStatus()
+  }, [loadFirebaseStatus])
 
   // v7.24 (R6): Backup all active user sessions to Odoo chatter.
   // Should be triggered manually BEFORE any deploy.
@@ -438,6 +532,192 @@ export function UsersPanel() {
           <AlertDescription>{error}</AlertDescription>
         </Alert>
       )}
+
+      {/* v7.31: Firebase / Firestore status banner.
+          -------------------------------------------------------------
+          Surfaces the actual Firebase init state to the admin so they can
+          see WHY users aren't appearing in the Firebase console. The most
+          common cause is: Firebase env vars aren't set on Render, so the
+          userStore silently falls back to SQLite — users "work" but they
+          don't land in Firestore, so they vanish on every Render restart.
+
+          This banner shows:
+          - Whether Firebase env vars are present (configured)
+          - Whether the Admin SDK actually initialized (initialized)
+          - The init error message (if any) — this is the key debug info
+          - User counts in Firestore vs SQLite
+          - A manual "Migrar agora" button to trigger the SQLite → Firestore
+            backfill via /api/auth/migrate-users
+          ------------------------------------------------------------- */}
+      <Card className="border-amber-200 dark:border-amber-900/50 bg-amber-50/40 dark:bg-amber-950/10">
+        <CardHeader className="pb-3">
+          <div className="flex items-center justify-between gap-2 flex-wrap">
+            <CardTitle className="text-base flex items-center gap-2">
+              {firebaseStatus?.loading ? (
+                <Loader2 className="size-4 animate-spin text-muted-foreground" />
+              ) : firebaseStatus?.configured && firebaseStatus?.initialized ? (
+                <Cloud className="size-4 text-emerald-600" />
+              ) : firebaseStatus?.configured && !firebaseStatus?.initialized ? (
+                <AlertCircle className="size-4 text-amber-600" />
+              ) : (
+                <CloudOff className="size-4 text-amber-600" />
+              )}
+              Status do Firebase / Firestore
+            </CardTitle>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={loadFirebaseStatus}
+              disabled={firebaseStatus?.loading}
+            >
+              <RefreshCw className={`size-3.5 mr-1.5 ${firebaseStatus?.loading ? 'animate-spin' : ''}`} />
+              Atualizar status
+            </Button>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-3 text-sm">
+          {!firebaseStatus ? (
+            <p className="text-muted-foreground">Carregando status...</p>
+          ) : (
+            <>
+              {/* Config + init status row */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                <div className="flex items-start gap-2">
+                  <span className="text-xs text-muted-foreground min-w-[110px]">Configurado:</span>
+                  <div className="flex-1">
+                    {firebaseStatus.configured ? (
+                      <Badge className="bg-emerald-100 text-emerald-800 border-emerald-200 text-xs">
+                        <CheckCircle2 className="size-3 mr-1" /> Sim
+                      </Badge>
+                    ) : (
+                      <Badge variant="destructive" className="text-xs">
+                        <XCircle className="size-3 mr-1" /> Não
+                      </Badge>
+                    )}
+                    {firebaseStatus.configSource && (
+                      <span className="ml-2 text-xs text-muted-foreground font-mono">
+                        via {firebaseStatus.configSource}
+                      </span>
+                    )}
+                  </div>
+                </div>
+                <div className="flex items-start gap-2">
+                  <span className="text-xs text-muted-foreground min-w-[110px]">Inicializado:</span>
+                  <div className="flex-1">
+                    {firebaseStatus.initialized ? (
+                      <Badge className="bg-emerald-100 text-emerald-800 border-emerald-200 text-xs">
+                        <CheckCircle2 className="size-3 mr-1" /> Sim
+                      </Badge>
+                    ) : (
+                      <Badge variant="destructive" className="text-xs">
+                        <XCircle className="size-3 mr-1" /> Não
+                      </Badge>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* User counts row */}
+              <div className="grid grid-cols-2 gap-2 pt-1">
+                <div className="rounded-md border border-emerald-200 dark:border-emerald-900/40 bg-emerald-50/40 dark:bg-emerald-950/10 p-2.5">
+                  <div className="text-xs text-muted-foreground">Firestore (usuários)</div>
+                  <div className="text-2xl font-semibold text-emerald-700 dark:text-emerald-400">
+                    {firebaseStatus.firestoreUsers}
+                  </div>
+                  <div className="text-[10px] text-muted-foreground">persiste entre deploys</div>
+                </div>
+                <div className="rounded-md border border-amber-200 dark:border-amber-900/40 bg-amber-50/40 dark:bg-amber-950/10 p-2.5">
+                  <div className="text-xs text-muted-foreground">SQLite (cache local)</div>
+                  <div className="text-2xl font-semibold text-amber-700 dark:text-amber-400">
+                    {firebaseStatus.sqliteUsers}
+                  </div>
+                  <div className="text-[10px] text-muted-foreground">perdido se Render dormir</div>
+                </div>
+              </div>
+
+              {/* Init error message */}
+              {firebaseStatus.initError && (
+                <Alert variant="destructive" className="py-2">
+                  <AlertCircle className="size-4" />
+                  <AlertDescription className="text-xs">
+                    <strong>Erro de inicialização:</strong> {firebaseStatus.initError}
+                  </AlertDescription>
+                </Alert>
+              )}
+
+              {/* Migration result */}
+              {migrationResult && (
+                <Alert variant={migrationResult.success ? 'default' : 'destructive'} className="py-2">
+                  {migrationResult.success ? (
+                    <CheckCircle2 className="size-4" />
+                  ) : (
+                    <AlertCircle className="size-4" />
+                  )}
+                  <AlertDescription className="text-xs">
+                    {migrationResult.success
+                      ? `Migração concluída: ${migrationResult.migrated} migrado(s), ${migrationResult.skipped} ignorado(s).`
+                      : 'Falha na migração.'}
+                    {migrationResult.errors.length > 0 && (
+                      <ul className="mt-1 ml-4 list-disc">
+                        {migrationResult.errors.map((e, i) => (
+                          <li key={i} className="text-[10px]">{e}</li>
+                        ))}
+                      </ul>
+                    )}
+                  </AlertDescription>
+                </Alert>
+              )}
+
+              {/* Recommendations / actions */}
+              {firebaseStatus.recommendations && firebaseStatus.recommendations.length > 0 && (
+                <div className="rounded-md border border-amber-200 dark:border-amber-900/40 bg-amber-50/60 dark:bg-amber-950/20 p-3 space-y-2">
+                  {firebaseStatus.recommendations.map((rec, i) => (
+                    <p key={i} className="text-xs text-amber-900 dark:text-amber-200 flex items-start gap-1.5">
+                      <AlertCircle className="size-3 mt-0.5 flex-shrink-0" />
+                      <span>{rec}</span>
+                    </p>
+                  ))}
+                  {/* Show "Migrar agora" button only when Firestore has fewer
+                      users than SQLite — i.e., there's something to backfill. */}
+                  {firebaseStatus.initialized &&
+                    firebaseStatus.firestoreUsers < firebaseStatus.sqliteUsers && (
+                    <Button
+                      size="sm"
+                      className="w-full mt-2 bg-amber-600 hover:bg-amber-700 text-white"
+                      onClick={runMigration}
+                      disabled={isMigrating}
+                    >
+                      {isMigrating ? (
+                        <>
+                          <Loader2 className="size-3.5 mr-1.5 animate-spin" />
+                          Migrando...
+                        </>
+                      ) : (
+                        <>
+                          <Flame className="size-3.5 mr-1.5" />
+                          Migrar {firebaseStatus.sqliteUsers - firebaseStatus.firestoreUsers} usuário(s) para o Firestore
+                        </>
+                      )}
+                    </Button>
+                  )}
+                </div>
+              )}
+
+              {/* Help message when Firebase isn't configured */}
+              {!firebaseStatus.configured && (
+                <div className="rounded-md border border-amber-200 dark:border-amber-900/40 bg-amber-50/60 dark:bg-amber-950/20 p-3">
+                  <p className="text-xs text-amber-900 dark:text-amber-200 mb-1.5">
+                    <strong>Firebase não configurado.</strong> Os usuários estão sendo salvos apenas em SQLite — sempre que o Render reiniciar (free tier dorme após 15min), os usuários criados após o último deploy serão perdidos.
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    Configure no Render a variável <code className="font-mono text-amber-700 dark:text-amber-400">FIREBASE_SERVICE_ACCOUNT</code> com o JSON da conta de serviço do Firebase. Após reiniciar, clique em "Atualizar status".
+                  </p>
+                </div>
+              )}
+            </>
+          )}
+        </CardContent>
+      </Card>
 
       <Card>
         <CardContent className="p-0">

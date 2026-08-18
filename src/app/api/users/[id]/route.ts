@@ -98,8 +98,22 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
 
     return NextResponse.json({ success: true, user: updated })
   } catch (err: any) {
-    console.error('[/api/users PATCH] error:', err.message)
-    return NextResponse.json({ success: false, error: 'Erro interno do servidor' }, { status: 500 })
+    console.error('[/api/users PATCH] error:', err.message, err.stack)
+    // v7.31: Surface Firestore write-verification failures with clear messages
+    const msg = String(err?.message || '')
+    if (msg.includes('Firestore update verification failed')) {
+      return NextResponse.json({
+        success: false,
+        error: 'Falha ao atualizar o usuário no Firebase Firestore. Verifique a configuração do Firebase Admin SDK no Render. Detalhe: ' + msg,
+      }, { status: 502 })
+    }
+    if (msg.includes('Firestore') || msg.includes('firebase') || msg.includes('credential') || msg.includes('permission')) {
+      return NextResponse.json({
+        success: false,
+        error: 'Erro do Firebase ao atualizar usuário: ' + msg,
+      }, { status: 502 })
+    }
+    return NextResponse.json({ success: false, error: 'Erro interno do servidor: ' + msg }, { status: 500 })
   }
 }
 

@@ -509,7 +509,7 @@ export default function HomePage() {
             {!sidebarCollapsed && (
               <div className="hidden lg:block min-w-0">
                 <p className="text-sm font-bold leading-tight truncate">Whats-Odoo</p>
-                <p className="text-[10px] text-muted-foreground">v7.30 Firebase session persistence</p>
+                <p className="text-[10px] text-muted-foreground">v7.31 Firebase status + force QR</p>
               </div>
             )}
           </div>
@@ -645,6 +645,7 @@ export default function HomePage() {
               me={wa.me}
               onRequestQR={wa.requestQR}
               onDisconnect={wa.disconnect}
+              onForceNewQR={wa.forceNewQR}
               isConnected={wa.status.connected}
             />
           </div>

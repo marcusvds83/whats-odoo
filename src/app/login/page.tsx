@@ -207,7 +207,7 @@ export default function LoginPage() {
         </Suspense>
 
         <p className="text-xs text-muted-foreground text-center mt-4">
-          v7.30 • Firebase session persistence
+          v7.31 • Firebase status + force QR
         </p>
       </div>
     </div>

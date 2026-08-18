@@ -434,6 +434,19 @@ export function useWhatsApp() {
     })
   }, [])
 
+  // v7.31: Force a brand-new QR code by clearing the saved session
+  // (Firestore + filesystem auth state) and starting a fresh connect.
+  // Use this when "Solicitar QR Code" doesn't produce a QR — usually
+  // because Baileys is trying to restore a stale saved session and
+  // refuses to generate a QR until that fails.
+  const forceNewQR = useCallback((): Promise<boolean> => {
+    return new Promise((resolve) => {
+      socketRef.current?.emit('whatsapp:force-new-qr', {}, (response: { success: boolean }) => {
+        resolve(!!response?.success)
+      })
+    })
+  }, [])
+
   const getProfilePic = useCallback((jid: string): Promise<string | null> => {
     return new Promise((resolve) => {
       socketRef.current?.emit('whatsapp:get-profile-pic', { jid }, (response: { success: boolean; url?: string | null }) => {
@@ -602,6 +615,8 @@ export function useWhatsApp() {
     sendMediaBase64,
     markRead,
     disconnect,
+    // v7.31: Force a brand-new QR by clearing saved session
+    forceNewQR,
     getProfilePic,
     // v7.9 actions
     getContacts,

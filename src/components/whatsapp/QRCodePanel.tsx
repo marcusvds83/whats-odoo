@@ -34,6 +34,11 @@ interface QRCodePanelProps {
   me: { id: string; name?: string; profilePicUrl?: string } | null
   onRequestQR: () => void
   onDisconnect: () => void
+  /** v7.31: Force a brand-new QR code by clearing the saved session
+   *  (Firestore + filesystem) and starting fresh. Use this when the
+   *  "Solicitar QR Code" button doesn't show a QR — usually because
+   *  there's a stale saved session that Baileys is trying to restore. */
+  onForceNewQR?: () => void
   isConnected: boolean
 }
 
@@ -43,13 +48,19 @@ export function QRCodePanel({
   me,
   onRequestQR,
   onDisconnect,
+  onForceNewQR,
   isConnected,
 }: QRCodePanelProps) {
   const [isRequesting, setIsRequesting] = useState(false)
   const [isDisconnecting, setIsDisconnecting] = useState(false)
+  const [isForcingNew, setIsForcingNew] = useState(false)
 
   const hasSession = status.hasSession ?? false
-  const isReconnecting = !isConnected && hasSession && status.reason === 'reconnecting'
+  // v7.31: Only treat as "reconnecting" if there's no QR. Once a QR arrives
+  // we want to display it even while hasSession is still true on the server
+  // (the server only clears hasSession AFTER it processes the QR, but the
+  // UI shouldn't wait for that — otherwise the QR is invisible).
+  const isReconnecting = !isConnected && hasSession && status.reason === 'reconnecting' && !qrCode
 
   const handleRequestQR = async () => {
     setIsRequesting(true)
@@ -66,6 +77,24 @@ export function QRCodePanel({
       await onDisconnect()
     } finally {
       setIsDisconnecting(false)
+    }
+  }
+
+  // v7.31: Force a brand-new QR by clearing saved session + reconnecting.
+  // Used when the user is stuck in "reconnecting" with no QR showing.
+  const handleForceNewQR = async () => {
+    if (!onForceNewQR) {
+      // Fallback: if server doesn't support force-new-qr yet, disconnect
+      // then request a QR — produces the same effect in two steps.
+      await handleDisconnect()
+      setTimeout(() => handleRequestQR(), 500)
+      return
+    }
+    setIsForcingNew(true)
+    try {
+      await onForceNewQR()
+    } finally {
+      setIsForcingNew(false)
     }
   }
 
@@ -153,7 +182,12 @@ export function QRCodePanel({
           </div>
         </div>
 
-        {/* Reconnecting State - Show waiting message instead of QR */}
+        {/* Reconnecting State - Show waiting message + force-new-QR escape hatch.
+            v7.31: Previously this state showed ONLY a spinner with no button,
+            so if the saved session was stale/expired the user was stuck
+            forever with no way to generate a fresh QR. Now we always show
+            a "Solicitar novo QR Code" button that clears the saved session
+            and starts fresh. */}
         {isReconnecting && !qrCode && (
           <div className="flex flex-col items-center gap-4 py-8">
             <div className="size-20 rounded-full bg-amber-50 dark:bg-amber-950/30 flex items-center justify-center">
@@ -162,9 +196,30 @@ export function QRCodePanel({
             <div className="text-center space-y-1">
               <p className="text-sm font-medium">Restaurando sessao...</p>
               <p className="text-xs text-muted-foreground max-w-[280px]">
-                Sua sessao anterior esta sendo restaurada. Se o aparelho ainda estiver conectado, isso deve levar alguns segundos.
+                Sua sessao anterior esta sendo restaurada. Se o aparelho ainda estiver conectado, isso deve levar alguns segundos. Se demorar muito, solicite um novo QR code abaixo.
               </p>
             </div>
+            <Button
+              variant="outline"
+              className="w-full"
+              onClick={handleForceNewQR}
+              disabled={isForcingNew || isDisconnecting}
+            >
+              {isForcingNew ? (
+                <>
+                  <Loader2 className="size-4 animate-spin" />
+                  Gerando novo QR...
+                </>
+              ) : (
+                <>
+                  <RefreshCw className="size-4" />
+                  Solicitar novo QR Code
+                </>
+              )}
+            </Button>
+            <p className="text-xs text-muted-foreground text-center">
+              Isto ira apagar a sessao salva e gerar um novo QR code.
+            </p>
           </div>
         )}
 
@@ -287,6 +342,32 @@ export function QRCodePanel({
                 </>
               )}
             </Button>
+
+            {/* v7.31: Secondary "force new QR" button — visible when not
+                connected. Use this if the regular "Solicitar QR Code" button
+                doesn't show a QR (usually because a stale saved session
+                is preventing Baileys from generating a fresh one). */}
+            {!isConnected && hasSession && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="w-full text-xs text-muted-foreground hover:text-destructive"
+                onClick={handleForceNewQR}
+                disabled={isForcingNew || isDisconnecting}
+              >
+                {isForcingNew ? (
+                  <>
+                    <Loader2 className="size-3 animate-spin mr-1" />
+                    Limpando sessao salva...
+                  </>
+                ) : (
+                  <>
+                    <RefreshCw className="size-3 mr-1" />
+                    Limpar sessao salva e gerar novo QR
+                  </>
+                )}
+              </Button>
+            )}
           </div>
         ) : null}
       </CardContent>

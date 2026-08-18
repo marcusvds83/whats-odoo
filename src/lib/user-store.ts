@@ -169,6 +169,32 @@ async function fsUpdate(
   }
   await docRef.update(payload)
   const after = await docRef.get()
+  // v7.31: Verify the update actually landed (mirror fsCreate behavior).
+  // If the read fails or the doc disappeared, surface a clear error
+  // instead of returning stale data.
+  if (!after.exists) {
+    throw new Error(`Firestore update verification failed for user ${id}: doc disappeared after update`)
+  }
+  const afterData = after.data() || {}
+  // Spot-check that the updated fields actually persisted. This catches
+  // silent permission-denied writes that return success but don't
+  // actually persist. We skip the `updatedAt` field because Firestore
+  // rewrites Date objects as Timestamps (so a direct === would always
+  // fail and produce false positives).
+  for (const k of Object.keys(payload) as string[]) {
+    if (k === 'updatedAt') continue
+    const expected = payload[k]
+    const actual = afterData[k]
+    if (expected instanceof Date) {
+      // Firestore stores Dates as Timestamps — compare via toDate()
+      const actualDate = actual?.toDate ? actual.toDate() : (actual instanceof Date ? actual : null)
+      if (!actualDate || expected.getTime() !== actualDate.getTime()) {
+        throw new Error(`Firestore update verification failed for user ${id}: field ${k} did not persist (expected=${expected.toISOString()}, actual=${actualDate?.toISOString() || actual})`)
+      }
+    } else if (expected !== actual) {
+      throw new Error(`Firestore update verification failed for user ${id}: field ${k} did not persist (expected=${JSON.stringify(expected)}, actual=${JSON.stringify(actual)})`)
+    }
+  }
   return toRecord(after)
 }
 

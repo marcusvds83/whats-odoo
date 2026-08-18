@@ -101,7 +101,27 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({ success: true, user })
   } catch (err: any) {
-    console.error('[/api/users POST] error:', err.message)
-    return NextResponse.json({ success: false, error: 'Erro interno do servidor' }, { status: 500 })
+    console.error('[/api/users POST] error:', err.message, err.stack)
+
+    // v7.31: Surface Firestore write-verification failures with a clear,
+    // actionable message. The default 500 "Erro interno do servidor"
+    // gave the admin no idea what went wrong — they would see "user
+    // created" but the user wasn't actually in Firebase, and login
+    // would fail. Now we detect Firestore-specific errors and tell
+    // the admin to check their FIREBASE_SERVICE_ACCOUNT env var.
+    const msg = String(err?.message || '')
+    if (msg.includes('Firestore write verification failed')) {
+      return NextResponse.json({
+        success: false,
+        error: 'Falha ao salvar o usuário no Firebase Firestore. Verifique se a variável FIREBASE_SERVICE_ACCOUNT está configurada corretamente no Render e se o service account tem permissão de escrita na coleção "users". Detalhe: ' + msg,
+      }, { status: 502 })
+    }
+    if (msg.includes('Firestore') || msg.includes('firebase') || msg.includes('credential') || msg.includes('permission')) {
+      return NextResponse.json({
+        success: false,
+        error: 'Erro do Firebase ao criar usuário: ' + msg + '. Verifique a configuração do Firebase Admin SDK no Render.',
+      }, { status: 502 })
+    }
+    return NextResponse.json({ success: false, error: 'Erro interno do servidor: ' + msg }, { status: 500 })
   }
 }

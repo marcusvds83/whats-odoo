@@ -310,6 +310,11 @@ app.prepare().then(async () => {
 
     socket.on('whatsapp:request-qr', () => s.onRequestQR(socket))
 
+    // v7.31: Force a brand-new QR by clearing saved session + reconnecting.
+    // Used by the "Solicitar novo QR Code" button when the user is stuck
+    // in reconnecting state or "Solicitar QR Code" doesn't produce a QR.
+    socket.on('whatsapp:force-new-qr', (_data, callback) => s.onForceNewQR(socket, callback))
+
     socket.on('whatsapp:get-messages', (data, callback) => s.onGetMessages(data, callback))
 
     socket.on('whatsapp:refresh-messages', (data, callback) => s.onRefreshMessages(data, callback))

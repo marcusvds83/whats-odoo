@@ -1039,3 +1039,63 @@ Stage Summary:
 - Odoo per-user config was already in the user record (Firestore via userStore) — survives deploys.
 - 4 new files: src/lib/firebase-admin.ts (rewritten), src/lib/user-store.ts (extended), src/server/wa-firestore-auth-state.cjs, src/server/user-migration.cjs, src/app/api/auth/debug/route.ts, src/app/api/auth/migrate-users/route.ts.
 - Modified files: server.js, src/server/user-session.js, src/app/page.tsx, src/app/login/page.tsx, src/app/admin/page.tsx, package.json.
+
+---
+Task ID: v7.31
+Agent: main
+Task: Fix QR code button (stuck in "reconnecting" state with no escape), surface Firebase status to admin UI, improve error reporting when Firestore writes fail
+
+Work Log:
+- Diagnosed QR code button issue: QRCodePanel's `isReconnecting` state was true whenever hasSession=true && reason==='reconnecting'. When true AND no qrCode, the panel showed ONLY a spinner — NO button to force a new QR. Worse, when a QR eventually arrived, the `: !isReconnecting ?` ternary returned null, so the QR was invisible. User saw "doesn't open QR code anymore".
+- Fixed by:
+  1. Changed `isReconnecting` definition to `!isConnected && hasSession && reason==='reconnecting' && !qrCode` — so when a QR arrives, isReconnecting becomes false and the QR renders.
+  2. Added a "Solicitar novo QR Code" button INSIDE the reconnecting spinner block — clears the saved session (Firestore + filesystem) and forces a fresh connect that generates a new QR.
+  3. Added a secondary "Limpar sessão salva e gerar novo QR" ghost button below the regular Request QR button, visible whenever not connected AND hasSession=true. This gives the user an escape hatch even when a QR is showing but the saved session is stale.
+- Added `forceNewQR` action to use-whatsapp.ts hook — emits `whatsapp:force-new-qr` socket event.
+- Added `onForceNewQR` prop to QRCodePanel — passed from page.tsx via wa.forceNewQR.
+- Registered `whatsapp:force-new-qr` event handler in server.js — calls `s.onForceNewQR(socket, callback)`.
+- Added `onForceNewQR()` method to UserSession (src/server/user-session.js):
+  - Cancels pending reconnect timer
+  - Kills existing waSocket
+  - Clears Firestore auth state (wa_auth_states/{userId})
+  - Clears filesystem auth files (data/auth_<userId>/*.json)
+  - Clears in-memory conversations/contacts
+  - Emits whatsapp:status { connected: false, reason: 'disconnected', hasSession: false }
+  - Calls connectWhatsApp() — Baileys generates fresh QR since no creds exist
+- Added Firebase status banner to UsersPanel.tsx — admin can now see at-a-glance:
+  - Whether Firebase env vars are configured (yes/no + which source)
+  - Whether the Admin SDK actually initialized (yes/no + error message if failed)
+  - User counts: Firestore (persists) vs SQLite (lost on Render sleep)
+  - Recommendations from /api/auth/debug
+  - "Migrar agora" button to manually trigger SQLite → Firestore backfill
+  - Help message explaining how to set FIREBASE_SERVICE_ACCOUNT when not configured
+- Improved error reporting in /api/users POST and PATCH routes:
+  - When `fsCreate` or `fsUpdate` throws "Firestore write verification failed", API returns 502 with clear message: "Falha ao salvar o usuário no Firebase Firestore. Verifique se a variável FIREBASE_SERVICE_ACCOUNT está configurada corretamente..."
+  - Generic Firebase errors (permission, credential) also surfaced with actionable message
+  - Other errors still return 500 but now include the actual error message
+- Added verification to `fsUpdate` (user-store.ts) — mirrors `fsCreate` behavior:
+  - Reads the doc back after update
+  - Throws if doc disappeared
+  - Spot-checks that each updated field actually persisted (catches silent permission-denied writes)
+  - Compares Date objects via toDate() to avoid false positives from Firestore's Date → Timestamp conversion
+- Bumped version to 7.31.0 in package.json, login page, admin page, main page footer.
+
+Stage Summary:
+- Files modified:
+  - src/components/whatsapp/QRCodePanel.tsx (added onForceNewQR prop, isReconnecting fix, force-new-QR button)
+  - src/lib/use-whatsapp.ts (added forceNewQR action + returned from hook)
+  - src/app/page.tsx (pass onForceNewQR to QRCodePanel, version bump)
+  - src/server/user-session.js (added onForceNewQR method)
+  - server.js (registered whatsapp:force-new-qr event)
+  - src/components/admin/UsersPanel.tsx (added Firebase status banner with counts + migration button)
+  - src/lib/user-store.ts (added verification to fsUpdate)
+  - src/app/api/users/route.ts (improved error messages for Firestore failures)
+  - src/app/api/users/[id]/route.ts (improved error messages for Firestore failures)
+  - src/app/login/page.tsx, src/app/admin/page.tsx (version label)
+  - package.json (version 7.31.0)
+- Build verified (npx next build succeeds, 15 routes generated)
+- Admin flow preserved — all changes are additive, no behavior change for the working admin WhatsApp flow
+- After deploy, admin should:
+  1. Open the Users tab to see the new Firebase status banner — this will immediately reveal WHY users aren't in Firebase (env var missing vs init failed)
+  2. Click "Migrar agora" to backfill existing SQLite users into Firestore
+  3. If stuck in WhatsApp "reconnecting", click "Solicitar novo QR Code" to clear the stale saved session and force a fresh QR
