@@ -1,0 +1,31 @@
+You are looking at a screenshot of a WhatsApp-Odoo middleware web app.
+
+CONTEXT (do not hallucinate — only describe what is actually visible in the image):
+- After the latest deploy (v7.37), the user reports they can see phone contacts
+  but NO messages are arriving — not from Odoo contacts, not from new external contacts.
+- Both admin and normal users are affected.
+- Before, everything arrived.
+
+Please describe in detail what you see in the screenshot, answering EACH of these
+questions in a numbered list. Be literal and only mention things actually visible:
+
+1. What page/view is shown? (Conversations tab? Contacts list? Single chat view?
+   Settings? Login?) Describe the active tab/section.
+2. What conversations or contacts are listed? Quote the exact names, phone numbers,
+   timestamps, and any preview text shown next to each row. If the list is empty,
+   say so explicitly.
+3. Are there any error messages, warning banners, toast notifications, or red/yellow
+   status indicators visible anywhere on the page? Quote them verbatim if present.
+4. What does the connection status show? Is WhatsApp shown as connected,
+   disconnected, syncing, scanning QR, etc.? Quote any status text.
+5. Are there any visible message bubbles in any conversation/chat panel shown?
+   If a chat panel is open, describe whether it is empty or has messages, and
+   quote the visible message text.
+6. Mention any visible UI version number, build number, environment label
+   (e.g. "v7.37", "production", "staging").
+7. Mention any visible user role indicator (admin vs. normal user) and who the
+   currently logged-in user appears to be.
+
+After answering the numbered questions, give a one-paragraph SUMMARY of what the
+UI state implies about the bug (empty conversation list vs. conversations with no
+messages vs. error state vs. connection issue).

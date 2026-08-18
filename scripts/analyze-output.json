@@ -1,0 +1,28 @@
+{
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+        "content": "Based on the screenshot provided, here is the detailed description of the UI state:\n\n1.  **Page/View:** The **\"Conversas\" (Conversations)** tab is active. The main view shows the \"Contatos e Conversas\" (Contacts and Conversations) list on the left, and a single chat panel for a specific contact (\"Kako\") is open on the right.\n2.  **Conversations Listed:** The list contains several entries, most showing \"Sem mensagens\" (No messages). The exact visible rows are:\n    *   **Lu:** Preview text: `Mesclar com os seguintes parceiros: Lu <n/a> ...`\n    *   **Kako** (Selected): Preview text: `Sem mensagens`\n    *   **Luiz Guilherme:** Preview text: `Sem mensagens`\n    *   **+55 41 9657-8109:** Preview text: `Sem mensagens`\n    *   **+55 43 8836-6898:** Preview text: `Sem mensagens`\n    *   **15998440856:** Preview text: `Sem mensagens`\n    *   **Abaline TRAVESSIA ILHA:** Preview text: `Sem mensagens` (partially cut off)\n3.  **Error Messages/Warnings:** There are **no** error banners, toast notifications, or red/yellow warning indicators visible anywhere on the page.\n4.  **Connection Status:** The connection status at the bottom left shows:\n    *   **WhatsApp:** **ON** (Green dot)\n    *   **Odoo:** **ON** (Green dot)\n5.  **Message Bubbles:** Yes, there are message bubbles in the open chat panel for **Kako**, despite the list saying \"Sem mensagens\". The visible bubbles are:\n    *   System text: `Mesclar com os seguintes parceiros: Kako <n/a> (ID 57)` (Timestamp: 21:00)\n    *   System text: `Contato criado` (Timestamp: 19:54)\n    *   **Outgoing Green Bubble:** `<div><strong> 📱 WhatsApp Enviada:</strong> 18/08/2026, 22:54:55<br/><span>Olá</span></div>` (Timestamp: 19:54)\n    *   System text: `Contact criado` (Timestamp: 19:55)\n6.  **Version/Environment:** The sidebar header displays version info: **\"v7.32 fix WA connect + auto-QR\"**. The browser address bar shows the domain `whats-odoo.onrender.com`.\n7.  **User Role:** The bottom left corner identifies the logged-in user as **Marcus Admin** with the email `marcus@nytro.com.br`.\n\n**SUMMARY:**\nThe UI state implies that the system is technically connected (both WhatsApp and Odoo show status \"ON\") and capable of sending/receiving data, as evidenced by the \"Contact created\" logs and the raw HTML content of a sent message appearing in the chat bubble for \"Kako\". However, the bug appears to be related to **message rendering or synchronization logic**: the conversation list incorrectly displays \"Sem mensagens\" (No messages) for contacts that clearly have activity, and the chat view shows raw HTML code (`<div><strong>...`) instead of rendered text for the incoming/outgoing message content. This suggests that while the middleware is receiving events (triggers), it is failing to properly parse or display the actual message body to the user interface after the latest update.",
+        "role": "assistant"
+      }
+    }
+  ],
+  "created": 1787094998,
+  "id": "2026081907163175d33c93e46a459c",
+  "model": "glm-5v-turbo",
+  "object": "chat.completion",
+  "request_id": "2026081907163175d33c93e46a459c",
+  "usage": {
+    "completion_tokens": 758,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens": 1751,
+    "prompt_tokens_details": {
+      "cached_tokens": 3
+    },
+    "total_tokens": 2509
+  }
+}

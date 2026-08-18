@@ -220,7 +220,7 @@ export default function LoginPage() {
         </Suspense>
 
         <p className="text-xs text-muted-foreground text-center mt-4">
-          v7.37.0 • Conversas persistidas no Firestore
+          v7.38.0 • Mensagens chegam para todos
         </p>
       </div>
     </div>

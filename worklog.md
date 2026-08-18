@@ -1325,3 +1325,35 @@ Stage Summary:
 - Behavior change: Conversation state (contacts + conversations + messages) now persists to Firestore on every debounced save (every ~30s when dirty). On startup, if disk file is missing, falls back to Firestore. Survives Render deploys, restarts, sleep/wake cycles.
 - IMPORTANT: For users with existing WhatsApp sessions, after deploying v7.37 they should do "Logout" + re-scan QR ONCE to trigger a fresh history sync that loads all phone contacts. After that, the state will be persisted and survive future deploys automatically.
 - Compatibility: v7.36 ownership rules preserved (unclaimed conversations visible to everyone; conversations owned by another user hidden from non-admins).
+
+---
+Task ID: v7.38
+Agent: Main Agent
+Task: Fix admin not receiving messages from conversations owned by other users (regression from v7.35 ownership filter)
+
+Work Log:
+- Analyzed user-provided screenshot via VLM agent. Key findings:
+  * Sidebar showed "v7.32 fix WA connect + auto-QR" — a HARDCODED string in src/app/page.tsx that never tracked package.json version
+  * Conversations list showed "Sem mensagens" for ALL contacts including ones with chat activity visible
+  * The Kako chat showed only Odoo-pulled chatter + outgoing echo, NO incoming WhatsApp messages
+  * Both admin and normal users affected
+- Root cause: v7.35 ownership filter was `if (owner && owner !== this.userId) continue` WITHOUT an admin bypass. This meant admin was ALSO filtered out from conversations owned by other users. So when normal user X owned conversation Y, admin's session would skip ALL incoming messages for Y — admin saw the conversation in the list (loaded from disk) but with no new messages.
+- v7.36 did NOT fix this — it only relaxed the unclaimed filter, not the owned-by-another-user filter.
+- Fix: Added `&& !_isAdmin` to all 9 ownership filter sites so admin bypasses the filter entirely:
+  1. messages.upsert (line 2199)
+  2. messages.update (line 2459)
+  3. chats.upsert (line 2596)
+  4. chats.update (line 2633)
+  5. messaging-history.set chats loop (line 2013)
+  6. messaging-history.set messages loop (line 2058)
+  7. _applySnapshot disk/Firestore load (line 673)
+  8. onGetMessages (line 2819)
+  9. onRefreshMessages (line 2847)
+- Also updated hardcoded sidebar version string in src/app/page.tsx from "v7.32 fix WA connect + auto-QR" to "v7.38 • Mensagens chegam para todos" so the user can confirm the deploy took effect.
+- Bumped version to 7.38.0 in package.json and login page footer.
+- Ran `node -c src/server/user-session.js` → SYNTAX_OK.
+
+Stage Summary:
+- File edited: src/server/user-session.js (9 filter sites), src/app/page.tsx (sidebar version), package.json, src/app/login/page.tsx
+- Behavior change: Admin now sees ALL messages (including from conversations owned by other users) — restores v7.34 "todos chegam tudo" behavior. Non-admin still only sees own + unclaimed conversations.
+- After deploy, admin should test by sending a fresh message FROM an external phone TO the WhatsApp number — should now arrive immediately for both admin and any non-admin user (unclaimed conversation visible to all).
