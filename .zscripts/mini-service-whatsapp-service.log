@@ -925,3 +925,184 @@ $ bun x tsx index.ts
 [WA] Connection update: close
 [WA] Connection closed. Status: 408, Reconnect: true
 [WA] Reconnecting in 30000ms (attempt 57)...
+[WA] Connection update: connecting
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: close
+[WA] Connection closed. Status: 408, Reconnect: true
+[WA] Reconnecting in 30000ms (attempt 58)...
+[WA] Connection update: connecting
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: close
+[WA] Connection closed. Status: 408, Reconnect: true
+[WA] Reconnecting in 30000ms (attempt 59)...
+[WA] Connection update: connecting
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: close
+[WA] Connection closed. Status: 408, Reconnect: true
+[WA] Reconnecting in 30000ms (attempt 60)...
+[WA] Connection update: connecting
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: close
+[WA] Connection closed. Status: 408, Reconnect: true
+[WA] Reconnecting in 30000ms (attempt 61)...
+[WA] Connection update: connecting
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: close
+[WA] Connection closed. Status: 408, Reconnect: true
+[WA] Reconnecting in 30000ms (attempt 62)...
+[WA] Connection update: connecting
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: close
+[WA] Connection closed. Status: 408, Reconnect: true
+[WA] Reconnecting in 30000ms (attempt 63)...
+[WA] Connection update: connecting
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: close
+[WA] Connection closed. Status: 408, Reconnect: true
+[WA] Reconnecting in 30000ms (attempt 64)...
+[WA] Connection update: connecting
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: close
+[WA] Connection closed. Status: 408, Reconnect: true
+[WA] Reconnecting in 30000ms (attempt 65)...
+[WA] Connection update: connecting
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: close
+[WA] Connection closed. Status: 408, Reconnect: true
+[WA] Reconnecting in 30000ms (attempt 66)...
+[WA] Connection update: connecting
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: close
+[WA] Connection closed. Status: 408, Reconnect: true
+[WA] Reconnecting in 30000ms (attempt 67)...
+[WA] Connection update: connecting
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: close
+[WA] Connection closed. Status: 408, Reconnect: true
+[WA] Reconnecting in 30000ms (attempt 68)...
+[WA] Connection update: connecting
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
+[WA] Connection update: undefined
+[WA] QR Code generated, sending to clients
