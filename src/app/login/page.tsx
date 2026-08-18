@@ -220,7 +220,7 @@ export default function LoginPage() {
         </Suspense>
 
         <p className="text-xs text-muted-foreground text-center mt-4">
-          v7.34.0 • Firebase persistence + dedupe sessions
+          v7.35.0 • Isolamento de conversas por usuário
         </p>
       </div>
     </div>

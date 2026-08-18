@@ -1238,3 +1238,46 @@ Stage Summary:
   - src/server/user-session.js (SessionManager.getOrCreate dedupe, invalidate clear pending)
   - package.json (version 7.34.0)
   - src/app/login/page.tsx (footer version string)
+
+---
+Task ID: v7.35.0
+Agent: main
+Task: Isolar conversas WhatsApp por usuário — usuário normal só deve ver conversas que ele iniciou com contatos Odoo, não conversas de outros usuários (mesmo número WhatsApp compartilhado via multi-device). Admin continua vendo tudo.
+
+Work Log:
+- Confirmado com o usuário que admin e usuários normais estão conectados e enviando/recebendo mensagens (v7.34.0 deploy funcionando).
+- Investigada a arquitetura: cada UserSession tem seu próprio `conversations` Map, mas como todos compartilham o mesmo número WhatsApp (multi-device), todo `messages.upsert` chega a TODOS os UserSessions simultaneamente — cada um cria uma cópia da conversa no próprio Map, então todo mundo vê tudo.
+- Adicionado `conversationOwners` Map no SessionManager (jid -> ownerUserId), persistido em Firestore (collection `conversation_owners`) para sobreviver a deploys e Render sleep/wake.
+- Adicionados métodos no SessionManager:
+  - `loadOwners()` — carrega todos os mapeamentos do Firestore (idempotente, lazy-load na primeira chamada de getOrCreate)
+  - `getConversationOwner(jid)` — consulta síncrona em memória
+  - `claimConversation(jid, userId)` — só reivindica se ainda não tem dono (não sobrescreve dono existente); persiste em Firestore
+- Passado `sessionManager: this` no constructor do UserSession para ele poder consultar/reivindicar conversas.
+- Modificado o handler `messages.upsert`:
+  - Se o jid tem dono diferente do this.userId → skip (mensagem é de conversa de outro usuário)
+  - Se o jid não tem dono E o usuário não é admin → skip (conversa "órfã", só admin vê)
+  - Aplica para mensagens recebidas (fromMe=false) e echoes de mensagens enviadas por outros usuários (fromMe=true)
+- Modificados `onSendMessage`, `onSendMedia`, `onSendMediaBase64` para chamar `sessionManager.claimConversation(jid, this.userId)` ANTES de enviar — o primeiro usuário que envia pelo sistema se torna dono permanente.
+- Modificado `getSortedConversations` para filtrar conversas (e device contacts) por ownership: admin vê tudo, não-admin vê só suas conversas.
+- Modificados `onGetMessages` e `onRefreshMessages` para bloquear acesso direto a mensagens de conversas de outros usuários (fallback de segurança caso o usuário tente acessar via API).
+- Modificado `messages.update` para aplicar o mesmo filtro (não atualizar status de mensagens em conversas alheias, não criar mensagens via fallback path em conversas alheias).
+- Modificados `chats.upsert` e `chats.update` para filtrar conversas que chegam via sync inicial do Baileys (evita poluir não-admins com todo o histórico).
+- Modificado `messaging-history.set` (o maior populador de conversas) para filtrar chats e mensagens históricas por ownership.
+- Modificado `loadConversationsFromDisk` para dropar conversas salvas em `conv_state_<userId>.json` que agora pertencem a outro usuário (migração transparente de dados pré-v7.35).
+- Bumped package.json version para 7.35.0; atualizada string de versão no rodapé da página /login.
+- Verificado: `node -c` em user-session.js passa; `npx next build` compila com sucesso.
+
+Stage Summary:
+- Isolamento de conversas por usuário implementado sem alterar o fluxo de login/admin (que continua funcionando igual).
+- Modelo de ownership:
+  - Primeiro usuário que envia mensagem via sistema para um JID vira o dono permanente dessa conversa
+  - Mensagens recebidas/enviadas para esse JID só são processadas pelo UserSession do dono
+  - Conversas "órfãs" (ninguém reivindicou; mensagem chegou direto do contato no WhatsApp) só são visíveis para admin
+  - Admin vê todas as conversas (próprias, de outros, e órfãs)
+- Persistência em Firestore collection `conversation_owners` sobrevive a deploys e Render sleep/wake
+- Filtros aplicados em TODOS os pontos de entrada: messages.upsert, messages.update, chats.upsert, chats.update, messaging-history.set, loadConversationsFromDisk, getSortedConversations, onGetMessages, onRefreshMessages
+- Não há mudanças no fluxo de login (admin e não-admin) — apenas no roteamento de conversas pós-login
+- Files modified:
+  - src/server/user-session.js (SessionManager + UserSession + handlers)
+  - package.json (7.35.0)
+  - src/app/login/page.tsx (footer version string)

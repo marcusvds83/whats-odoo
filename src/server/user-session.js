@@ -193,11 +193,17 @@ function buildConversationTranscript(messages) {
 // ====================================================================
 
 class UserSession {
-  constructor({ userId, user, io, prisma }) {
+  constructor({ userId, user, io, prisma, sessionManager }) {
     this.userId = userId
     this.user = user              // Prisma User record (with odooUrl etc.)
     this.io = io                  // socket.io server instance (for namespaces)
     this.prisma = prisma          // shared PrismaClient
+    // v7.35: Reference back to the SessionManager — used to consult the
+    // global conversation owner registry when filtering incoming messages
+    // and outgoing echoes. Optional (some tests may construct UserSession
+    // directly without a SessionManager; in that case the session will
+    // process all messages, i.e., behave like the pre-v7.35 code).
+    this.sessionManager = sessionManager || null
 
     // ===== Per-user paths =====
     this.authFolder = path.join(DATA_DIR, `auth_${userId}`)
@@ -553,8 +559,27 @@ class UserSession {
       }
 
       let loaded = 0
+      let droppedOwnedByOther = 0
+      // v7.35: When loading saved conversations from disk, filter out any
+      // conversation that is now owned by ANOTHER user. This handles the
+      // migration scenario: prior to v7.35, all users on a shared WhatsApp
+      // number would persist every conversation to their own conv_state file
+      // (because there was no ownership filter). After v7.35 deploys, those
+      // files contain conversations that belong to other users — we must
+      // drop them on load so the UI doesn't display them again.
+      // (Conversations with no owner in the registry are kept — they'll be
+      // filtered at display-time for non-admins by getSortedConversations.)
+      const _sm = this.sessionManager
+      const _isAdmin = this.user && this.user.role === 'admin'
       for (const c of snapshot.conversations || []) {
         if (!c.jid || !isValidPhoneJid(c.jid)) continue
+        if (_sm) {
+          const owner = _sm.getConversationOwner(c.jid)
+          if (owner && owner !== this.userId) {
+            droppedOwnedByOther++
+            continue
+          }
+        }
         this.conversations.set(c.jid, {
           jid: c.jid,
           name: c.name || null,
@@ -570,6 +595,9 @@ class UserSession {
           })),
         })
         loaded++
+      }
+      if (droppedOwnedByOther > 0) {
+        console.log(`[UserSession:${this.userId}] Dropped ${droppedOwnedByOther} conversation(s) from disk state — owned by other users (v7.35 isolation)`)
       }
 
       for (const [jid, name] of snapshot.contactNames || []) {
@@ -649,10 +677,25 @@ class UserSession {
   getSortedConversations() {
     // v7.20: Conversas tab shows BOTH actual conversations AND device contacts
     // that don't have a conversation yet. Unified list.
+    // v7.35: Apply ownership filter — non-admin users see only conversations
+    // they own (i.e., that they initiated by sending the first message via
+    // the system). Admins see all conversations including unclaimed ones
+    // (contact-initiated leads that nobody has grabbed yet).
     const conversationJids = new Set(this.conversations.keys())
     const deviceContactEntries = []
+    const isAdmin = this.user && this.user.role === 'admin'
+    const isOwnerOf = (jid) => {
+      if (isAdmin) return true  // admin sees everything
+      if (!this.sessionManager) return true  // no registry → no filtering (test mode)
+      const owner = this.sessionManager.getConversationOwner(jid)
+      if (owner === this.userId) return true  // user owns this conversation
+      return false  // owned by someone else, or unclaimed → hide from non-admin
+    }
     for (const contact of this.deviceContacts.values()) {
       if (conversationJids.has(contact.jid)) continue
+      // v7.35: device contacts are also subject to ownership filtering.
+      // A non-admin user only sees device contacts they own.
+      if (!isOwnerOf(contact.jid)) continue
       deviceContactEntries.push({
         jid: contact.jid,
         name: contact.name,
@@ -669,6 +712,7 @@ class UserSession {
 
     return Array.from(this.conversations.values())
       .filter(conv => isValidPhoneJid(conv.jid))
+      .filter(conv => isOwnerOf(conv.jid))  // v7.35: ownership filter
       .map(c => this.serializeConversation(c))
       .filter(Boolean)
       .concat(deviceContactEntries)
@@ -1844,6 +1888,10 @@ class UserSession {
 
       let chatsProcessed = 0
       let lidChatsResolved = 0
+      // v7.35: For non-admin users, filter the historical chats by ownership.
+      // Pre-compute role/owner check to avoid hitting the registry once per chat.
+      const _isAdmin = this.user && this.user.role === 'admin'
+      const _sm = this.sessionManager
       for (const chat of chats) {
         let jid = normalizeJid(chat.id)
         if (!jid && chat.id && chat.id.endsWith('@lid')) {
@@ -1851,6 +1899,15 @@ class UserSession {
           if (jid) lidChatsResolved++
         }
         if (!jid) continue
+        // v7.35: Skip chats owned by other users, or unclaimed chats if this
+        // user is not admin. Otherwise the initial history sync would pollute
+        // non-admin users with EVERY conversation ever had on the shared
+        // WhatsApp number.
+        if (_sm) {
+          const owner = _sm.getConversationOwner(jid)
+          if (owner && owner !== this.userId) continue
+          if (!owner && !_isAdmin) continue
+        }
         const contactName = this.contactNames.get(jid) || null
         if (!this.conversations.has(jid)) {
           this.conversations.set(jid, {
@@ -1887,6 +1944,15 @@ class UserSession {
           }
         }
         if (!jid) continue
+
+        // v7.35: Apply the same ownership filter to historical messages —
+        // if the user doesn't own this JID and isn't admin, skip the message
+        // (and don't auto-create a conversation for it).
+        if (_sm) {
+          const owner = _sm.getConversationOwner(jid)
+          if (owner && owner !== this.userId) continue
+          if (!owner && !_isAdmin) continue
+        }
 
         const fromMe = msg.key.fromMe || false
         let m = msg.message
@@ -2017,6 +2083,30 @@ class UserSession {
               this.logUpsertEvent({ type: 'skipped-invalid-jid', rawJid, sample })
             } catch {}
             continue
+          }
+
+          // v7.35: Conversation ownership isolation.
+          // - If this JID has an owner that is NOT this user → skip the message
+          //   entirely (it belongs to another user's conversation).
+          // - If this JID has NO owner (contact-initiated conversation that
+          //   nobody has claimed yet) → only admin processes it. Non-admin
+          //   users skip these so they don't see other people's inbound leads.
+          // - Outgoing messages (fromMe=true) are subject to the same filter:
+          //   if another user owns this JID, the outgoing echo is for their
+          //   conversation, not ours. (We don't claim ownership here — that
+          //   only happens in onSendMessage / onSendMedia when the user
+          //   actively sends via the system.)
+          if (this.sessionManager) {
+            const owner = this.sessionManager.getConversationOwner(jid)
+            const isAdmin = this.user && this.user.role === 'admin'
+            if (owner && owner !== this.userId) {
+              console.log(`[WA:${this.userId}] upsert msg skipped — conversation ${jid} owned by user ${owner}`)
+              continue
+            }
+            if (!owner && !isAdmin) {
+              console.log(`[WA:${this.userId}] upsert msg skipped — conversation ${jid} unclaimed (admin-only); non-admin user`)
+              continue
+            }
           }
 
           const conv = this.getOrCreateConversation(jid, fromMe ? undefined : pushName)
@@ -2267,6 +2357,16 @@ class UserSession {
             if (candidate) jid = normalizeJid(candidate)
           }
           if (!jid) continue
+          // v7.35: ownership filter on messages.update too. If this JID is owned
+          // by another user (or unclaimed and this user is not admin), skip the
+          // update entirely — we shouldn't be mutating someone else's conversation
+          // or creating a new message in it via the fallback path.
+          if (this.sessionManager) {
+            const owner = this.sessionManager.getConversationOwner(jid)
+            const isAdmin = this.user && this.user.role === 'admin'
+            if (owner && owner !== this.userId) continue
+            if (!owner && !isAdmin) continue
+          }
           const conv = this.conversations.get(jid)
           if (!conv) continue
 
@@ -2397,6 +2497,16 @@ class UserSession {
           jid = this.lidToPhoneMap.get(chat.id) || null
         }
         if (!jid) continue
+        // v7.35: Skip chats owned by other users, or unclaimed chats if this
+        // user is not admin. These chats come from Baileys' initial sync
+        // (messaging-history.set) and would otherwise pollute non-admin
+        // users with everyone else's conversations.
+        if (this.sessionManager) {
+          const owner = this.sessionManager.getConversationOwner(jid)
+          const isAdmin = this.user && this.user.role === 'admin'
+          if (owner && owner !== this.userId) continue
+          if (!owner && !isAdmin) continue
+        }
         if (!this.conversations.has(jid)) {
           const contactName = this.contactNames.get(jid) || null
           this.conversations.set(jid, {
@@ -2426,6 +2536,13 @@ class UserSession {
           jid = this.lidToPhoneMap.get(update.id) || null
         }
         if (!jid) continue
+        // v7.35: ownership filter — don't mutate other users' conversations
+        if (this.sessionManager) {
+          const owner = this.sessionManager.getConversationOwner(jid)
+          const isAdmin = this.user && this.user.role === 'admin'
+          if (owner && owner !== this.userId) continue
+          if (!owner && !isAdmin) continue
+        }
         const conv = this.conversations.get(jid)
         if (conv) {
           if (update.unreadCount !== undefined) conv.unreadCount = update.unreadCount
@@ -2601,6 +2718,23 @@ class UserSession {
 
   onGetMessages(data, callback) {
     const jid = normalizeJid(data?.jid)
+    // v7.35: Block access to conversations owned by another user.
+    // Non-admin users can only fetch messages for conversations they own.
+    // (Admin sees everything.)
+    if (jid && this.sessionManager) {
+      const owner = this.sessionManager.getConversationOwner(jid)
+      const isAdmin = this.user && this.user.role === 'admin'
+      if (owner && owner !== this.userId && !isAdmin) {
+        console.warn(`[WA:${this.userId}] onGetMessages denied for ${jid} — owned by ${owner}`)
+        callback?.({ messages: [], error: 'Acesso negado a esta conversa' })
+        return
+      }
+      if (!owner && !isAdmin) {
+        console.warn(`[WA:${this.userId}] onGetMessages denied for ${jid} — unclaimed (admin-only)`)
+        callback?.({ messages: [], error: 'Conversa não atribuída' })
+        return
+      }
+    }
     const conv = jid ? this.conversations.get(jid) : null
     if (!conv) { callback?.({ messages: [] }); return }
     const messages = conv.messages.slice(-200).map(m => ({
@@ -2616,6 +2750,21 @@ class UserSession {
       if (!jid) {
         callback?.({ success: false, error: 'Invalid JID', messages: [] })
         return
+      }
+      // v7.35: ownership check — same as onGetMessages
+      if (this.sessionManager) {
+        const owner = this.sessionManager.getConversationOwner(jid)
+        const isAdmin = this.user && this.user.role === 'admin'
+        if (owner && owner !== this.userId && !isAdmin) {
+          console.warn(`[WA:${this.userId}] onRefreshMessages denied for ${jid} — owned by ${owner}`)
+          callback?.({ success: false, error: 'Acesso negado a esta conversa', messages: [] })
+          return
+        }
+        if (!owner && !isAdmin) {
+          console.warn(`[WA:${this.userId}] onRefreshMessages denied for ${jid} — unclaimed (admin-only)`)
+          callback?.({ success: false, error: 'Conversa não atribuída', messages: [] })
+          return
+        }
       }
       const conv = this.conversations.get(jid)
       if (!conv) {
@@ -2751,6 +2900,16 @@ class UserSession {
         return
       }
 
+      // v7.35: Claim this conversation for the current user BEFORE sending.
+      // The first user to send a message to this JID becomes its owner.
+      // Subsequent sends by other users are still allowed (the message goes
+      // out via the shared WhatsApp number), but the original owner keeps
+      // ownership — i.e., incoming replies will be routed to the original
+      // owner, not to the user who later replied.
+      if (this.sessionManager) {
+        await this.sessionManager.claimConversation(jid, this.userId)
+      }
+
       const sent = await this.waSocket.sendMessage(jid, { text: data.text })
       const conv = this.getOrCreateConversation(jid)
       if (!conv) { callback?.({ success: false, error: 'Could not create conversation' }); return }
@@ -2819,6 +2978,11 @@ class UserSession {
       if (!this.waSocket || this.connectionState.connection !== 'open') { callback?.({ success: false, error: 'WhatsApp não conectado' }); return }
       const jid = normalizeJid(data?.jid)
       if (!jid) { callback?.({ success: false, error: 'Invalid contact JID' }); return }
+
+      // v7.35: Claim this conversation for the current user BEFORE sending.
+      if (this.sessionManager) {
+        await this.sessionManager.claimConversation(jid, this.userId)
+      }
 
       let sent
       if (data.type === 'image') sent = await this.waSocket.sendMessage(jid, { image: { url: data.url }, caption: data.caption })
@@ -2901,6 +3065,11 @@ class UserSession {
       const jid = normalizeJid(data?.jid)
       if (!jid) { callback?.({ success: false, error: 'Invalid contact JID' }); return }
       if (!data.base64 || !data.type) { callback?.({ success: false, error: 'Missing base64 or type' }); return }
+
+      // v7.35: Claim this conversation for the current user BEFORE sending.
+      if (this.sessionManager) {
+        await this.sessionManager.claimConversation(jid, this.userId)
+      }
 
       const buffer = Buffer.from(data.base64, 'base64')
       if (buffer.length === 0) { callback?.({ success: false, error: 'Empty file' }); return }
@@ -3749,9 +3918,100 @@ class SessionManager {
     // log lines visible in v7.33.1 Render logs, and was a contributing
     // cause of the 515 (loggedOut) status after QR scan.
     this._pending = new Map()  // userId -> Promise<UserSession|null>
+
+    // v7.35: Conversation ownership registry — maps normalizedJid -> ownerUserId.
+    // Used to enforce isolation between non-admin users sharing the same WhatsApp
+    // number (multi-device linked phones). When a user sends the FIRST message
+    // to a contact JID via the system (onSendMessage / onSendMedia), they
+    // "claim" that conversation. Incoming messages for that JID are then routed
+    // ONLY to the owner. Conversations with no owner (started by the contact
+    // directly on the phone) are visible ONLY to admins.
+    // Persisted to Firestore (collection: conversation_owners) so it survives
+    // deploys and Render sleep/wake cycles.
+    this.conversationOwners = new Map()  // jid -> userId
+    this._ownersLoaded = false
+    this._ownersLoading = null
+  }
+
+  // v7.35: Load conversation owner mappings from Firestore (idempotent).
+  // Called once on first getOrCreate() so the registry is ready before
+  // any UserSession starts processing messages.
+  async loadOwners() {
+    if (this._ownersLoaded) return
+    if (this._ownersLoading) return this._ownersLoading
+    this._ownersLoading = (async () => {
+      try {
+        const { getFirestoreOrNull } = require('./wa-firestore-auth-state.cjs')
+        const db = getFirestoreOrNull()
+        if (db) {
+          const snap = await db.collection('conversation_owners').get()
+          let count = 0
+          snap.forEach(doc => {
+            const data = doc.data()
+            if (data && data.ownerUserId && data.jid) {
+              this.conversationOwners.set(data.jid, data.ownerUserId)
+              count++
+            }
+          })
+          console.log(`[SessionManager] Loaded ${count} conversation owner mappings from Firestore`)
+        } else {
+          console.log(`[SessionManager] Firestore not configured — conversation owner registry is in-memory only (will be lost on restart)`)
+        }
+      } catch (err) {
+        console.error('[SessionManager] Failed to load conversation owners:', err && err.message)
+      } finally {
+        this._ownersLoaded = true
+        this._ownersLoading = null
+      }
+    })()
+    return this._ownersLoading
+  }
+
+  // v7.35: Returns ownerUserId for a JID, or null if no owner yet.
+  getConversationOwner(jid) {
+    if (!jid) return null
+    return this.conversationOwners.get(jid) || null
+  }
+
+  // v7.35: Claim a conversation for a user — only if it has no owner yet.
+  // If the conversation is already owned by another user, this is a no-op
+  // (the original owner keeps ownership). Persists to Firestore.
+  async claimConversation(jid, userId) {
+    if (!jid || !userId) return
+    const existing = this.conversationOwners.get(jid)
+    if (existing === userId) return  // already owned by this user
+    if (existing) {
+      // Already owned by someone else — keep current owner (don't overwrite)
+      console.log(`[SessionManager] claimConversation(${jid}, ${userId}) — already owned by ${existing}, ignoring`)
+      return
+    }
+    this.conversationOwners.set(jid, userId)
+    console.log(`[SessionManager] claimConversation(${jid}, ${userId}) — claimed`)
+    try {
+      const { getFirestoreOrNull } = require('./wa-firestore-auth-state.cjs')
+      const db = getFirestoreOrNull()
+      if (db) {
+        // Doc ID must be safe for Firestore — JIDs contain '@' and ':' which
+        // are valid in Firestore doc IDs, but to be extra safe we URL-encode.
+        // (Firestore doc IDs can be up to 1500 bytes; JIDs are far shorter.)
+        const docId = jid
+        await db.collection('conversation_owners').doc(docId).set({
+          jid,
+          ownerUserId: userId,
+          claimedAt: new Date(),
+        })
+      }
+    } catch (err) {
+      console.error(`[SessionManager] Failed to persist conversation owner for ${jid}:`, err && err.message)
+    }
   }
 
   async getOrCreate(userId) {
+    // v7.35: ensure conversation owner registry is loaded before any session
+    // starts processing messages. Idempotent — first call kicks off the load,
+    // subsequent calls await the same promise.
+    await this.loadOwners()
+
     const existing = this.sessions.get(userId)
     if (existing) return existing
 
@@ -3773,7 +4033,7 @@ class SessionManager {
         const raced = this.sessions.get(userId)
         if (raced) return raced
 
-        const s = new UserSession({ userId, user, io: this.io, prisma: this.prisma })
+        const s = new UserSession({ userId, user, io: this.io, prisma: this.prisma, sessionManager: this })
         this.sessions.set(userId, s)
         await s.start()
         return s

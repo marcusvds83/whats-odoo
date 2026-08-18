@@ -6,10 +6,10 @@ bun install v1.3.14 (0d9b296a)
 + socket.io@4.8.3
 + xmlrpc@1.3.2
 
-27 packages installed [201.00ms]
+27 packages installed [231.00ms]
 [odoo-service] Running bun run dev...
 $ bun x tsx index.ts
 [Odoo Service] Server running on port 3002
 [Odoo Service] Auto-sync enabled: true
 [Odoo] No ODOO_URL/ODOO_DB/ODOO_USERNAME/ODOO_PASSWORD env vars set. Waiting for manual connection via UI.
-[Odoo IO] Client connected: 1PkQkCC28lZgWbZ3AAAB
+[Odoo IO] Client connected: 2QIInxZyJlO9dfckAAAB
