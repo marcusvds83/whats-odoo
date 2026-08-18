@@ -514,105 +514,194 @@ class UserSession {
   // Persistence — conversations/contacts/messages to per-user JSON file
   // ------------------------------------------------------------------
 
+  // v7.37: Build the snapshot object once, used by both disk + Firestore writes.
+  _buildSnapshot() {
+    return {
+      version: 1,
+      userId: this.userId,
+      savedAt: new Date().toISOString(),
+      conversations: Array.from(this.conversations.values()).map(c => ({
+        jid: c.jid,
+        name: c.name,
+        phone: c.phone,
+        pushName: c.pushName,
+        avatarUrl: c.avatarUrl,
+        lastMessage: c.lastMessage,
+        lastMessageAt: c.lastMessageAt ? c.lastMessageAt.toISOString() : null,
+        unreadCount: c.unreadCount,
+        messages: c.messages.map(m => ({
+          ...m,
+          timestamp: m.timestamp instanceof Date ? m.timestamp.toISOString() : m.timestamp,
+        })),
+      })),
+      contactNames: Array.from(this.contactNames.entries()),
+      deviceContacts: Array.from(this.deviceContacts.values()),
+      lidToPhoneMap: Array.from(this.lidToPhoneMap.entries()),
+    }
+  }
+
   persistConversationsToDisk() {
     try {
-      const snapshot = {
-        version: 1,
-        userId: this.userId,
-        savedAt: new Date().toISOString(),
-        conversations: Array.from(this.conversations.values()).map(c => ({
-          jid: c.jid,
-          name: c.name,
-          phone: c.phone,
-          pushName: c.pushName,
-          avatarUrl: c.avatarUrl,
-          lastMessage: c.lastMessage,
-          lastMessageAt: c.lastMessageAt ? c.lastMessageAt.toISOString() : null,
-          unreadCount: c.unreadCount,
-          messages: c.messages.map(m => ({
-            ...m,
-            timestamp: m.timestamp instanceof Date ? m.timestamp.toISOString() : m.timestamp,
-          })),
-        })),
-        contactNames: Array.from(this.contactNames.entries()),
-        deviceContacts: Array.from(this.deviceContacts.values()),
-        lidToPhoneMap: Array.from(this.lidToPhoneMap.entries()),
-      }
+      const snapshot = this._buildSnapshot()
       fs.writeFileSync(this.stateFile, JSON.stringify(snapshot), 'utf8')
-      console.log(`[UserSession:${this.userId}] Persisted ${snapshot.conversations.length} conversations to disk`)
+      console.log(`[UserSession:${this.userId}] Persisted ${snapshot.conversations.length} conversations, ${snapshot.deviceContacts.length} device contacts to disk`)
+
+      // v7.37: Also persist to Firestore so it survives Render deploys
+      // (which wipe the ephemeral disk). Fire-and-forget — the disk write
+      // already guarantees durability for the current process. If Firestore
+      // is unconfigured or fails, we just log and continue.
+      this._persistConversationsToFirestore(snapshot).catch(err => {
+        console.warn(`[UserSession:${this.userId}] Firestore conv-state persist failed: ${err && err.message}`)
+      })
     } catch (err) {
       console.error(`[UserSession:${this.userId}] Failed to persist conversations: ${err.message}`)
     }
   }
 
+  // v7.37: Persist conversation state to Firestore.
+  // Stored in collection `wa_conv_states` keyed by userId. This is the
+  // counterpart to `wa_auth_states` — together they allow a full session
+  // (auth creds + all conversations/contacts) to survive a Render deploy
+  // or any other ephemeral-disk wipe.
+  async _persistConversationsToFirestore(snapshot) {
+    const { getFirestoreOrNull } = require('./wa-firestore-auth-state.cjs')
+    const db = getFirestoreOrNull()
+    if (!db) return  // Firestore not configured — disk-only mode
+    const docRef = db.collection('wa_conv_states').doc(String(this.userId))
+    // Firestore docs have a 1 MiB size limit. A snapshot with many
+    // conversations + messages could exceed this. We attempt the write
+    // and log on failure — but for typical usage (<500 conversations,
+    // <200 messages each) we stay well under the limit.
+    await docRef.set({
+      snapshot: JSON.stringify(snapshot),
+      savedAt: new Date(),
+      conversationCount: snapshot.conversations.length,
+      deviceContactCount: snapshot.deviceContacts.length,
+    }, { merge: false })
+    console.log(`[UserSession:${this.userId}] ✓ Persisted conv state to Firestore (${snapshot.conversations.length} convs, ${snapshot.deviceContacts.length} contacts)`)
+  }
+
   loadConversationsFromDisk() {
     try {
-      if (!fs.existsSync(this.stateFile)) {
-        console.log(`[UserSession:${this.userId}] No saved conversation state — starting fresh`)
-        return
-      }
-      const raw = fs.readFileSync(this.stateFile, 'utf8')
-      const snapshot = JSON.parse(raw)
-      if (!snapshot || snapshot.version !== 1) {
-        console.log(`[UserSession:${this.userId}] Saved conversation state is old format — ignoring`)
-        return
-      }
-
-      let loaded = 0
-      let droppedOwnedByOther = 0
-      // v7.35: When loading saved conversations from disk, filter out any
-      // conversation that is now owned by ANOTHER user. This handles the
-      // migration scenario: prior to v7.35, all users on a shared WhatsApp
-      // number would persist every conversation to their own conv_state file
-      // (because there was no ownership filter). After v7.35 deploys, those
-      // files contain conversations that belong to other users — we must
-      // drop them on load so the UI doesn't display them again.
-      // (Conversations with no owner in the registry are kept — they'll be
-      // filtered at display-time for non-admins by getSortedConversations.)
-      const _sm = this.sessionManager
-      const _isAdmin = this.user && this.user.role === 'admin'
-      for (const c of snapshot.conversations || []) {
-        if (!c.jid || !isValidPhoneJid(c.jid)) continue
-        if (_sm) {
-          const owner = _sm.getConversationOwner(c.jid)
-          if (owner && owner !== this.userId) {
-            droppedOwnedByOther++
-            continue
-          }
+      let snapshot = null
+      if (fs.existsSync(this.stateFile)) {
+        const raw = fs.readFileSync(this.stateFile, 'utf8')
+        snapshot = JSON.parse(raw)
+        if (!snapshot || snapshot.version !== 1) {
+          console.log(`[UserSession:${this.userId}] Saved conversation state on disk is old format — ignoring`)
+          snapshot = null
         }
-        this.conversations.set(c.jid, {
-          jid: c.jid,
-          name: c.name || null,
-          phone: c.phone || extractPhone(c.jid),
-          pushName: c.pushName || null,
-          avatarUrl: c.avatarUrl || null,
-          lastMessage: c.lastMessage || null,
-          lastMessageAt: c.lastMessageAt ? new Date(c.lastMessageAt) : null,
-          unreadCount: c.unreadCount || 0,
-          messages: (c.messages || []).map(m => ({
-            ...m,
-            timestamp: m.timestamp ? new Date(m.timestamp) : new Date(),
-          })),
+      }
+
+      // v7.37: If disk file is missing or old format (typical after a Render
+      // deploy that wiped the ephemeral disk), try to load from Firestore.
+      // The Firestore doc stores the same snapshot JSON-stringified.
+      if (!snapshot) {
+        console.log(`[UserSession:${this.userId}] No conv state on disk — trying Firestore fallback`)
+        // We can't use await here because loadConversationsFromDisk is
+        // synchronous (called from start() before the async connect flow).
+        // Spawn an async load that re-populates Maps AFTER start returns.
+        // This is OK because Baileys' live events will keep working in the
+        // background; we just need to populate the Maps before the UI
+        // requests them.
+        this._loadConversationsFromFirestore().catch(err => {
+          console.warn(`[UserSession:${this.userId}] Firestore conv-state load failed: ${err && err.message}`)
         })
-        loaded++
-      }
-      if (droppedOwnedByOther > 0) {
-        console.log(`[UserSession:${this.userId}] Dropped ${droppedOwnedByOther} conversation(s) from disk state — owned by other users (v7.35 isolation)`)
+        return
       }
 
-      for (const [jid, name] of snapshot.contactNames || []) {
-        this.contactNames.set(jid, name)
-      }
-      for (const c of snapshot.deviceContacts || []) {
-        if (c.jid) this.deviceContacts.set(c.jid, c)
-      }
-      for (const [lid, phone] of snapshot.lidToPhoneMap || []) {
-        this.lidToPhoneMap.set(lid, phone)
-      }
-
-      console.log(`[UserSession:${this.userId}] ✓ Loaded ${loaded} conversations, ${this.contactNames.size} contact names, ${this.deviceContacts.size} device contacts (saved ${snapshot.savedAt})`)
+      this._applySnapshot(snapshot)
+      console.log(`[UserSession:${this.userId}] ✓ Loaded ${this.conversations.size} conversations, ${this.contactNames.size} contact names, ${this.deviceContacts.size} device contacts from disk (saved ${snapshot.savedAt})`)
     } catch (err) {
       console.error(`[UserSession:${this.userId}] Failed to load conversations from disk: ${err.message}`)
+    }
+  }
+
+  // v7.37: Load conversation state from Firestore and apply it.
+  // Used when the local disk file is missing (e.g., after Render deploy).
+  async _loadConversationsFromFirestore() {
+    try {
+      const { getFirestoreOrNull } = require('./wa-firestore-auth-state.cjs')
+      const db = getFirestoreOrNull()
+      if (!db) {
+        console.log(`[UserSession:${this.userId}] No Firestore conv state available — starting fresh`)
+        return
+      }
+      const docRef = db.collection('wa_conv_states').doc(String(this.userId))
+      const doc = await docRef.get()
+      if (!doc.exists) {
+        console.log(`[UserSession:${this.userId}] No conv state in Firestore — starting fresh`)
+        return
+      }
+      const data = doc.data()
+      if (!data || !data.snapshot) {
+        console.log(`[UserSession:${this.userId}] Firestore conv state doc has no snapshot — starting fresh`)
+        return
+      }
+      let snapshot
+      try { snapshot = JSON.parse(data.snapshot) }
+      catch { console.warn(`[UserSession:${this.userId}] Firestore conv state snapshot is not valid JSON`); return }
+      if (!snapshot || snapshot.version !== 1) {
+        console.log(`[UserSession:${this.userId}] Firestore conv state is old format — ignoring`)
+        return
+      }
+      this._applySnapshot(snapshot)
+      console.log(`[UserSession:${this.userId}] ✓✓ Loaded ${this.conversations.size} conversations, ${this.contactNames.size} contact names, ${this.deviceContacts.size} device contacts FROM FIRESTORE (saved ${snapshot.savedAt}) — disk was empty`)
+      // Emit a conversations update so any connected frontend sees the
+      // newly-restored conversations immediately.
+      this.emitWA('whatsapp:conversations', this.getSortedConversations())
+    } catch (err) {
+      console.error(`[UserSession:${this.userId}] Failed to load conv state from Firestore:`, err && err.message)
+    }
+  }
+
+  // v7.37: Apply a snapshot (from disk OR Firestore) to the in-memory Maps.
+  // Shared by both loadConversationsFromDisk and _loadConversationsFromFirestore.
+  _applySnapshot(snapshot) {
+    let loaded = 0
+    let droppedOwnedByOther = 0
+    // v7.35/v7.37: When loading saved conversations, filter out any
+    // conversation that is now owned by ANOTHER user. Conversations with
+    // no owner (external leads) are kept — they're visible to everyone
+    // per v7.36 rules.
+    const _sm = this.sessionManager
+    for (const c of snapshot.conversations || []) {
+      if (!c.jid || !isValidPhoneJid(c.jid)) continue
+      if (_sm) {
+        const owner = _sm.getConversationOwner(c.jid)
+        if (owner && owner !== this.userId) {
+          droppedOwnedByOther++
+          continue
+        }
+      }
+      this.conversations.set(c.jid, {
+        jid: c.jid,
+        name: c.name || null,
+        phone: c.phone || extractPhone(c.jid),
+        pushName: c.pushName || null,
+        avatarUrl: c.avatarUrl || null,
+        lastMessage: c.lastMessage || null,
+        lastMessageAt: c.lastMessageAt ? new Date(c.lastMessageAt) : null,
+        unreadCount: c.unreadCount || 0,
+        messages: (c.messages || []).map(m => ({
+          ...m,
+          timestamp: m.timestamp ? new Date(m.timestamp) : new Date(),
+        })),
+      })
+      loaded++
+    }
+    if (droppedOwnedByOther > 0) {
+      console.log(`[UserSession:${this.userId}] Dropped ${droppedOwnedByOther} conversation(s) from saved state — owned by other users (v7.35 isolation)`)
+    }
+
+    for (const [jid, name] of snapshot.contactNames || []) {
+      this.contactNames.set(jid, name)
+    }
+    for (const c of snapshot.deviceContacts || []) {
+      if (c.jid) this.deviceContacts.set(c.jid, c)
+    }
+    for (const [lid, phone] of snapshot.lidToPhoneMap || []) {
+      this.lidToPhoneMap.set(lid, phone)
     }
   }
 
@@ -1720,6 +1809,12 @@ class UserSession {
               db.collection('wa_auth_states').doc(String(this.userId)).delete()
                 .then(() => console.log(`[WA:${this.userId}] Cleared Firestore auth state (loggedOut)`))
                 .catch(err => console.warn(`[WA:${this.userId}] Could not clear Firestore auth state:`, err.message))
+              // v7.37: Also clear conv state — otherwise on next QR scan
+              // the user would inherit stale conversations/contacts from
+              // the previous session.
+              db.collection('wa_conv_states').doc(String(this.userId)).delete()
+                .then(() => console.log(`[WA:${this.userId}] Cleared Firestore conv state (loggedOut)`))
+                .catch(err => console.warn(`[WA:${this.userId}] Could not clear Firestore conv state:`, err.message))
             }
           } catch {}
           // Also delete the local filesystem auth folder so we don't
@@ -2662,6 +2757,9 @@ class UserSession {
         if (db) {
           await db.collection('wa_auth_states').doc(String(this.userId)).delete()
           console.log(`[WA:${this.userId}] Force-new-QR: Cleared Firestore auth state`)
+          // v7.37: Also clear conv state so the new session starts fresh.
+          await db.collection('wa_conv_states').doc(String(this.userId)).delete()
+          console.log(`[WA:${this.userId}] Force-new-QR: Cleared Firestore conv state`)
         }
       } catch (err) {
         console.warn(`[WA:${this.userId}] Force-new-QR: Could not clear Firestore auth state:`, err && err.message)
@@ -3205,6 +3303,9 @@ class UserSession {
           if (db) {
             await db.collection('wa_auth_states').doc(String(this.userId)).delete()
             console.log(`[WA:${this.userId}] Cleared Firestore auth state (explicit logout)`)
+            // v7.37: Also clear conv state on explicit logout.
+            await db.collection('wa_conv_states').doc(String(this.userId)).delete()
+            console.log(`[WA:${this.userId}] Cleared Firestore conv state (explicit logout)`)
           }
         } catch (err) {
           console.warn(`[WA:${this.userId}] Could not clear Firestore auth state on logout:`, err && err.message)

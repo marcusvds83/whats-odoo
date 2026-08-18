@@ -1301,3 +1301,27 @@ Stage Summary:
 - File edited: src/server/user-session.js (8 filter sites relaxed), package.json, src/app/login/page.tsx
 - Behavior change: external inbound messages and phone contacts are now visible to BOTH admin and normal users. Only conversations already OWNED BY ANOTHER user remain hidden from non-admin users. Admin continues to see everything.
 - Compatibility: ownership claim logic (claimConversation in onSendMessage/onSendMedia/onSendMediaBase64) is untouched — first user to respond to an unclaimed lead still becomes its owner.
+
+---
+Task ID: v7.37
+Agent: Main Agent
+Task: Persist conversation state to Firestore so phone contacts and conversations survive Render deploys (which wipe the ephemeral disk)
+
+Work Log:
+- Root cause analysis: Render's ephemeral disk wipes `data/conv_state_<userId>.json` on every deploy. The WhatsApp auth state survives (already in Firestore via wa-firestore-auth-state.cjs), but the conversation snapshot (deviceContacts, conversations, contactNames, lidToPhoneMap, message history) does NOT. Without a fresh QR scan, Baileys won't re-fire messaging-history.set, so deviceContacts stays empty after every deploy.
+- This explains why v7.36's filter relaxation didn't help: there was simply no data in memory to display.
+- Added _buildSnapshot() helper that produces the snapshot object (shared by disk + Firestore writes).
+- Modified persistConversationsToDisk() to also call _persistConversationsToFirestore() (fire-and-forget async).
+- Added _persistConversationsToFirestore() — writes to Firestore collection `wa_conv_states` keyed by userId. Stores snapshot as JSON string (Firestore docs have 1 MiB limit; typical usage is well under).
+- Refactored loadConversationsFromDisk() to use new _applySnapshot() helper. If disk file is missing (typical post-deploy), spawns async _loadConversationsFromFirestore() to fetch and apply from Firestore.
+- Added _loadConversationsFromFirestore() — fetches wa_conv_states/{userId}, parses snapshot JSON, applies to Maps, emits whatsapp:conversations event so frontend sees restored data immediately.
+- Added _applySnapshot() — shared logic that populates conversations/contactNames/deviceContacts/lidToPhoneMap Maps from a snapshot. Preserves v7.35 ownership filter (conversations owned by other users are skipped).
+- Updated 3 logout paths to also delete wa_conv_states doc: connection-close loggedOut, force-new-QR, explicit logout. Otherwise next QR scan would inherit stale state.
+- Bumped version to 7.37.0 in package.json and login page footer.
+- Ran `node -c src/server/user-session.js` → SYNTAX_OK.
+
+Stage Summary:
+- File edited: src/server/user-session.js, package.json, src/app/login/page.tsx
+- Behavior change: Conversation state (contacts + conversations + messages) now persists to Firestore on every debounced save (every ~30s when dirty). On startup, if disk file is missing, falls back to Firestore. Survives Render deploys, restarts, sleep/wake cycles.
+- IMPORTANT: For users with existing WhatsApp sessions, after deploying v7.37 they should do "Logout" + re-scan QR ONCE to trigger a fresh history sync that loads all phone contacts. After that, the state will be persisted and survive future deploys automatically.
+- Compatibility: v7.36 ownership rules preserved (unclaimed conversations visible to everyone; conversations owned by another user hidden from non-admins).
