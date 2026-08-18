@@ -66,8 +66,17 @@ function AdminLoginForm() {
       const data = await res.json()
 
       if (data.success) {
-        router.push(redirectPath)
-        router.refresh()
+        // v7.33.1: Use hard navigation (window.location.href) instead of
+        // router.push() + router.refresh(). Avoids a race condition where
+        // the Set-Cookie from the POST hadn't been committed yet when the
+        // next page load fired, causing the middleware to redirect back
+        // to the login page. See /login page for the same fix.
+        if (typeof window !== 'undefined') {
+          window.location.href = redirectPath
+        } else {
+          router.push(redirectPath)
+          router.refresh()
+        }
       } else {
         setError(data.error || 'Falha na autenticação')
       }

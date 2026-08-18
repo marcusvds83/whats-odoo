@@ -139,6 +139,15 @@ export function getFirestoreDb(): Firestore | null {
       console.log(`[firebase-admin] ✓ Reusing existing Firebase Admin app (configured via ${_configSource})`)
     }
     cachedDb = getFirestore()
+    // v7.33.1: ignoreUndefinedProperties — silently drop undefined fields
+    // instead of throwing "Cannot use 'undefined' as a Firestore value".
+    // This matches wa-firestore-auth-state.cjs and prevents future issues
+    // if any user record happens to contain undefined fields.
+    try {
+      cachedDb.settings({ ignoreUndefinedProperties: true })
+    } catch (_) {
+      // settings() throws if called more than once — safe to ignore.
+    }
     console.log('[firebase-admin] ✓ Firestore instance obtained — user records will persist in Firestore (survives deploys)')
     return cachedDb
   } catch (err: any) {

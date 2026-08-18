@@ -71,7 +71,15 @@ function getFirestore() {
       _app = existing || initializeApp({ credential: cert(parseCredentials()) })
     }
     const { getFirestore } = require('firebase-admin/firestore')
-    _firestore = getFirestore(_app)
+    const db = getFirestore(_app)
+    // v7.33.1: ignoreUndefinedProperties — silently drop undefined fields.
+    // Matches wa-firestore-auth-state.cjs and firebase-admin.ts.
+    try {
+      db.settings({ ignoreUndefinedProperties: true })
+    } catch (_) {
+      // settings() throws if called more than once on the same instance.
+    }
+    _firestore = db
   } catch (err) {
     console.error(`[user-lookup] Firebase init failed, falling back to SQLite: ${err && err.message}`)
     _app = null

@@ -82,7 +82,23 @@ function getFirestoreOrNull() {
       if (!sa) return null
       app = initializeApp({ credential: cert(sa) })
     }
-    return getFirestore(app)
+    const db = getFirestore(app)
+    // v7.33.1: ignoreUndefinedProperties=true — CRITICAL.
+    // Baileys' initAuthCreds() returns an object with `pairingCode: undefined`
+    // and `lastPropHash: undefined`. Firestore REJECTS any document containing
+    // undefined values by default (throws "Cannot use 'undefined' as a
+    // Firestore value"). This was causing persistState() to fail every time
+    // the user scanned the QR code → creds never got saved → on reconnect
+    // we generated fresh initAuthCreds() → the scan was lost forever and
+    // the user saw an infinite spinner. Enabling this flag tells Firestore
+    // to silently drop undefined fields instead of throwing.
+    try {
+      db.settings({ ignoreUndefinedProperties: true })
+    } catch (_) {
+      // settings() throws if called more than once on the same instance —
+      // safe to ignore since the setting is already applied from a prior call.
+    }
+    return db
   } catch (err) {
     console.error('[wa-firestore-auth-state] Failed to init Firestore:', err && err.message)
     return null

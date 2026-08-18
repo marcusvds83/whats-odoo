@@ -56,8 +56,21 @@ function LoginForm() {
       const data = await res.json()
 
       if (data.success) {
-        router.push(redirectPath)
-        router.refresh()
+        // v7.33.1: Use hard navigation (window.location.href) instead of
+        // router.push() + router.refresh(). The previous approach had a
+        // race condition on some browsers where the Set-Cookie from the
+        // POST response hadn't been committed to the cookie jar yet when
+        // router.push('/') triggered the next page load — so the middleware
+        // saw no cookie and redirected back to /login, leaving the user
+        // stuck on the login page. A hard navigation forces the browser to
+        // wait for the POST response to fully complete (including Set-Cookie)
+        // before starting the next request.
+        if (typeof window !== 'undefined') {
+          window.location.href = redirectPath
+        } else {
+          router.push(redirectPath)
+          router.refresh()
+        }
       } else {
         setError(data.error || 'Falha na autenticação')
       }
@@ -207,7 +220,7 @@ export default function LoginPage() {
         </Suspense>
 
         <p className="text-xs text-muted-foreground text-center mt-4">
-          v7.31 • Firebase status + force QR
+          v7.33.1 • Firebase status + force QR
         </p>
       </div>
     </div>
