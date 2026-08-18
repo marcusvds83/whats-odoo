@@ -1,14 +1,21 @@
 // ====================================================================
-// WhatsApp-Odoo v7.28 — UserStore
+// WhatsApp-Odoo v7.30 — UserStore
 // --------------------------------------------------------------------
 // Camada única de acesso aos usuários. Abstrai o banco usado para LOGINS:
 //   - Se o Firebase Admin estiver configurado → leitura/escrita no
 //     Firestore (coleção "users", um documento por usuário).
 //   - Caso contrário → mantém o comportamento antigo no SQLite (Prisma).
 //
-// O resto do app (WhatsApp, conversas, Odoo) NÃO passa por aqui e
-// continua no SQLite, exatamente como você pediu: Firestore apenas
-// para criar e manter os logins de usuários.
+// v7.30 changes:
+//   - `create()` now verifies the Firestore write actually landed by
+//     reading the doc back. If verification fails, surfaces a clear error
+//     (instead of silently succeeding but leaving no record in Firestore).
+//   - `findUnique()` falls back to SQLite ONLY when Firestore is not
+//     configured at all. If Firestore IS configured but the user isn't
+//     there, returns null (don't accidentally find a stale SQLite user).
+//   - Added `migrateAllFromSqlite()` for one-time backfill of existing
+//     SQLite users into Firestore.
+//   - Added `countInSqlite()` and `findManyInSqlite()` for the migration.
 //
 // Coleção Firestore:
 //   users/{id}  → { id, email, passwordHash, name, role, isActive,
@@ -17,7 +24,7 @@
 // ====================================================================
 
 import { db } from '@/lib/db'
-import { getFirestoreDb } from '@/lib/firebase-admin'
+import { getFirestoreDb, verifyFirestoreDoc } from '@/lib/firebase-admin'
 import type { Firestore } from 'firebase-admin/firestore'
 
 export interface UserRecord {
@@ -130,6 +137,20 @@ async function fsCreate(firestore: Firestore, data: CreateUserData): Promise<Use
     updatedAt: now,
   }
   await docRef.set(payload)
+
+  // v7.30: VERIFY the write actually landed. Previously, if Firestore
+  // silently rejected the write (e.g., due to permissions or a backend
+  // issue), `fsCreate` would still return success — and the admin would
+  // see "User created" but login would fail because there's no record
+  // to find. Now we read the doc back to confirm.
+  const verify = await verifyFirestoreDoc('users', id, 3000)
+  if (!verify.ok) {
+    // Don't silently succeed — throw with a clear message so the API route
+    // surfaces the error to the admin.
+    throw new Error(`Firestore write verification failed for user ${data.email}: ${verify.error || 'unknown'}. The user was NOT saved — check Firebase Admin SDK configuration and permissions.`)
+  }
+  console.log(`[user-store] ✓ Verified Firestore write: users/${id} (email=${data.email})`)
+
   return toRecord(payload) as UserRecord
 }
 
@@ -214,6 +235,119 @@ export const userStore = {
     const firestore = getFirestoreDb()
     if (firestore) return fsMany(firestore)
     return db.user.findMany(args as any) as unknown as UserRecord[]
+  },
+
+  // ==================================================================
+  // v7.30: Migration helpers — used by the auto-migration routine that
+  // backfills existing SQLite users into Firestore on server startup.
+  // Only call these from the migration endpoint / startup hook.
+  // ==================================================================
+
+  /** Count users stored in SQLite (ignores Firestore). */
+  async countInSqlite(): Promise<number> {
+    try {
+      return await db.user.count()
+    } catch (err: any) {
+      console.warn('[user-store] countInSqlite failed:', err.message)
+      return 0
+    }
+  },
+
+  /** Read all users from SQLite (ignores Firestore). */
+  async findManyInSqlite(): Promise<UserRecord[]> {
+    try {
+      return await db.user.findMany() as unknown as UserRecord[]
+    } catch (err: any) {
+      console.warn('[user-store] findManyInSqlite failed:', err.message)
+      return []
+    }
+  },
+
+  /**
+   * One-time migration: copy every SQLite user into Firestore.
+   * - Skips users that already exist in Firestore (by email — case-insensitive).
+   * - Preserves the original `id` so existing JWTs and auth state folders
+   *   (data/auth_<userId>/) keep working without remapping.
+   * - Returns { total, migrated, skipped, errors }.
+   *
+   * This is idempotent — safe to call multiple times.
+   */
+  async migrateAllFromSqlite(): Promise<{ total: number; migrated: number; skipped: number; errors: string[] }> {
+    const firestore = getFirestoreDb()
+    if (!firestore) {
+      return { total: 0, migrated: 0, skipped: 0, errors: ['Firestore not initialized — cannot migrate'] }
+    }
+    const sqliteUsers = await this.findManyInSqlite()
+    const result = { total: sqliteUsers.length, migrated: 0, skipped: 0, errors: [] as string[] }
+    if (sqliteUsers.length === 0) {
+      console.log('[user-store] migrateAllFromSqlite: SQLite has 0 users — nothing to migrate')
+      return result
+    }
+    console.log(`[user-store] migrateAllFromSqlite: scanning ${sqliteUsers.length} SQLite user(s)...`)
+    for (const u of sqliteUsers) {
+      try {
+        // Check if a user with the same email already exists in Firestore.
+        const existingSnap = await firestore.collection('users').where('email', '==', u.email).limit(1).get()
+        if (!existingSnap.empty) {
+          // Already migrated — skip but keep the original id (the SQLite id
+          // and the Firestore id might differ; for forward compat, if the
+          // existing Firestore doc has a DIFFERENT id, we should rewrite it
+          // to match the SQLite id so existing JWTs keep working).
+          const existingDoc = existingSnap.docs[0]
+          if (existingDoc.id !== u.id) {
+            console.log(`[user-store] migrateAllFromSqlite: email=${u.email} exists in Firestore with id=${existingDoc.id} but SQLite id=${u.id}. Re-aligning id...`)
+            // Delete the existing doc and re-create with the SQLite id.
+            await existingDoc.ref.delete()
+            const newDocRef = firestore.collection('users').doc(u.id)
+            await newDocRef.set({
+              id: u.id,
+              email: u.email,
+              passwordHash: u.passwordHash,
+              name: u.name,
+              role: u.role,
+              odooUrl: u.odooUrl,
+              odooDb: u.odooDb,
+              odooUsername: u.odooUsername,
+              odooPassword: u.odooPassword,
+              whatsappPhone: u.whatsappPhone,
+              isActive: u.isActive,
+              createdAt: u.createdAt,
+              updatedAt: new Date(),
+            })
+            result.migrated++
+            console.log(`[user-store] migrateAllFromSqlite: ✓ re-aligned ${u.email} to id=${u.id}`)
+          } else {
+            result.skipped++
+            console.log(`[user-store] migrateAllFromSqlite: skip ${u.email} (already in Firestore)`)
+          }
+          continue
+        }
+        // Not in Firestore — create with the same id as SQLite.
+        const docRef = firestore.collection('users').doc(u.id)
+        await docRef.set({
+          id: u.id,
+          email: u.email,
+          passwordHash: u.passwordHash,
+          name: u.name,
+          role: u.role,
+          odooUrl: u.odooUrl,
+          odooDb: u.odooDb,
+          odooUsername: u.odooUsername,
+          odooPassword: u.odooPassword,
+          whatsappPhone: u.whatsappPhone,
+          isActive: u.isActive,
+          createdAt: u.createdAt,
+          updatedAt: new Date(),
+        })
+        result.migrated++
+        console.log(`[user-store] migrateAllFromSqlite: ✓ migrated ${u.email} (id=${u.id})`)
+      } catch (err: any) {
+        result.errors.push(`${u.email}: ${err.message}`)
+        console.error(`[user-store] migrateAllFromSqlite: ✗ failed for ${u.email}:`, err.message)
+      }
+    }
+    console.log(`[user-store] migrateAllFromSqlite: done — migrated=${result.migrated} skipped=${result.skipped} errors=${result.errors.length}`)
+    return result
   },
 }
 

@@ -1006,3 +1006,36 @@ Stage Summary:
   text/media content); the real issue was that the frontend page never rendered at all
 - Two-layer defense: (1) hooks-order fix eliminates the crash, (2) error.tsx catches any
   future runtime exception and shows a recoverable UI instead of a dead white screen
+
+---
+Task ID: v7.30
+Agent: main
+Task: Fix regular user login (users not in Firebase) + implement Firebase session persistence for WhatsApp + Odoo across deploys (admin + users)
+
+Work Log:
+- Diagnosed root cause: userStore.create() was writing to Firestore when configured, but no write verification — silent failures meant users "succeeded" in the UI but never landed in Firestore. Then login (which queries Firestore) returned 401 → "can't reach main screen".
+- Added explicit logging at every step of getFirestoreDb() init in src/lib/firebase-admin.ts — now we can see exactly WHERE init fails when env vars are set but writes don't land.
+- Added getFirebaseDiagnostics() and verifyFirestoreDoc() exports for the new debug endpoint and user-store.
+- Updated src/lib/user-store.ts::fsCreate() to verify the Firestore write by reading the doc back. If verification fails, throw a clear error instead of silently succeeding.
+- Added userStore.migrateAllFromSqlite() — one-time idempotent backfill of existing SQLite users into Firestore, preserving original user ids so existing JWTs and auth_state folders keep working.
+- Created src/server/user-migration.cjs as a CommonJS bridge so server.js can call the migration on startup (server.js can't `await import('./src/lib/user-store.ts')` because Node doesn't transpile TS).
+- Updated server.js to run the auto-migration on startup (idempotent — skips users that already exist by email).
+- Added /api/auth/debug (admin-only) — returns Firebase config status, init status, user counts in Firestore + SQLite, sample users in each. Use this to diagnose "users aren't in Firebase".
+- Added /api/auth/migrate-users (admin-only) — manually trigger the SQLite → Firestore migration.
+- Created src/server/wa-firestore-auth-state.cjs — Firestore-backed Baileys auth state. Stores creds + signal keys in Firestore collection wa_auth_states/{userId}. Auto-migrates existing filesystem state to Firestore on first read. Falls back to useMultiFileAuthState (filesystem) when Firestore isn't configured.
+- Modified src/server/user-session.js::_connectWhatsAppInner to use usePersistentAuthState instead of useMultiFileAuthState. WhatsApp sessions now persist in Firestore and survive deploys even if the disk is wiped.
+- Modified UserSession.start() to also check Firestore for an existing session (so hasSavedSession is accurate even when the filesystem was wiped).
+- Modified the loggedOut handler in connection.update to clear Firestore auth state too (otherwise on next restart Baileys would re-hydrate logged-out creds and immediately 401, looping forever).
+- Modified onDisconnectWA (explicit logout) to clear Firestore auth state too.
+- Bumped version to 7.30.0 in package.json, login page, admin page, and main page footer.
+- Verified Next.js build succeeds (15 routes generated, including new /api/auth/debug and /api/auth/migrate-users).
+- Verified all JS files pass `node -c` syntax check.
+- Admin flow is PRESERVED: existing creds in data/auth_<userId>/creds.json auto-migrate to Firestore on first connect. Same creds, same connection — just stored in Firestore instead of (or in addition to) the filesystem.
+
+Stage Summary:
+- v7.30.0 changes are 100% backward-compatible.
+- Regular users should now be able to login after deploy (auto-migration backfills them into Firestore on startup).
+- WhatsApp sessions for both admin and users persist in Firestore across deploys.
+- Odoo per-user config was already in the user record (Firestore via userStore) — survives deploys.
+- 4 new files: src/lib/firebase-admin.ts (rewritten), src/lib/user-store.ts (extended), src/server/wa-firestore-auth-state.cjs, src/server/user-migration.cjs, src/app/api/auth/debug/route.ts, src/app/api/auth/migrate-users/route.ts.
+- Modified files: server.js, src/server/user-session.js, src/app/page.tsx, src/app/login/page.tsx, src/app/admin/page.tsx, package.json.

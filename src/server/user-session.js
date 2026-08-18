@@ -24,6 +24,11 @@ const fs = require('fs')
 const { createClient, createSecureClient } = require('xmlrpc')
 const { PrismaClient } = require('@prisma/client')
 
+// v7.30: Firestore-backed Baileys auth state — persists WhatsApp sessions
+// across deploys even if the disk is wiped. Falls back to filesystem
+// (useMultiFileAuthState) if Firestore is not configured.
+const { usePersistentAuthState } = require('./wa-firestore-auth-state.cjs')
+
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data')
 
 // ====================================================================
@@ -340,6 +345,24 @@ class UserSession {
           this.persistConversationsToDisk()
         }
       }, 30_000)
+
+      // v7.30: Also check Firestore for an existing WhatsApp session.
+      // If Firestore has creds for this user but the local filesystem
+      // doesn't (e.g., after a deploy that wiped the disk), we still
+      // have a saved session. Updates hasSavedSession before logging.
+      try {
+        const { getFirestoreOrNull } = require('./wa-firestore-auth-state.cjs')
+        const db = getFirestoreOrNull()
+        if (db && !this.hasSavedSession) {
+          const snap = await db.collection('wa_auth_states').doc(String(this.userId)).get()
+          if (snap.exists && snap.data() && snap.data().creds) {
+            this.hasSavedSession = true
+            console.log(`[UserSession:${this.userId}] Found saved session in Firestore (no local creds.json)`)
+          }
+        }
+      } catch (err) {
+        console.warn(`[UserSession:${this.userId}] Firestore session check failed:`, err && err.message)
+      }
 
       console.log(`[UserSession:${this.userId}] Starting — user=${this.user.email}, hasSavedSession=${this.hasSavedSession}, usingGlobalOdooConfig=${this.usingGlobalOdooConfig}`)
 
@@ -1479,7 +1502,12 @@ class UserSession {
     const P = (await import('pino')).default
     const logger = P({ level: 'silent' })
 
-    const { state, saveCreds } = await useMultiFileAuthState(this.authFolder)
+    // v7.30: Use Firestore-backed auth state when available (persists
+    // across deploys even if disk is wiped). Auto-migrates existing
+    // filesystem state to Firestore on first read. Falls back to
+    // useMultiFileAuthState (filesystem) when Firestore isn't configured.
+    const { state, saveCreds, source: authSource } = await usePersistentAuthState(this.authFolder, this.userId)
+    console.log(`[WA:${this.userId}] Auth state source: ${authSource}, hasCreds=${!!state.creds}`)
     const { version } = await fetchLatestBaileysVersion()
 
     // v7.29.1: capture THIS socket instance so we can ignore stale events
@@ -1555,6 +1583,29 @@ class UserSession {
           this.postedChatterIds.clear()
           this.phoneToActiveLeadCache.clear()
           try { if (fs.existsSync(this.stateFile)) fs.unlinkSync(this.stateFile) } catch {}
+          // v7.30: Also clear the Firestore auth state — otherwise on the
+          // next restart Baileys would re-hydrate the logged-out creds and
+          // immediately get a 401, looping forever.
+          try {
+            const { getFirestoreOrNull } = require('./wa-firestore-auth-state.cjs')
+            const db = getFirestoreOrNull()
+            if (db) {
+              db.collection('wa_auth_states').doc(String(this.userId)).delete()
+                .then(() => console.log(`[WA:${this.userId}] Cleared Firestore auth state (loggedOut)`))
+                .catch(err => console.warn(`[WA:${this.userId}] Could not clear Firestore auth state:`, err.message))
+            }
+          } catch {}
+          // Also delete the local filesystem auth folder so we don't
+          // accidentally re-migrate stale creds back to Firestore.
+          try {
+            if (fs.existsSync(this.authFolder)) {
+              for (const f of fs.readdirSync(this.authFolder)) {
+                if (f.endsWith('.json')) {
+                  fs.unlinkSync(path.join(this.authFolder, f))
+                }
+              }
+            }
+          } catch {}
           this.emitWA('whatsapp:conversations', [])
         }
 
@@ -2808,6 +2859,27 @@ class UserSession {
         this.postedChatterIds.clear()
         this.phoneToActiveLeadCache.clear()
         try { if (fs.existsSync(this.stateFile)) fs.unlinkSync(this.stateFile) } catch {}
+        // v7.30: Clear Firestore auth state on explicit logout too —
+        // otherwise on next reconnect Baileys would re-hydrate the
+        // logged-out creds and immediately get a 401, looping forever.
+        try {
+          const { getFirestoreOrNull } = require('./wa-firestore-auth-state.cjs')
+          const db = getFirestoreOrNull()
+          if (db) {
+            await db.collection('wa_auth_states').doc(String(this.userId)).delete()
+            console.log(`[WA:${this.userId}] Cleared Firestore auth state (explicit logout)`)
+          }
+        } catch (err) {
+          console.warn(`[WA:${this.userId}] Could not clear Firestore auth state on logout:`, err && err.message)
+        }
+        // Also delete local filesystem creds files
+        try {
+          if (fs.existsSync(this.authFolder)) {
+            for (const f of fs.readdirSync(this.authFolder)) {
+              if (f.endsWith('.json')) fs.unlinkSync(path.join(this.authFolder, f))
+            }
+          }
+        } catch {}
         this.emitWA('whatsapp:status', { connected: false, reason: 'logged_out', hasSession: false })
         this.emitWA('whatsapp:conversations', [])
         callback?.({ success: true })

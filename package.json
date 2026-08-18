@@ -1,6 +1,6 @@
 {
   "name": "whats-odoo",
-  "version": "7.29.5",
+  "version": "7.30.0",
   "private": true,
   "scripts": {
     "dev": "next dev -p 3000",

@@ -226,6 +226,35 @@ app.prepare().then(async () => {
   // v7.23: Initialize the SessionManager — owns all UserSession instances
   sessionManager = new SessionManager({ io, prisma, loadUserById })
 
+  // ==================================================================
+  // v7.30: AUTO-MIGRATE SQLite users → Firestore on startup.
+  // ------------------------------------------------------------------
+  // If Firebase env vars are set (FIREBASE_SERVICE_ACCOUNT etc.) but the
+  // Firestore `users` collection is empty while SQLite has users, copy
+  // them over. This makes regular users able to login IMMEDIATELY after
+  // Firebase is enabled — without this, they'd be invisible to the
+  // Firestore-backed userStore and login would 401.
+  //
+  // Safe to run on every startup: migrateAllFromSqlite is idempotent
+  // (skips users that already exist by email, preserves original ids so
+  // existing JWTs and auth folders keep working).
+  // ==================================================================
+  try {
+    const { migrateAllFromSqlite } = require('./src/server/user-migration.cjs')
+    console.log('[Server] v7.30: Auto-migrating SQLite users → Firestore (if needed)...')
+    const result = await migrateAllFromSqlite()
+    if (result.migrated > 0) {
+      console.log(`[Server] ✓ Migrated ${result.migrated} user(s) from SQLite to Firestore`)
+    } else {
+      console.log(`[Server] No migration needed (total=${result.total}, skipped=${result.skipped})`)
+    }
+    if (result.errors.length > 0) {
+      console.warn(`[Server] Migration errors:`, result.errors)
+    }
+  } catch (err) {
+    console.warn('[Server] Auto-migration check failed (non-fatal):', err && err.message)
+  }
+
   const waNamespace = io.of('/whatsapp')
   const odooNamespace = io.of('/odoo')
 
