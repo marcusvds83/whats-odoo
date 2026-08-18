@@ -183,9 +183,16 @@ export function ChatView({
   }, [conversation?.jid, onMarkRead])
 
   // Reset pull result when conversation changes
+  // v7.29.5: REMOVED stray `setRefreshResult(null)` call — that setter was
+  // never declared (the state was renamed to `pullResult`/`setPullResult`
+  // long ago). Calling an undefined function threw `setRefreshResult is not
+  // defined` inside a useEffect, which crashed the entire ChatView component
+  // the moment the user clicked a conversation. The error was uncaught by
+  // React's render path (it happened inside useEffect) and surfaced as the
+  // error boundary "Algo deu errado" page — making it look like the app
+  // was broken on every conversation click.
   useEffect(() => {
     setPullResult(null)
-    setRefreshResult(null)
   }, [conversation?.jid])
 
   // v7.24 (R5): Auto-focus the text input when the conversation changes,

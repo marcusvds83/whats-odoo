@@ -509,7 +509,7 @@ export default function HomePage() {
             {!sidebarCollapsed && (
               <div className="hidden lg:block min-w-0">
                 <p className="text-sm font-bold leading-tight truncate">Whats-Odoo</p>
-                <p className="text-[10px] text-muted-foreground">v7.29.4 Msg extract fix</p>
+                <p className="text-[10px] text-muted-foreground">v7.29.5 ChatView crash fix</p>
               </div>
             )}
           </div>
