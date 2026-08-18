@@ -122,8 +122,27 @@ async function useFirestoreAuthState(db, userId) {
   const docRef = db.collection('wa_auth_states').doc(String(userId))
   const COLLECTION = 'wa_auth_states'
 
-  // Hydrate in-memory state from Firestore
+  // v7.33 CRITICAL FIX: import initAuthCreds from Baileys. This generates
+  // the noiseKey, signedIdentityKey, signedPreKey, registrationId, etc.
+  // that Baileys NEEDS to even initiate the WhatsApp WebSocket handshake.
+  // Without these, makeWASocket throws synchronously when it tries to
+  // read creds.noiseKey / creds.signedIdentityKey, the catch in
+  // connectWhatsApp swallows the error, and NO QR CODE IS EVER GENERATED.
+  //
+  // Baileys' own useMultiFileAuthState does the equivalent:
+  //   const creds = await readData('creds.json') || initAuthCreds()
+  //
+  // Previously the Firestore adapter returned state.creds = null when no
+  // saved creds existed — this was THE bug that broke WhatsApp connection
+  // for all users (including admin) in v7.30-v7.32.
+  const { initAuthCreds } = require('@whiskeysockets/baileys')
+
+  // Hydrate in-memory state from Firestore.
+  // If Firestore has no creds, generate fresh ones via initAuthCreds() —
+  // these will be persisted to Firestore on the first saveCreds() call
+  // (fired by Baileys' creds.update event after registration completes).
   let cached = { creds: null, keys: {} }
+  let credsWereFreshlyInit = false
   try {
     const snap = await docRef.get()
     if (snap.exists) {
@@ -138,9 +157,15 @@ async function useFirestoreAuthState(db, userId) {
     console.error(`[WA-FS-Auth:${userId}] Failed to read from Firestore:`, err && err.message)
   }
 
+  // v7.33: If still no creds after reading Firestore, generate fresh ones.
+  // This matches Baileys' useMultiFileAuthState behavior exactly.
+  if (!cached.creds) {
+    cached.creds = initAuthCreds()
+    credsWereFreshlyInit = true
+    console.log(`[WA-FS-Auth:${userId}] No saved creds — generated fresh initAuthCreds() (will persist on first saveCreds)`)
+  }
+
   // Debounced write — Baileys fires many key writes in bursts.
-  // v7.32: writeTimer/pendingWrite declared here; the actual persist logic
-  // is defined LATER in `schedulePersist()` (after persistState() is hoisted).
   let writeTimer = null
   let pendingWrite = false
 
@@ -166,9 +191,14 @@ async function useFirestoreAuthState(db, userId) {
       if (changed) schedulePersist()
     },
     async clearAll() {
+      // v7.33: Match Baileys' useMultiFileAuthState behavior — generate
+      // FRESH creds via initAuthCreds() instead of nulling them out.
+      // Baileys internally reassigns state.creds after clearAll anyway,
+      // but if any code reads state.creds between our clearAll and
+      // Baileys' reassignment, null would crash it. initAuthCreds is safe.
       cached.keys = {}
-      cached.creds = null
-      state.creds = null
+      cached.creds = initAuthCreds()
+      state.creds = cached.creds
       try {
         await docRef.delete()
         console.log(`[WA-FS-Auth:${userId}] Cleared all state in Firestore`)

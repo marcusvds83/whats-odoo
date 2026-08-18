@@ -1155,3 +1155,29 @@ Stage Summary:
   2. Scan it with their phone
   3. Have the session persist in Firestore (survives Render sleeps/deploys)
   4. Send and receive WhatsApp messages
+
+---
+Task ID: v7.33
+Agent: main
+Task: Fix WhatsApp QR code not appearing for any user (including admin). User reported "nada de codigo qrcode pra whatsapp".
+
+Work Log:
+- Analyzed screenshot showing UI in "Desconectado" state with QR placeholder visible but no QR generated even after clicking "Solicitar QR Code"
+- Traced the QR generation flow: server.js (socket.io handlers) → user-session.js (onRequestQR, connectWhatsApp, _connectWhatsAppInner) → wa-firestore-auth-state.cjs (usePersistentAuthState, useFirestoreAuthState)
+- Compared Baileys' own useMultiFileAuthState with our Firestore adapter
+- ROOT CAUSE FOUND: Baileys' useMultiFileAuthState does `const creds = await readData('creds.json') || initAuthCreds()` — it ALWAYS returns valid creds (either saved or freshly initialized via initAuthCreds()). Our Firestore adapter returned `state.creds: null` when no saved creds existed. Baileys internally needs creds.noiseKey, creds.signedIdentityKey, creds.signedPreKey, etc. to even initiate the WhatsApp WebSocket handshake. With null creds, makeWASocket throws synchronously, the catch in connectWhatsApp swallowed the error (only logged err.message, no stack trace), and NO QR WAS EVER GENERATED.
+- This bug was introduced in v7.30 when the Firestore auth state adapter was added. It affected ALL users (including admin) who didn't have a saved session in Firestore — i.e., any user connecting for the first time after the v7.30 deploy.
+
+Fixes Applied:
+1. wa-firestore-auth-state.cjs — useFirestoreAuthState: when cached.creds is null (no saved session in Firestore), call `initAuthCreds()` from Baileys to generate fresh credentials. This matches Baileys' own useMultiFileAuthState behavior exactly. The fresh creds get persisted to Firestore on the first saveCreds() call (fired by Baileys' creds.update event after registration completes).
+2. wa-firestore-auth-state.cjs — clearAll: instead of setting state.creds = null (which would crash Baileys if it reads state.creds between our clearAll and its own reassignment), call initAuthCreds() to generate fresh creds. Matches Baileys' own clearAll behavior.
+3. user-session.js — connectWhatsApp: improved error logging (now prints full stack trace, not just err.message). Also emits a 'whatsapp:status' event with reason='connection_error' so the UI shows the user something went wrong, instead of staring at "Desconectado" with no QR forever.
+4. QRCodePanel.tsx — added UI handling for reason='connection_error' (shows the error message + "Clique em Solicitar QR Code para tentar novamente") and reason='connecting' (shows "Gerando QR code...").
+5. Bumped version to 7.33.0.
+
+Stage Summary:
+- Bug was a missing initAuthCreds() call in the Firestore auth state adapter, introduced in v7.30
+- Fix matches Baileys' own useMultiFileAuthState behavior exactly
+- Tested with mock Firestore: state.creds is now always non-null with valid noiseKey/signedIdentityKey/signedPreKey
+- All users (including admin) should now be able to see the QR code and connect WhatsApp
+- Existing saved sessions in Firestore are NOT affected — only the "no saved session" path was broken

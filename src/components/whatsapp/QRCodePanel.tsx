@@ -30,7 +30,7 @@ import {
 
 interface QRCodePanelProps {
   qrCode: string | null
-  status: { connected: boolean; reason?: string; hasSession?: boolean }
+  status: { connected: boolean; reason?: string; hasSession?: boolean; error?: string }
   me: { id: string; name?: string; profilePicUrl?: string } | null
   onRequestQR: () => void
   onDisconnect: () => void
@@ -178,6 +178,14 @@ export function QRCodePanel({
             )}
             {status.reason === 'reconnecting' && (
               <p className="text-xs text-muted-foreground truncate">Tentando restaurar sessao salva...</p>
+            )}
+            {status.reason === 'connection_error' && (
+              <p className="text-xs text-destructive truncate">
+                Erro ao conectar: {status.error || 'erro desconhecido'}. Clique em "Solicitar QR Code" para tentar novamente.
+              </p>
+            )}
+            {status.reason === 'connecting' && (
+              <p className="text-xs text-muted-foreground truncate">Gerando QR code...</p>
             )}
           </div>
         </div>

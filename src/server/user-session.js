@@ -1476,7 +1476,23 @@ class UserSession {
     try {
       await this._connectWhatsAppInner()
     } catch (err) {
+      // v7.33: Log the FULL stack trace, not just the message. Previously
+      // the catch only printed `err.message`, which made it impossible to
+      // diagnose why the QR wasn't appearing (the actual error was
+      // happening inside makeWASocket when it tried to read
+      // creds.noiseKey on a null creds object — silent crash, no QR).
       console.error(`[WA:${this.userId}] connectWhatsApp error:`, err && err.message)
+      console.error(`[WA:${this.userId}] connectWhatsApp stack:`, err && err.stack)
+      // Notify the client UI so the user sees something went wrong
+      // instead of staring at "Desconectado" with no QR forever.
+      try {
+        this.emitWA('whatsapp:status', {
+          connected: false,
+          reason: 'connection_error',
+          hasSession: this.hasSavedSession,
+          error: err && err.message ? err.message : 'Unknown connection error',
+        })
+      } catch {}
       // Reset state so a future call isn't blocked by stale waSocket
       this.waSocket = null
     } finally {
