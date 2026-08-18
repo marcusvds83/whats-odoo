@@ -1123,3 +1123,35 @@ Stage Summary:
 - Recommended user also add `match /wa_auth_states/{userId} { allow read, write: if false; }` to Firestore rules (defense in depth, same pattern as users).
 - No git commits or code changes made — production matches 93bf4df and is correct.
 - Action required from user: paste FIREBASE_SERVICE_ACCOUNT into Render dashboard + redeploy.
+
+---
+Task ID: v7.32.0
+Agent: main
+Task: Fix WhatsApp connection failing for all users (admin and regular). Login was working, Firebase was working, but QR was not appearing and connect wasn't happening.
+
+Work Log:
+- Confirmed Firebase is correctly configured (user `qQpXb1nMv8zrKR8iECQM` appears in Firestore with all fields including isActive=true, role=admin). No need to regenerate Firebase keys.
+- Identified Bug #1 (PRIMARY ROOT CAUSE): In `UserSession.connectWhatsApp()`, the re-entrancy guard `if (this.waConnecting) return` was silently aborting when the user clicked "Solicitar QR Code" while the initial `start()` connect was still in-flight. The `onRequestQR` handler had already killed the existing `waSocket` (set it to null) but `connectWhatsApp()` returned early without creating a new socket. Result: no socket → no QR ever appeared. This affected ALL users (admin and regular) when they opened the WhatsApp tab before Baileys had finished its initial connect (~5-15s on Render).
+- Identified Bug #2: In `wa-firestore-auth-state.cjs`, `saveCreds()` was reading from `cached.creds` (a snapshot from the initial Firestore read) instead of `state.creds` (the live reference Baileys mutates). When Baileys reassigned `state.creds = {...newCreds}` after QR scan, `cached.creds` stayed null. The debounced `schedulePersist` then wrote `creds: null` to Firestore. Next deploy, session was lost → user had to re-scan QR every time.
+- Identified Bug #3: No watchdog on the initial-connect phase. If Baileys silently failed to emit `qr` or `open` within 30s (e.g., stale auth state, network blip during init), the user was stuck forever with no way to recover except manually clicking "Solicitar QR Code".
+
+Fixes applied (v7.32.0):
+1. `connectWhatsApp(force=false)` — new optional parameter. `force=true` bypasses the waConnecting guard. `onRequestQR()` and `onForceNewQR()` now pass `force=true`. Also wraps `_connectWhatsAppInner()` in try/catch that resets `waSocket=null` on error so subsequent calls aren't blocked.
+2. `wa-firestore-auth-state.cjs`: Added `persistState()` function that reads from `state.creds` (live) instead of `cached.creds` (snapshot). `saveCreds()` now calls `persistState()`. `cached.creds = state.creds` sync after each write. Also deduplicated `schedulePersist` (was defined twice by accident in v7.30).
+3. Added 30s `initialConnectWatchdog` in `_connectWhatsAppInner()`. Cleared as soon as `qr` or `open` event arrives. If 30s pass with no event, kills the socket and force-calls `connectWhatsApp(true)`.
+4. Added cleanup of `initialConnectWatchdog` in `stop()` and initialized `this.initialConnectWatchdog = null` in constructor.
+5. Frontend: Added auto-request-QR `useEffect` in `src/app/page.tsx`. When user opens the WhatsApp tab AND there's no connection AND no QR AND no saved session, the QR is requested automatically after a 1.5s debounce (lets the initial `whatsapp:status` from `onWAConnection` arrive first). Users no longer need to manually click the button on first visit.
+6. `onRequestQR` now emits `whatsapp:status { connected: false, reason: 'connecting' }` before forcing the connect, so the UI shows a loading state instead of nothing.
+7. Updated `package.json` to version 7.32.0; updated sidebar version label to "v7.32 fix WA connect + auto-QR".
+
+Stage Summary:
+- Commit: `573d985 v7.32.0: fix WhatsApp connect stuck + auto-request QR`
+- Pushed to `origin/main` (Render will auto-deploy)
+- Build verified locally (`npx next build` succeeds, 15 routes generated)
+- Node syntax verified for all 3 modified server files (server.js, user-session.js, wa-firestore-auth-state.cjs)
+- No changes to admin working flow — all changes are additive and apply equally to admin and regular users
+- After deploy, both admin and regular users should be able to:
+  1. See the QR code appear automatically when they open the WhatsApp tab
+  2. Scan it with their phone
+  3. Have the session persist in Firestore (survives Render sleeps/deploys)
+  4. Send and receive WhatsApp messages

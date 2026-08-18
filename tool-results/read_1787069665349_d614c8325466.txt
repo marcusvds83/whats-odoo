@@ -1,0 +1,702 @@
+     1→// ====================================================================
+     2→// Whats-Odoo v7.23 — PER-USER SESSION
+     3→// --------------------------------------------------------------------
+     4→// Each logged-in middleware user has their own UserSession instance:
+     5→//   - Own Baileys WhatsApp socket (data/auth_<userId>/creds.json)
+     6→//   - Own conversations/messages state (in-memory Map + data/conv_state_<userId>.json)
+     7→//   - Own Odoo connection (per-user creds from DB, falling back to global OdooConfig)
+     8→//   - Own socket.io event routing (only sees their own QR codes + conversations)
+     9→//
+    10→// This file is CommonJS because server.js is CommonJS.
+    11→//
+    12→// The SessionManager lazily creates/starts a UserSession on the first
+    13→// socket.io connection from a logged-in user. Sessions stay alive after
+    14→// the socket disconnects (so WhatsApp stays connected); they are only
+    15→// destroyed by SessionManager.invalidate(userId) — currently only called
+    16→// on server shutdown.
+    17→//
+    18→// The pure helpers (normalizeJid, escapeHtml, etc.) are exported for
+    19→// server.js to use directly when wiring socket handlers.
+    20→// ====================================================================
+    21→
+    22→const path = require('path')
+    23→const fs = require('fs')
+    24→const { createClient, createSecureClient } = require('xmlrpc')
+    25→const { PrismaClient } = require('@prisma/client')
+    26→
+    27→// v7.30: Firestore-backed Baileys auth state — persists WhatsApp sessions
+    28→// across deploys even if the disk is wiped. Falls back to filesystem
+    29→// (useMultiFileAuthState) if Firestore is not configured.
+    30→const { usePersistentAuthState } = require('./wa-firestore-auth-state.cjs')
+    31→
+    32→const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data')
+    33→
+    34→// ====================================================================
+    35→// PURE HELPERS — module-level (don't touch per-user state)
+    36→// ====================================================================
+    37→
+    38→// Baileys can deliver JIDs in several forms:
+    39→//   5511999888777@s.whatsapp.net            — canonical DM
+    40→//   5511999888777:7@s.whatsapp.net          — DM with device suffix (multi-device send)
+    41→//   5511999888777:7:3@s.whatsapp.net        — DM with device + agent suffix
+    42→//   5511999888777@lid                        — Linked Identity (newer protocol)
+    43→// We normalize everything to canonical form: <digits>@s.whatsapp.net
+    44→function normalizeJid(jid) {
+    45→  if (!jid || typeof jid !== 'string') return null
+    46→  const atIdx = jid.indexOf('@')
+    47→  if (atIdx < 0) return null
+    48→  const server = jid.slice(atIdx + 1)
+    49→  if (server !== 's.whatsapp.net') return null
+    50→  const userCombined = jid.slice(0, atIdx)
+    51→  const user = userCombined.split(':')[0].split('_')[0]
+    52→  if (!/^\d{7,}$/.test(user)) return null
+    53→  return `${user}@s.whatsapp.net`
+    54→}
+    55→
+    56→function isValidPhoneJid(jid) {
+    57→  return normalizeJid(jid) !== null
+    58→}
+    59→
+    60→function extractPhone(jid) {
+    61→  const normalized = normalizeJid(jid)
+    62→  return normalized ? normalized.split('@')[0] : null
+    63→}
+    64→
+    65→// Compatibility alias — many call sites use jidNormalizedUser()
+    66→function jidNormalizedUser(jid) {
+    67→  return normalizeJid(jid) || jid
+    68→}
+    69→
+    70→// Normalize a phone number (strip non-digits) to a WhatsApp JID
+    71→function normalizePhoneToJid(phone) {
+    72→  if (!phone) return null
+    73→  const digits = String(phone).replace(/\D/g, '')
+    74→  if (digits.length < 7) return null
+    75→  return `${digits}@s.whatsapp.net`
+    76→}
+    77→
+    78→function escapeHtml(text) {
+    79→  return String(text || '')
+    80→    .replace(/&/g, '&amp;')
+    81→    .replace(/</g, '&lt;')
+    82→    .replace(/>/g, '&gt;')
+    83→    .replace(/\n/g, '<br/>')
+    84→}
+    85→
+    86→function stripHtml(html) {
+    87→  if (!html) return ''
+    88→  let text = String(html)
+    89→    .replace(/<br\s*\/?>/gi, '\n')
+    90→    .replace(/<\/p>/gi, '\n')
+    91→    .replace(/<p[^>]*>/gi, '')
+    92→    .replace(/<[^>]+>/g, '')
+    93→    .replace(/&nbsp;/g, ' ')
+    94→    .replace(/&amp;/g, '&')
+    95→    .replace(/&lt;/g, '<')
+    96→    .replace(/&gt;/g, '>')
+    97→    .replace(/&quot;/g, '"')
+    98→    .replace(/&#39;/g, "'")
+    99→    .trim()
+   100→  text = text.replace(/\n{3,}/g, '\n\n')
+   101→  return text
+   102→}
+   103→
+   104→// v7.28: Parse a chatter body produced by buildChatterBody() back into clean
+   105→// message components (direction, timestamp, text). The chatter body format is:
+   106→//   <div><strong>📱 WhatsApp {Enviada|Recebida}:</strong> {ts}<br/>{mediaLine}<span>{text}</span></div>
+   107→// We want to extract ONLY the user-visible text (the <span> content), detect
+   108→// the direction from "Enviada" vs "Recebida", and parse the timestamp.
+   109→// Falls back to stripHtml() for any non-conforming body (e.g. messages posted
+   110→// by other Odoo users from the web UI — those are returned as-is, plain text).
+   111→function parseChatterBody(body) {
+   112→  if (!body) return { fromMe: false, timestamp: null, text: '' }
+   113→  const s = String(body)
+   114→
+   115→  // Detect direction from the "WhatsApp Enviada/Recebida:" marker
+   116→  const isSent = /WhatsApp\s+Enviada/i.test(s)
+   117→  const fromMe = isSent
+   118→
+   119→  // Extract timestamp from "(...)" — buildChatterBody uses toLocaleString('pt-BR')
+   120→  // inside parentheses as part of the label. Actually buildChatterBody does NOT
+   121→  // wrap in parens — it inserts the timestamp directly after the colon.
+   122→  // But older messages may have the "(date)" format. Support both.
+   123→  let timestamp = null
+   124→  const parenMatch = s.match(/\(([^)]+)\)/)
+   125→  if (parenMatch) {
+   126→    const parsed = new Date(parenMatch[1])
+   127→    if (!isNaN(parsed.getTime())) timestamp = parsed
+   128→  }
+   129→
+   130→  // Extract the text content from the <span>...</span> block (the real message)
+   131→  let text = ''
+   132→  const spanMatch = s.match(/<span[^>]*>([\s\S]*?)<\/span>/i)
+   133→  if (spanMatch) {
+   134→    text = stripHtml(spanMatch[1])
+   135→  } else {
+   136→    // No <span> — this isn't a WhatsApp chatter message produced by us.
+   137→    // It's probably a note posted by a human via the Odoo UI, or a different
+   138→    // format entirely. Strip HTML and return the whole body as plain text.
+   139→    text = stripHtml(s)
+   140→    // If the body still starts with the WhatsApp metadata header, strip it.
+   141→    // This handles the case where buildChatterBody emitted no <span> because
+   142→    // textContent was empty (media-only message).
+   143→    const headerMatch = text.match(/^📱\s*WhatsApp\s+(Enviada|Recebida)[:\s]*(.*)$/is)
+   144→    if (headerMatch) {
+   145→      // For media-only messages, the "text" will be empty after the header.
+   146→      // Strip the header line and keep the remaining content (media label).
+   147→      const remaining = text.slice(headerMatch[0].length).trim()
+   148→      // Try to detect a media label line like "🎙️ Áudio"
+   149→      const mediaMatch = remaining.match(/^([🎙️🖼️📄🎬🏷️][^\n]*)/)
+   150→      text = mediaMatch ? mediaMatch[1] : remaining
+   151→    }
+   152→  }
+   153→
+   154→  // Try to parse timestamp from the label after the colon (no parens case)
+   155→  if (!timestamp) {
+   156→    // Look for a date pattern like "14/08/2026, 10:30:45" or "14/08/2026 10:30"
+   157→    const dateMatch = s.match(/(\d{1,2}\/\d{1,2}\/\d{4})[,\s]+(\d{1,2}:\d{2}(?::\d{2})?)/)
+   158→    if (dateMatch) {
+   159→      const [_, d, t] = dateMatch
+   160→      // pt-BR format: DD/MM/YYYY HH:MM:SS
+   161→      const parsed = new Date(`${d.split('/').reverse().join('-')}T${t}`)
+   162→      if (!isNaN(parsed.getTime())) timestamp = parsed
+   163→    }
+   164→  }
+   165→
+   166→  return { fromMe, timestamp, text }
+   167→}
+   168→
+   169→// Extract a display name from a message's pushName field
+   170→function pushNameFallback(msg) {
+   171→  return msg?.pushName || null
+   172→}
+   173→
+   174→// v7.19: Build a plain-text transcript of the WhatsApp conversation that will
+   175→// be written to the `description` field (Notes) of the CRM lead/opportunity.
+   176→function buildConversationTranscript(messages) {
+   177→  if (!Array.isArray(messages) || messages.length === 0) return ''
+   178→  const sorted = [...messages].sort(
+   179→    (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+   180→  )
+   181→  const lines = sorted.map((m) => {
+   182→    const direction = m.fromMe ? 'Eu' : 'Contato'
+   183→    const dateLabel = new Date(m.timestamp).toLocaleString('pt-BR')
+   184→    const mediaLabel = m.mediaType ? ` [${m.mediaType}]` : ''
+   185→    const text = m.textContent && m.textContent.trim() ? m.textContent : '[Mídia]'
+   186→    return `[${dateLabel}] ${direction}${mediaLabel}: ${text}`
+   187→  })
+   188→  return `Conversa WhatsApp:\n${lines.join('\n')}`
+   189→}
+   190→
+   191→// ====================================================================
+   192→// UserSession — encapsulates ALL per-user state
+   193→// ====================================================================
+   194→
+   195→class UserSession {
+   196→  constructor({ userId, user, io, prisma }) {
+   197→    this.userId = userId
+   198→    this.user = user              // Prisma User record (with odooUrl etc.)
+   199→    this.io = io                  // socket.io server instance (for namespaces)
+   200→    this.prisma = prisma          // shared PrismaClient
+   201→
+   202→    // ===== Per-user paths =====
+   203→    this.authFolder = path.join(DATA_DIR, `auth_${userId}`)
+   204→    this.stateFile = path.join(DATA_DIR, `conv_state_${userId}.json`)
+   205→    this.mediaDir = path.join(DATA_DIR, 'media')  // shared (filenames are random cuids)
+   206→
+   207→    // ===== WhatsApp state =====
+   208→    this.waSocket = null
+   209→    this.connectionState = { connection: 'close' }
+   210→    this.hasSavedSession = fs.existsSync(path.join(this.authFolder, 'creds.json'))
+   211→    this.lastQrCode = null
+   212→    this.reconnectAttempts = 0
+   213→    this.watchdogTimer = null
+   214→    this.waConnecting = false        // v7.29: re-entrancy guard for connectWhatsApp
+   215→    this.waReconnectTimer = null     // v7.29: single pending reconnect timer
+   216→    this.conversations = new Map()
+   217→    this.contactNames = new Map()
+   218→    this.deviceContacts = new Map()
+   219→    this.lidToPhoneMap = new Map()
+   220→    this.syncState = { isSyncing: false, progress: 0, totalChats: 0, totalContacts: 0, totalMessages: 0 }
+   221→    this.lastPersistTs = 0
+   222→    this.conversationDirty = false
+   223→
+   224→    // v7.15: Ring buffer of recent `messages.upsert` events for debugging.
+   225→    this.recentUpsertEvents = []
+   226→    this.MAX_RECENT_EVENTS = 50
+   227→
+   228→    // ===== Odoo state — initialized from user record =====
+   229→    // Per-user creds take precedence; if empty, loadOdooConfig() will fall
+   230→    // back to the global OdooConfig row from the DB.
+   231→    this.odooConfig = {
+   232→      url: user.odooUrl || '',
+   233→      db: user.odooDb || '',
+   234→      username: user.odooUsername || '',
+   235→      password: user.odooPassword || '',
+   236→      uid: null,
+   237→    }
+   238→    this.usingGlobalOdooConfig = !(this.odooConfig.url && this.odooConfig.db && this.odooConfig.username && this.odooConfig.password)
+   239→
+   240→    this.autoSyncSettings = {
+   241→      enabled: true,
+   242→      autoCreateContact: true,
+   243→      autoCreateLead: false,       // v7.19: default OFF per user request
+   244→      autoPostMessages: true,
+   245→      autoCreateActivity: false,
+   246→      leadPrefix: '[WhatsApp] ',
+   247→      leadTeamId: null,
+   248→      leadUserId: null,
+   249→    }
+   250→    this.odooReauthTimer = null
+   251→    this.modelFieldsCache = new Map()
+   252→    this.phoneToPartnerCache = new Map()
+   253→    // Track which WhatsApp message IDs have already been posted to Odoo chatter
+   254→    this.postedChatterIds = new Set()
+   255→    // Track active lead IDs by phone (refreshed on every auto-sync)
+   256→    this.phoneToActiveLeadCache = new Map()
+   257→
+   258→    // v7.21: Odoo chatter history sync state
+   259→    this.odooHistorySyncInProgress = false
+   260→    this.odooHistorySyncLastRun = null
+   261→
+   262→    // ===== Socket.io bookkeeping =====
+   263→    this.connectedSockets = new Set()  // socket.io Socket instances subscribed to this user
+   264→    this.persistTimer = null
+   265→    this.isStarted = false
+   266→    this.isStarting = false
+   267→  }
+   268→
+   269→  // ------------------------------------------------------------------
+   270→  // Emit helpers — send only to sockets subscribed to THIS user
+   271→  // ------------------------------------------------------------------
+   272→  emitWA(event, data) {
+   273→    for (const s of this.connectedSockets) {
+   274→      try { s.emit(event, data) } catch {}
+   275→    }
+   276→  }
+   277→  emitOdoo(event, data) {
+   278→    for (const s of this.connectedSockets) {
+   279→      try { s.emit(event, data) } catch {}
+   280→    }
+   281→  }
+   282→  // Emit to a specific socket (used for the initial burst on connection)
+   283→  emitTo(socket, event, data) {
+   284→    try { socket.emit(event, data) } catch {}
+   285→  }
+   286→
+   287→  markDirty() { this.conversationDirty = true }
+   288→
+   289→  logUpsertEvent(event) {
+   290→    try {
+   291→      this.recentUpsertEvents.push({ ts: new Date().toISOString(), ...event })
+   292→      while (this.recentUpsertEvents.length > this.MAX_RECENT_EVENTS) this.recentUpsertEvents.shift()
+   293→    } catch {}
+   294→  }
+   295→
+   296→  // ------------------------------------------------------------------
+   297→  // Lifecycle
+   298→  // ------------------------------------------------------------------
+   299→
+   300→  async loadOdooConfig() {
+   301→    // If per-user creds are already set, nothing to do
+   302→    if (this.odooConfig.url && this.odooConfig.db && this.odooConfig.username && this.odooConfig.password) {
+   303→      this.usingGlobalOdooConfig = false
+   304→      return
+   305→    }
+   306→    // Fall back to global OdooConfig table
+   307→    try {
+   308→      const globalConfig = await this.prisma.odooConfig.findFirst({
+   309→        where: { active: true },
+   310→        orderBy: { updatedAt: 'desc' },
+   311→      })
+   312→      if (globalConfig) {
+   313→        this.odooConfig = {
+   314→          url: globalConfig.url,
+   315→          db: globalConfig.db,
+   316→          username: globalConfig.username,
+   317→          password: globalConfig.password,
+   318→          uid: null,
+   319→        }
+   320→        this.usingGlobalOdooConfig = true
+   321→        console.log(`[UserSession:${this.userId}] Using GLOBAL OdooConfig (no per-user creds set)`)
+   322→      } else {
+   323→        this.usingGlobalOdooConfig = true
+   324→        console.log(`[UserSession:${this.userId}] No Odoo config (per-user or global) — Odoo features disabled`)
+   325→      }
+   326→    } catch (err) {
+   327→      console.error(`[UserSession:${this.userId}] loadOdooConfig failed: ${err.message}`)
+   328→    }
+   329→  }
+   330→
+   331→  async start() {
+   332→    if (this.isStarted || this.isStarting) return
+   333→    this.isStarting = true
+   334→    try {
+   335→      fs.mkdirSync(this.authFolder, { recursive: true })
+   336→      fs.mkdirSync(this.mediaDir, { recursive: true })
+   337→
+   338→      this.loadConversationsFromDisk()
+   339→
+   340→      // Persist conversations every 30 seconds (debounced — only if changed)
+   341→      this.persistTimer = setInterval(() => {
+   342→        if (this.conversationDirty && Date.now() - this.lastPersistTs > 25_000) {
+   343→          this.conversationDirty = false
+   344→          this.lastPersistTs = Date.now()
+   345→          this.persistConversationsToDisk()
+   346→        }
+   347→      }, 30_000)
+   348→
+   349→      // v7.30: Also check Firestore for an existing WhatsApp session.
+   350→      // If Firestore has creds for this user but the local filesystem
+   351→      // doesn't (e.g., after a deploy that wiped the disk), we still
+   352→      // have a saved session. Updates hasSavedSession before logging.
+   353→      try {
+   354→        const { getFirestoreOrNull } = require('./wa-firestore-auth-state.cjs')
+   355→        const db = getFirestoreOrNull()
+   356→        if (db && !this.hasSavedSession) {
+   357→          const snap = await db.collection('wa_auth_states').doc(String(this.userId)).get()
+   358→          if (snap.exists && snap.data() && snap.data().creds) {
+   359→            this.hasSavedSession = true
+   360→            console.log(`[UserSession:${this.userId}] Found saved session in Firestore (no local creds.json)`)
+   361→          }
+   362→        }
+   363→      } catch (err) {
+   364→        console.warn(`[UserSession:${this.userId}] Firestore session check failed:`, err && err.message)
+   365→      }
+   366→
+   367→      console.log(`[UserSession:${this.userId}] Starting — user=${this.user.email}, hasSavedSession=${this.hasSavedSession}, usingGlobalOdooConfig=${this.usingGlobalOdooConfig}`)
+   368→
+   369→      // Load Odoo config from DB (if needed) before starting auto-auth
+   370→      await this.loadOdooConfig()
+   371→
+   372→      // Start WA + Odoo (fire-and-forget — they self-retry internally)
+   373→      this.connectWhatsApp().catch(err => console.error(`[UserSession:${this.userId}] WA startup error:`, err.message))
+   374→      this.startOdooAutoAuth().catch(err => console.error(`[UserSession:${this.userId}] Odoo startup error:`, err.message))
+   375→
+   376→      this.isStarted = true
+   377→    } finally {
+   378→      this.isStarting = false
+   379→    }
+   380→  }
+   381→
+   382→  stop() {
+   383→    try {
+   384→      if (this.persistTimer) { clearInterval(this.persistTimer); this.persistTimer = null }
+   385→      if (this.watchdogTimer) { clearInterval(this.watchdogTimer); this.watchdogTimer = null }
+   386→      if (this.waReconnectTimer) { clearTimeout(this.waReconnectTimer); this.waReconnectTimer = null }
+   387→      if (this.odooReauthTimer) { clearInterval(this.odooReauthTimer); this.odooReauthTimer = null }
+   388→      try { this.waSocket?.end(undefined) } catch {}
+   389→      this.persistConversationsToDisk()
+   390→      console.log(`[UserSession:${this.userId}] Stopped`)
+   391→    } catch (err) {
+   392→      console.error(`[UserSession:${this.userId}] Stop error:`, err.message)
+   393→    }
+   394→  }
+   395→
+   396→  // v7.24 (R6): Pre-deploy backup — dump this user's WA creds + conversation
+   397→  // state to Odoo chatter so the data survives even if the disk is wiped
+   398→  // during a Render deploy. Posted as a mail.message on a designated
+   399→  // res.partner (the user's own partner if findable, otherwise partner 1).
+   400→  //
+   401→  // Format: subject `[BACKUP-CREDS] User <email> — <timestamp>`, body is
+   402→  // JSON-stringified { creds, conversations }. If the JSON is too large
+   403→  // (>600 KB per chunk — Odoo's chatter body limit is ~1MB), it's split
+   404→  // into N chunks posted as separate messages with subject suffix `[1/N]`.
+   405→  //
+   406→  // Returns: { success, chunksPosted, partnerId, error? }
+   407→  async backupToOdoo() {
+   408→    if (!this.odooConfig.uid) {
+   409→      return { success: false, chunksPosted: 0, error: 'Odoo not authenticated' }
+   410→    }
+   411→    try {
+   412→      // Persist current state to disk first (so the backup reflects the
+   413→      // latest conversations, not the last periodic save).
+   414→      this.persistConversationsToDisk()
+   415→
+   416→      // Read creds.json
+   417→      const credsPath = path.join(this.authFolder, 'creds.json')
+   418→      let credsJson = null
+   419→      try {
+   420→        if (fs.existsSync(credsPath)) {
+   421→          credsJson = JSON.parse(fs.readFileSync(credsPath, 'utf8'))
+   422→        }
+   423→      } catch (err) {
+   424→        console.warn(`[Backup:${this.userId}] Could not read creds.json:`, err.message)
+   425→      }
+   426→
+   427→      // Read conv_state_<userId>.json
+   428→      let convState = null
+   429→      try {
+   430→        if (fs.existsSync(this.stateFile)) {
+   431→          convState = JSON.parse(fs.readFileSync(this.stateFile, 'utf8'))
+   432→        }
+   433→      } catch (err) {
+   434→        console.warn(`[Backup:${this.userId}] Could not read conv state:`, err.message)
+   435→      }
+   436→
+   437→      // Build the JSON payload
+   438→      const payload = JSON.stringify({
+   439→        userId: this.userId,
+   440→        email: this.user.email,
+   441→        backedUpAt: new Date().toISOString(),
+   442→        version: '7.24',
+   443→        creds: credsJson,
+   444→        conversations: convState,
+   445→      })
+   446→
+   447→      // Find a partner to post to. Strategy: look up res.partner by the
+   448→      // user's email; if not found, fall back to partner id 1
+   449→      // (Administrator in most Odoo installs).
+   450→      let backupPartnerId = 1
+   451→      try {
+   452→        const partners = await this.odooExecuteKw('res.partner', 'search_read', [
+   453→          [['email', '=', this.user.email]],
+   454→        ], { fields: ['id', 'name'], limit: 1 })
+   455→        if (partners && partners.length > 0) {
+   456→          backupPartnerId = partners[0].id
+   457→        } else {
+   458→          // Fall back: try admin user's partner (res.users where login = 'admin')
+   459→          const adminUsers = await this.odooExecuteKw('res.users', 'search_read', [
+   460→            [['login', '=', 'admin']],
+   461→          ], { fields: ['partner_id'], limit: 1 })
+   462→          if (adminUsers && adminUsers.length > 0 && adminUsers[0].partner_id) {
+   463→            backupPartnerId = adminUsers[0].partner_id[0]
+   464→          }
+   465→        }
+   466→      } catch (err) {
+   467→        console.warn(`[Backup:${this.userId}] Partner lookup failed, using id=1:`, err.message)
+   468→      }
+   469→
+   470→      // Split into chunks of ~600 KB (base64 expansion + Odoo overhead
+   471→      // means 600 KB raw → ~800 KB on the wire, safely under 1 MB).
+   472→      const CHUNK_SIZE = 600_000
+   473→      const chunks = []
+   474→      for (let i = 0; i < payload.length; i += CHUNK_SIZE) {
+   475→        chunks.push(payload.slice(i, i + CHUNK_SIZE))
+   476→      }
+   477→      if (chunks.length === 0) chunks.push('')
+   478→
+   479→      const tsLabel = new Date().toISOString()
+   480→      const subject = `[BACKUP-CREDS] User ${this.user.email} — ${tsLabel}`
+   481→      const total = chunks.length
+   482→
+   483→      for (let i = 0; i < chunks.length; i++) {
+   484→        const partNum = i + 1
+   485→        const body = `<div><strong>${subject}</strong> [${partNum}/${total}]<br/>` +
+   486→          `<em>Backup dos dados de conexão e conversas — não editar.</em>` +
+   487→          `<pre style="font-size:10px; white-space:pre-wrap; word-break:break-all;">${escapeHtml(chunks[i])}</pre></div>`
+   488→        try {
+   489→          await this.odooPostMessage('res.partner', backupPartnerId, body)
+   490→        } catch (err) {
+   491→          console.error(`[Backup:${this.userId}] Chunk ${partNum}/${total} failed:`, err.message)
+   492→          return { success: false, chunksPosted: i, partnerId: backupPartnerId, error: err.message }
+   493→        }
+   494→      }
+   495→
+   496→      console.log(`[Backup:${this.userId}] ✓ Posted ${total} chunk(s) to partner ${backupPartnerId}`)
+   497→      return { success: true, chunksPosted: total, partnerId: backupPartnerId }
+   498→    } catch (err) {
+   499→      console.error(`[Backup:${this.userId}] Error:`, err.message)
+   500→      return { success: false, chunksPosted: 0, error: err.message }
+   501→    }
+   502→  }
+   503→
+   504→  // ------------------------------------------------------------------
+   505→  // Persistence — conversations/contacts/messages to per-user JSON file
+   506→  // ------------------------------------------------------------------
+   507→
+   508→  persistConversationsToDisk() {
+   509→    try {
+   510→      const snapshot = {
+   511→        version: 1,
+   512→        userId: this.userId,
+   513→        savedAt: new Date().toISOString(),
+   514→        conversations: Array.from(this.conversations.values()).map(c => ({
+   515→          jid: c.jid,
+   516→          name: c.name,
+   517→          phone: c.phone,
+   518→          pushName: c.pushName,
+   519→          avatarUrl: c.avatarUrl,
+   520→          lastMessage: c.lastMessage,
+   521→          lastMessageAt: c.lastMessageAt ? c.lastMessageAt.toISOString() : null,
+   522→          unreadCount: c.unreadCount,
+   523→          messages: c.messages.map(m => ({
+   524→            ...m,
+   525→            timestamp: m.timestamp instanceof Date ? m.timestamp.toISOString() : m.timestamp,
+   526→          })),
+   527→        })),
+   528→        contactNames: Array.from(this.contactNames.entries()),
+   529→        deviceContacts: Array.from(this.deviceContacts.values()),
+   530→        lidToPhoneMap: Array.from(this.lidToPhoneMap.entries()),
+   531→      }
+   532→      fs.writeFileSync(this.stateFile, JSON.stringify(snapshot), 'utf8')
+   533→      console.log(`[UserSession:${this.userId}] Persisted ${snapshot.conversations.length} conversations to disk`)
+   534→    } catch (err) {
+   535→      console.error(`[UserSession:${this.userId}] Failed to persist conversations: ${err.message}`)
+   536→    }
+   537→  }
+   538→
+   539→  loadConversationsFromDisk() {
+   540→    try {
+   541→      if (!fs.existsSync(this.stateFile)) {
+   542→        console.log(`[UserSession:${this.userId}] No saved conversation state — starting fresh`)
+   543→        return
+   544→      }
+   545→      const raw = fs.readFileSync(this.stateFile, 'utf8')
+   546→      const snapshot = JSON.parse(raw)
+   547→      if (!snapshot || snapshot.version !== 1) {
+   548→        console.log(`[UserSession:${this.userId}] Saved conversation state is old format — ignoring`)
+   549→        return
+   550→      }
+   551→
+   552→      let loaded = 0
+   553→      for (const c of snapshot.conversations || []) {
+   554→        if (!c.jid || !isValidPhoneJid(c.jid)) continue
+   555→        this.conversations.set(c.jid, {
+   556→          jid: c.jid,
+   557→          name: c.name || null,
+   558→          phone: c.phone || extractPhone(c.jid),
+   559→          pushName: c.pushName || null,
+   560→          avatarUrl: c.avatarUrl || null,
+   561→          lastMessage: c.lastMessage || null,
+   562→          lastMessageAt: c.lastMessageAt ? new Date(c.lastMessageAt) : null,
+   563→          unreadCount: c.unreadCount || 0,
+   564→          messages: (c.messages || []).map(m => ({
+   565→            ...m,
+   566→            timestamp: m.timestamp ? new Date(m.timestamp) : new Date(),
+   567→          })),
+   568→        })
+   569→        loaded++
+   570→      }
+   571→
+   572→      for (const [jid, name] of snapshot.contactNames || []) {
+   573→        this.contactNames.set(jid, name)
+   574→      }
+   575→      for (const c of snapshot.deviceContacts || []) {
+   576→        if (c.jid) this.deviceContacts.set(c.jid, c)
+   577→      }
+   578→      for (const [lid, phone] of snapshot.lidToPhoneMap || []) {
+   579→        this.lidToPhoneMap.set(lid, phone)
+   580→      }
+   581→
+   582→      console.log(`[UserSession:${this.userId}] ✓ Loaded ${loaded} conversations, ${this.contactNames.size} contact names, ${this.deviceContacts.size} device contacts (saved ${snapshot.savedAt})`)
+   583→    } catch (err) {
+   584→      console.error(`[UserSession:${this.userId}] Failed to load conversations from disk: ${err.message}`)
+   585→    }
+   586→  }
+   587→
+   588→  // ------------------------------------------------------------------
+   589→  // Conversation helpers
+   590→  // ------------------------------------------------------------------
+   591→
+   592→  getOrCreateConversation(jid, pushName) {
+   593→    const normalizedJid = normalizeJid(jid)
+   594→    if (!normalizedJid) return null
+   595→    const cachedName = this.contactNames.get(normalizedJid) || null
+   596→    const phone = extractPhone(normalizedJid)
+   597→
+   598→    if (!this.conversations.has(normalizedJid)) {
+   599→      this.conversations.set(normalizedJid, {
+   600→        jid: normalizedJid,
+   601→        name: cachedName || pushName || null,
+   602→        phone,
+   603→        pushName: pushName || null,
+   604→        avatarUrl: null,
+   605→        lastMessage: null,
+   606→        lastMessageAt: new Date(),
+   607→        unreadCount: 0,
+   608→        messages: [],
+   609→      })
+   610→    }
+   611→    const conv = this.conversations.get(normalizedJid)
+   612→    if (cachedName) {
+   613→      conv.name = cachedName
+   614→    } else if (pushName && !conv.name) {
+   615→      conv.pushName = pushName
+   616→    }
+   617→
+   618→    // Also track in deviceContacts phonebook
+   619→    const displayName = cachedName || pushName || phone
+   620→    if (phone) {
+   621→      if (!this.deviceContacts.has(normalizedJid)) {
+   622→        this.deviceContacts.set(normalizedJid, { jid: normalizedJid, phone, name: displayName, avatarUrl: null })
+   623→      } else if (cachedName) {
+   624→        this.deviceContacts.get(normalizedJid).name = cachedName
+   625→      }
+   626→    }
+   627→
+   628→    return conv
+   629→  }
+   630→
+   631→  serializeConversation(conv) {
+   632→    if (!conv) return null
+   633→    return {
+   634→      jid: conv.jid,
+   635→      name: conv.name,
+   636→      phone: conv.phone,
+   637→      pushName: conv.pushName,
+   638→      avatarUrl: conv.avatarUrl,
+   639→      lastMessage: conv.lastMessage,
+   640→      lastMessageAt: conv.lastMessageAt ? conv.lastMessageAt.toISOString() : null,
+   641→      unreadCount: conv.unreadCount,
+   642→      messageCount: conv.messages.length,
+   643→    }
+   644→  }
+   645→
+   646→  getSortedConversations() {
+   647→    // v7.20: Conversas tab shows BOTH actual conversations AND device contacts
+   648→    // that don't have a conversation yet. Unified list.
+   649→    const conversationJids = new Set(this.conversations.keys())
+   650→    const deviceContactEntries = []
+   651→    for (const contact of this.deviceContacts.values()) {
+   652→      if (conversationJids.has(contact.jid)) continue
+   653→      deviceContactEntries.push({
+   654→        jid: contact.jid,
+   655→        name: contact.name,
+   656→        phone: contact.phone,
+   657→        pushName: null,
+   658→        avatarUrl: contact.avatarUrl || null,
+   659→        lastMessage: null,
+   660→        lastMessageAt: null,
+   661→        unreadCount: 0,
+   662→        messageCount: 0,
+   663→        _isDeviceContact: true,
+   664→      })
+   665→    }
+   666→
+   667→    return Array.from(this.conversations.values())
+   668→      .filter(conv => isValidPhoneJid(conv.jid))
+   669→      .map(c => this.serializeConversation(c))
+   670→      .filter(Boolean)
+   671→      .concat(deviceContactEntries)
+   672→      .sort((a, b) => {
+   673→        const tA = a.lastMessageAt ? new Date(a.lastMessageAt).getTime() : 0
+   674→        const tB = b.lastMessageAt ? new Date(b.lastMessageAt).getTime() : 0
+   675→        if (tA === 0 && tB === 0) {
+   676→          return (a.name || a.phone || '').localeCompare(b.name || b.phone || '')
+   677→        }
+   678→        return tB - tA
+   679→      })
+   680→  }
+   681→
+   682→  updateConversationName(jid, contactName) {
+   683→    const normalizedJid = normalizeJid(jid)
+   684→    if (!normalizedJid) return
+   685→    this.contactNames.set(normalizedJid, contactName)
+   686→    const phone = extractPhone(normalizedJid)
+   687→    const existing = this.deviceContacts.get(normalizedJid)
+   688→    if (existing) {
+   689→      existing.name = contactName
+   690→    } else if (phone) {
+   691→      this.deviceContacts.set(normalizedJid, { jid: normalizedJid, phone, name: contactName, avatarUrl: null })
+   692→    }
+   693→    const conv = this.conversations.get(normalizedJid)
+   694→    if (conv) conv.name = contactName
+   695→  }
+   696→
+   697→  getDeviceContactsList() {
+   698→    return Array.from(this.deviceContacts.values())
+   699→      .sort((a, b) => (a.name || '').localeCompare(b.name || ''))
+   700→  }
+
+[showing lines 1-700 of 3726; use offset=701 with limit to continue reading]
