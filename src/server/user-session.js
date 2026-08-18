@@ -681,6 +681,10 @@ class UserSession {
     // they own (i.e., that they initiated by sending the first message via
     // the system). Admins see all conversations including unclaimed ones
     // (contact-initiated leads that nobody has grabbed yet).
+    // v7.36: External inbound messages (unclaimed conversations) and device
+    // contacts are now visible to BOTH admin and normal users — so normal
+    // users can see new leads arriving and respond (thereby claiming the
+    // conversation). Only conversations OWNED BY ANOTHER user remain hidden.
     const conversationJids = new Set(this.conversations.keys())
     const deviceContactEntries = []
     const isAdmin = this.user && this.user.role === 'admin'
@@ -688,14 +692,17 @@ class UserSession {
       if (isAdmin) return true  // admin sees everything
       if (!this.sessionManager) return true  // no registry → no filtering (test mode)
       const owner = this.sessionManager.getConversationOwner(jid)
+      if (!owner) return true  // v7.36: unclaimed → visible to everyone (new lead)
       if (owner === this.userId) return true  // user owns this conversation
-      return false  // owned by someone else, or unclaimed → hide from non-admin
+      return false  // owned by someone else → hide from this non-admin user
     }
     for (const contact of this.deviceContacts.values()) {
       if (conversationJids.has(contact.jid)) continue
-      // v7.35: device contacts are also subject to ownership filtering.
-      // A non-admin user only sees device contacts they own.
-      if (!isOwnerOf(contact.jid)) continue
+      // v7.36: device contacts are NOT subject to ownership filtering.
+      // They are just an address book entry from the phone — every user
+      // (admin or not) should be able to start a new conversation with
+      // any of these contacts. Ownership is only enforced AFTER a
+      // conversation is actually initiated via the system.
       deviceContactEntries.push({
         jid: contact.jid,
         name: contact.name,
@@ -1888,8 +1895,10 @@ class UserSession {
 
       let chatsProcessed = 0
       let lidChatsResolved = 0
-      // v7.35: For non-admin users, filter the historical chats by ownership.
-      // Pre-compute role/owner check to avoid hitting the registry once per chat.
+      // v7.35: Filter historical chats by ownership.
+      // v7.36: Unclaimed chats (no owner yet) are now loaded for ALL users
+      // (admin + non-admin) — so external message history is visible to
+      // everyone. Only chats OWNED BY ANOTHER user are skipped.
       const _isAdmin = this.user && this.user.role === 'admin'
       const _sm = this.sessionManager
       for (const chat of chats) {
@@ -1899,14 +1908,10 @@ class UserSession {
           if (jid) lidChatsResolved++
         }
         if (!jid) continue
-        // v7.35: Skip chats owned by other users, or unclaimed chats if this
-        // user is not admin. Otherwise the initial history sync would pollute
-        // non-admin users with EVERY conversation ever had on the shared
-        // WhatsApp number.
+        // v7.35/v7.36: Skip chats owned by another user.
         if (_sm) {
           const owner = _sm.getConversationOwner(jid)
           if (owner && owner !== this.userId) continue
-          if (!owner && !_isAdmin) continue
         }
         const contactName = this.contactNames.get(jid) || null
         if (!this.conversations.has(jid)) {
@@ -1945,13 +1950,12 @@ class UserSession {
         }
         if (!jid) continue
 
-        // v7.35: Apply the same ownership filter to historical messages —
-        // if the user doesn't own this JID and isn't admin, skip the message
-        // (and don't auto-create a conversation for it).
+        // v7.35/v7.36: Skip historical messages owned by another user.
+        // Unclaimed (no owner) messages are loaded for everyone so external
+        // leads are visible to all users until someone claims the conversation.
         if (_sm) {
           const owner = _sm.getConversationOwner(jid)
           if (owner && owner !== this.userId) continue
-          if (!owner && !_isAdmin) continue
         }
 
         const fromMe = msg.key.fromMe || false
@@ -2085,26 +2089,21 @@ class UserSession {
             continue
           }
 
-          // v7.35: Conversation ownership isolation.
+          // v7.35/v7.36: Conversation ownership isolation.
           // - If this JID has an owner that is NOT this user → skip the message
           //   entirely (it belongs to another user's conversation).
           // - If this JID has NO owner (contact-initiated conversation that
-          //   nobody has claimed yet) → only admin processes it. Non-admin
-          //   users skip these so they don't see other people's inbound leads.
+          //   nobody has claimed yet) → process it for EVERYONE (admin and
+          //   non-admin). External inbound messages should create the contact
+          //   and be visible to all users, so any of them can respond and claim
+          //   the conversation. (Claiming happens in onSendMessage / onSendMedia.)
           // - Outgoing messages (fromMe=true) are subject to the same filter:
           //   if another user owns this JID, the outgoing echo is for their
-          //   conversation, not ours. (We don't claim ownership here — that
-          //   only happens in onSendMessage / onSendMedia when the user
-          //   actively sends via the system.)
+          //   conversation, not ours.
           if (this.sessionManager) {
             const owner = this.sessionManager.getConversationOwner(jid)
-            const isAdmin = this.user && this.user.role === 'admin'
             if (owner && owner !== this.userId) {
               console.log(`[WA:${this.userId}] upsert msg skipped — conversation ${jid} owned by user ${owner}`)
-              continue
-            }
-            if (!owner && !isAdmin) {
-              console.log(`[WA:${this.userId}] upsert msg skipped — conversation ${jid} unclaimed (admin-only); non-admin user`)
               continue
             }
           }
@@ -2357,15 +2356,12 @@ class UserSession {
             if (candidate) jid = normalizeJid(candidate)
           }
           if (!jid) continue
-          // v7.35: ownership filter on messages.update too. If this JID is owned
-          // by another user (or unclaimed and this user is not admin), skip the
-          // update entirely — we shouldn't be mutating someone else's conversation
-          // or creating a new message in it via the fallback path.
+          // v7.35/v7.36: ownership filter on messages.update too. Skip
+          // updates for conversations owned by another user. Unclaimed
+          // conversations are processed for everyone.
           if (this.sessionManager) {
             const owner = this.sessionManager.getConversationOwner(jid)
-            const isAdmin = this.user && this.user.role === 'admin'
             if (owner && owner !== this.userId) continue
-            if (!owner && !isAdmin) continue
           }
           const conv = this.conversations.get(jid)
           if (!conv) continue
@@ -2497,15 +2493,11 @@ class UserSession {
           jid = this.lidToPhoneMap.get(chat.id) || null
         }
         if (!jid) continue
-        // v7.35: Skip chats owned by other users, or unclaimed chats if this
-        // user is not admin. These chats come from Baileys' initial sync
-        // (messaging-history.set) and would otherwise pollute non-admin
-        // users with everyone else's conversations.
+        // v7.35/v7.36: Skip chats owned by another user. Unclaimed chats
+        // are processed for everyone so external leads show up for all users.
         if (this.sessionManager) {
           const owner = this.sessionManager.getConversationOwner(jid)
-          const isAdmin = this.user && this.user.role === 'admin'
           if (owner && owner !== this.userId) continue
-          if (!owner && !isAdmin) continue
         }
         if (!this.conversations.has(jid)) {
           const contactName = this.contactNames.get(jid) || null
@@ -2536,12 +2528,11 @@ class UserSession {
           jid = this.lidToPhoneMap.get(update.id) || null
         }
         if (!jid) continue
-        // v7.35: ownership filter — don't mutate other users' conversations
+        // v7.35/v7.36: ownership filter — don't mutate other users' conversations.
+        // Unclaimed conversations can be updated by anyone.
         if (this.sessionManager) {
           const owner = this.sessionManager.getConversationOwner(jid)
-          const isAdmin = this.user && this.user.role === 'admin'
           if (owner && owner !== this.userId) continue
-          if (!owner && !isAdmin) continue
         }
         const conv = this.conversations.get(jid)
         if (conv) {
@@ -2718,20 +2709,15 @@ class UserSession {
 
   onGetMessages(data, callback) {
     const jid = normalizeJid(data?.jid)
-    // v7.35: Block access to conversations owned by another user.
-    // Non-admin users can only fetch messages for conversations they own.
-    // (Admin sees everything.)
+    // v7.35/v7.36: Block access to conversations owned by ANOTHER user.
+    // Unclaimed conversations (no owner yet) and own conversations are
+    // accessible to everyone. Admin sees everything.
     if (jid && this.sessionManager) {
       const owner = this.sessionManager.getConversationOwner(jid)
       const isAdmin = this.user && this.user.role === 'admin'
       if (owner && owner !== this.userId && !isAdmin) {
         console.warn(`[WA:${this.userId}] onGetMessages denied for ${jid} — owned by ${owner}`)
         callback?.({ messages: [], error: 'Acesso negado a esta conversa' })
-        return
-      }
-      if (!owner && !isAdmin) {
-        console.warn(`[WA:${this.userId}] onGetMessages denied for ${jid} — unclaimed (admin-only)`)
-        callback?.({ messages: [], error: 'Conversa não atribuída' })
         return
       }
     }
@@ -2751,18 +2737,15 @@ class UserSession {
         callback?.({ success: false, error: 'Invalid JID', messages: [] })
         return
       }
-      // v7.35: ownership check — same as onGetMessages
+      // v7.35/v7.36: ownership check — same as onGetMessages.
+      // Only blocks conversations owned by ANOTHER user. Unclaimed and
+      // own conversations are accessible to everyone.
       if (this.sessionManager) {
         const owner = this.sessionManager.getConversationOwner(jid)
         const isAdmin = this.user && this.user.role === 'admin'
         if (owner && owner !== this.userId && !isAdmin) {
           console.warn(`[WA:${this.userId}] onRefreshMessages denied for ${jid} — owned by ${owner}`)
           callback?.({ success: false, error: 'Acesso negado a esta conversa', messages: [] })
-          return
-        }
-        if (!owner && !isAdmin) {
-          console.warn(`[WA:${this.userId}] onRefreshMessages denied for ${jid} — unclaimed (admin-only)`)
-          callback?.({ success: false, error: 'Conversa não atribuída', messages: [] })
           return
         }
       }

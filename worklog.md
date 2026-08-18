@@ -1281,3 +1281,23 @@ Stage Summary:
   - src/server/user-session.js (SessionManager + UserSession + handlers)
   - package.json (7.35.0)
   - src/app/login/page.tsx (footer version string)
+
+---
+Task ID: v7.36
+Agent: Main Agent
+Task: Restore external inbound message delivery and phone contacts visibility for non-admin + admin users (keep ownership isolation for conversations initiated via the system)
+
+Work Log:
+- Identified root cause: v7.35.0 ownership filter was too aggressive — it skipped ALL unclaimed conversations (no owner yet) for non-admin users, which is exactly what external inbound messages are. So external leads were being silently dropped for non-admins. Device contacts were also subject to ownership filtering, hiding the entire phone address book from non-admin users.
+- Reviewed all 8 v7.35 ownership filter sites: messages.upsert, messages.update, chats.upsert, chats.update, messaging-history.set (chats), messaging-history.set (messages), onGetMessages, onRefreshMessages, getSortedConversations.isOwnerOf, and device-contact loop.
+- v7.36 fix pattern: KEEP the "if (owner && owner !== this.userId) continue" line (still hides conversations owned by OTHER users). REMOVE the "if (!owner && !isAdmin) continue" line (was blocking external inbound messages for non-admins).
+- getSortedConversations.isOwnerOf now returns true for unclaimed (no owner) → external leads visible to all. Device contacts no longer subject to ownership filter (they're just an address book, not conversations).
+- onGetMessages / onRefreshMessages: kept access block for conversations owned by ANOTHER user, removed block on unclaimed conversations.
+- messaging-history.set (initial history sync): now loads unclaimed chats/messages for all users — so historical external conversations reappear.
+- Bumped version to 7.36.0 in package.json and login page footer.
+- Ran `node -c src/server/user-session.js` → SYNTAX_OK.
+
+Stage Summary:
+- File edited: src/server/user-session.js (8 filter sites relaxed), package.json, src/app/login/page.tsx
+- Behavior change: external inbound messages and phone contacts are now visible to BOTH admin and normal users. Only conversations already OWNED BY ANOTHER user remain hidden from non-admin users. Admin continues to see everything.
+- Compatibility: ownership claim logic (claimConversation in onSendMessage/onSendMedia/onSendMediaBase64) is untouched — first user to respond to an unclaimed lead still becomes its owner.
