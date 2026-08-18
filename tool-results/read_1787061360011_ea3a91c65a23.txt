@@ -1,0 +1,946 @@
+     1→'use client'
+     2→
+     3→import { useState, useEffect, useCallback } from 'react'
+     4→import { Button } from '@/components/ui/button'
+     5→import { Input } from '@/components/ui/input'
+     6→import { Label } from '@/components/ui/label'
+     7→import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+     8→import { Badge } from '@/components/ui/badge'
+     9→import {
+    10→  Table,
+    11→  TableBody,
+    12→  TableCell,
+    13→  TableHead,
+    14→  TableHeader,
+    15→  TableRow,
+    16→} from '@/components/ui/table'
+    17→import {
+    18→  Dialog,
+    19→  DialogContent,
+    20→  DialogDescription,
+    21→  DialogFooter,
+    22→  DialogHeader,
+    23→  DialogTitle,
+    24→} from '@/components/ui/dialog'
+    25→import {
+    26→  Select,
+    27→  SelectContent,
+    28→  SelectItem,
+    29→  SelectTrigger,
+    30→  SelectValue,
+    31→} from '@/components/ui/select'
+    32→import {
+    33→  Switch
+    34→} from '@/components/ui/switch'
+    35→import { Alert, AlertDescription } from '@/components/ui/alert'
+    36→import {
+    37→  UserPlus,
+    38→  Pencil,
+    39→  Trash2,
+    40→  Loader2,
+    41→  Shield,
+    42→  User as UserIcon,
+    43→  Mail,
+    44→  Phone,
+    45→  RefreshCw,
+    46→  Key,
+    47→  ExternalLink,
+    48→  Database,
+    49→  CheckCircle2,
+    50→  AlertCircle,
+    51→  FlaskConical,
+    52→  Dices,
+    53→  Eye,
+    54→  EyeOff,
+    55→} from 'lucide-react'
+    56→import { useOdoo } from '@/lib/use-odoo'
+    57→
+    58→interface UserRow {
+    59→  id: string
+    60→  email: string
+    61→  name: string | null
+    62→  role: string
+    63→  isActive: boolean
+    64→  whatsappPhone: string | null
+    65→  odooUrl: string | null
+    66→  odooDb: string | null
+    67→  odooUsername: string | null
+    68→  createdAt: string
+    69→  updatedAt: string
+    70→}
+    71→
+    72→interface EditState {
+    73→  id?: string
+    74→  email: string
+    75→  name: string
+    76→  password: string
+    77→  role: 'user' | 'admin'
+    78→  isActive: boolean
+    79→  whatsappPhone: string
+    80→  odooUrl: string
+    81→  odooDb: string
+    82→  odooUsername: string
+    83→  odooPassword: string
+    84→}
+    85→
+    86→const EMPTY_EDIT: EditState = {
+    87→  email: '',
+    88→  name: '',
+    89→  password: '',
+    90→  role: 'user',
+    91→  isActive: true,
+    92→  whatsappPhone: '',
+    93→  odooUrl: '',
+    94→  odooDb: '',
+    95→  odooUsername: '',
+    96→  odooPassword: '',
+    97→}
+    98→
+    99→export function UsersPanel() {
+   100→  const [users, setUsers] = useState<UserRow[]>([])
+   101→  const [isLoading, setIsLoading] = useState(true)
+   102→  const [error, setError] = useState<string | null>(null)
+   103→  const [dialogOpen, setDialogOpen] = useState(false)
+   104→  const [editState, setEditState] = useState<EditState>(EMPTY_EDIT)
+   105→  const [isSaving, setIsSaving] = useState(false)
+   106→  // v7.24 (R6): pre-deploy backup state
+   107→  const odoo = useOdoo()
+   108→  const [isBackingUp, setIsBackingUp] = useState(false)
+   109→  const [backupResult, setBackupResult] = useState<{
+   110→    success: boolean
+   111→    backed: number
+   112→    total: number
+   113→    failed: Array<{ userId: string; email: string; error: string }>
+   114→    at: string
+   115→  } | null>(null)
+   116→  // v7.26: Test-login state
+   117→  const [testLoginUser, setTestLoginUser] = useState<UserRow | null>(null)
+   118→  const [testLoginPassword, setTestLoginPassword] = useState('')
+   119→  const [testLoginResult, setTestLoginResult] = useState<null | {
+   120→    found: boolean
+   121→    isActive: boolean
+   122→    role: string
+   123→    passwordOk: boolean
+   124→    hashPrefix: string
+   125→    hashLength: number
+   126→    providedHashPreview: string
+   127→  }>(null)
+   128→  const [isTestingLogin, setIsTestingLogin] = useState(false)
+   129→  const [showPassword, setShowPassword] = useState(false)
+   130→  // v7.29: "Alterar senha" dialog state
+   131→  const [pwdUser, setPwdUser] = useState<UserRow | null>(null)
+   132→  const [newPassword, setNewPassword] = useState('')
+   133→  const [showNewPassword, setShowNewPassword] = useState(false)
+   134→  const [isChangingPwd, setIsChangingPwd] = useState(false)
+   135→  const [pwdCopied, setPwdCopied] = useState(false)
+   136→
+   137→  const loadUsers = useCallback(async () => {
+   138→    setIsLoading(true)
+   139→    setError(null)
+   140→    try {
+   141→      const res = await fetch('/api/users', { cache: 'no-store' })
+   142→      const data = await res.json()
+   143→      if (data.success) {
+   144→        setUsers(data.users)
+   145→      } else {
+   146→        setError(data.error || 'Falha ao carregar usuários')
+   147→      }
+   148→    } catch (err: any) {
+   149→      setError(err.message)
+   150→    } finally {
+   151→      setIsLoading(false)
+   152→    }
+   153→  }, [])
+   154→
+   155→  useEffect(() => {
+   156→    loadUsers()
+   157→  }, [loadUsers])
+   158→
+   159→  // v7.24 (R6): Backup all active user sessions to Odoo chatter.
+   160→  // Should be triggered manually BEFORE any deploy.
+   161→  const handleBackupToOdoo = useCallback(async () => {
+   162→    if (isBackingUp) return
+   163→    setIsBackingUp(true)
+   164→    setBackupResult(null)
+   165→    try {
+   166→      const r = await odoo.backupAllToOdoo()
+   167→      if (r.success) {
+   168→        setBackupResult({
+   169→          success: true,
+   170→          backed: r.backed || 0,
+   171→          total: r.total || 0,
+   172→          failed: r.failed || [],
+   173→          at: new Date().toISOString(),
+   174→        })
+   175→      } else {
+   176→        setBackupResult({
+   177→          success: false,
+   178→          backed: r.backed || 0,
+   179→          total: r.total || 0,
+   180→          failed: r.failed || [{ userId: '-', email: '-', error: r.error || 'Falha desconhecida' }],
+   181→          at: new Date().toISOString(),
+   182→        })
+   183→      }
+   184→    } catch (err: any) {
+   185→      setBackupResult({
+   186→        success: false,
+   187→        backed: 0,
+   188→        total: 0,
+   189→        failed: [{ userId: '-', email: '-', error: err.message }],
+   190→        at: new Date().toISOString(),
+   191→      })
+   192→    } finally {
+   193→      setIsBackingUp(false)
+   194→    }
+   195→  }, [isBackingUp, odoo])
+   196→
+   197→  const handleCreate = () => {
+   198→    setEditState(EMPTY_EDIT)
+   199→    setDialogOpen(true)
+   200→  }
+   201→
+   202→  const handleEdit = (user: UserRow) => {
+   203→    setEditState({
+   204→      id: user.id,
+   205→      email: user.email,
+   206→      name: user.name || '',
+   207→      password: '',
+   208→      role: user.role as 'user' | 'admin',
+   209→      isActive: user.isActive,
+   210→      whatsappPhone: user.whatsappPhone || '',
+   211→      odooUrl: user.odooUrl || '',
+   212→      odooDb: user.odooDb || '',
+   213→      odooUsername: user.odooUsername || '',
+   214→      odooPassword: '',
+   215→    })
+   216→    setDialogOpen(true)
+   217→  }
+   218→
+   219→  const handleSave = async () => {
+   220→    setIsSaving(true)
+   221→    setError(null)
+   222→    try {
+   223→      const isEditing = !!editState.id
+   224→      const url = isEditing ? `/api/users/${editState.id}` : '/api/users'
+   225→      const method = isEditing ? 'PATCH' : 'POST'
+   226→
+   227→      const body: any = {
+   228→        email: editState.email,
+   229→        name: editState.name,
+   230→        role: editState.role,
+   231→        isActive: editState.isActive,
+   232→        whatsappPhone: editState.whatsappPhone,
+   233→        odooUrl: editState.odooUrl,
+   234→        odooDb: editState.odooDb,
+   235→        odooUsername: editState.odooUsername,
+   236→      }
+   237→      if (editState.password) body.password = editState.password
+   238→      if (editState.odooPassword) body.odooPassword = editState.odooPassword
+   239→
+   240→      const res = await fetch(url, {
+   241→        method,
+   242→        headers: { 'Content-Type': 'application/json' },
+   243→        body: JSON.stringify(body),
+   244→      })
+   245→      const data = await res.json()
+   246→      if (data.success) {
+   247→        setDialogOpen(false)
+   248→        await loadUsers()
+   249→      } else {
+   250→        setError(data.error || 'Falha ao salvar')
+   251→      }
+   252→    } catch (err: any) {
+   253→      setError(err.message)
+   254→    } finally {
+   255→      setIsSaving(false)
+   256→    }
+   257→  }
+   258→
+   259→  // v7.26: Generate a random strong password and put it into the edit form
+   260→  const generatePassword = () => {
+   261→    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789!@#$%&*'
+   262→    let pwd = ''
+   263→    const arr = new Uint32Array(12)
+   264→    crypto.getRandomValues(arr)
+   265→    for (let i = 0; i < 12; i++) pwd += chars[arr[i] % chars.length]
+   266→    setEditState(s => ({ ...s, password: pwd }))
+   267→    setShowPassword(true)
+   268→  }
+   269→
+   270→  // v7.26: Test a user's password without impersonating them
+   271→  const handleTestLogin = async () => {
+   272→    if (!testLoginUser || !testLoginPassword) return
+   273→    setIsTestingLogin(true)
+   274→    setTestLoginResult(null)
+   275→    try {
+   276→      const res = await fetch(`/api/users/${testLoginUser.id}/test-login`, {
+   277→        method: 'POST',
+   278→        headers: { 'Content-Type': 'application/json' },
+   279→        body: JSON.stringify({ password: testLoginPassword }),
+   280→      })
+   281→      const data = await res.json()
+   282→      if (data.success) {
+   283→        setTestLoginResult({
+   284→          found: data.found,
+   285→          isActive: data.isActive,
+   286→          role: data.role,
+   287→          passwordOk: data.passwordOk,
+   288→          hashPrefix: data.hashPrefix,
+   289→          hashLength: data.hashLength,
+   290→          providedHashPreview: data.providedHashPreview,
+   291→        })
+   292→      } else {
+   293→        setTestLoginResult({
+   294→          found: false,
+   295→          isActive: false,
+   296→          role: '?',
+   297→          passwordOk: false,
+   298→          hashPrefix: 'error: ' + (data.error || 'unknown'),
+   299→          hashLength: 0,
+   300→          providedHashPreview: '',
+   301→        })
+   302→      }
+   303→    } catch (err: any) {
+   304→      setTestLoginResult({
+   305→        found: false,
+   306→        isActive: false,
+   307→        role: '?',
+   308→        passwordOk: false,
+   309→        hashPrefix: 'fetch error: ' + err.message,
+   310→        hashLength: 0,
+   311→        providedHashPreview: '',
+   312→      })
+   313→    } finally {
+   314→      setIsTestingLogin(false)
+   315→    }
+   316→  }
+   317→
+   318→  const handleDelete = async (user: UserRow) => {
+   319→    if (!confirm(`Excluir o usuário "${user.email}"? Esta ação não pode ser desfeita.`)) return
+   320→    try {
+   321→      const res = await fetch(`/api/users/${user.id}`, { method: 'DELETE' })
+   322→      const data = await res.json()
+   323→      if (data.success) {
+   324→        await loadUsers()
+   325→      } else {
+   326→        setError(data.error || 'Falha ao excluir')
+   327→      }
+   328→    } catch (err: any) {
+   329→      setError(err.message)
+   330→    }
+   331→  }
+   332→
+   333→  const activeCount = users.filter(u => u.isActive).length
+   334→  const adminCount = users.filter(u => u.role === 'admin').length
+   335→
+   336→  // v7.29: Open the "Alterar senha" dialog for a user
+   337→  const openChangePassword = (user: UserRow) => {
+   338→    setPwdUser(user)
+   339→    setNewPassword('')
+   340→    setShowNewPassword(false)
+   341→    setPwdCopied(false)
+   342→  }
+   343→
+   344→  // v7.29: Save a new password for the user (hashed on the server)
+   345→  const handleChangePassword = async () => {
+   346→    if (!pwdUser || !newPassword.trim()) return
+   347→    setIsChangingPwd(true)
+   348→    setError(null)
+   349→    try {
+   350→      const res = await fetch(`/api/users/${pwdUser.id}`, {
+   351→        method: 'PATCH',
+   352→        headers: { 'Content-Type': 'application/json' },
+   353→        body: JSON.stringify({ password: newPassword.trim() }),
+   354→      })
+   355→      const data = await res.json()
+   356→      if (data.success) {
+   357→        setPwdUser(null)
+   358→        await loadUsers()
+   359→      } else {
+   360→        setError(data.error || 'Falha ao alterar a senha')
+   361→      }
+   362→    } catch (err: any) {
+   363→      setError(err.message)
+   364→    } finally {
+   365→      setIsChangingPwd(false)
+   366→    }
+   367→  }
+   368→
+   369→  const copyNewPassword = async () => {
+   370→    try {
+   371→      await navigator.clipboard?.writeText(newPassword)
+   372→      setPwdCopied(true)
+   373→      setTimeout(() => setPwdCopied(false), 2000)
+   374→    } catch {}
+   375→  }
+   376→
+   377→  return (
+   378→    <div className="space-y-4">
+   379→      <div className="flex items-center justify-between gap-3">
+   380→        <div>
+   381→          <h2 className="text-xl font-bold flex items-center gap-2">
+   382→            <UserIcon className="size-5" />
+   383→            Usuários do Middleware
+   384→          </h2>
+   385→          <p className="text-sm text-muted-foreground mt-1">
+   386→            {users.length} total • {activeCount} ativos • {adminCount} admin
+   387→          </p>
+   388→        </div>
+   389→        <div className="flex gap-2">
+   390→          <Button variant="outline" size="sm" onClick={loadUsers} disabled={isLoading}>
+   391→            <RefreshCw className={`size-4 mr-1.5 ${isLoading ? 'animate-spin' : ''}`} />
+   392→            Atualizar
+   393→          </Button>
+   394→          {/* v7.24 (R6): Pre-deploy backup button */}
+   395→          <Button
+   396→            variant="outline"
+   397→            size="sm"
+   398→            onClick={handleBackupToOdoo}
+   399→            disabled={isBackingUp || !odoo.isConnected}
+   400→            title={odoo.isConnected ? 'Salva credenciais e conversas de todos os usuários no chatter do Odoo (use antes de deploy)' : 'Conecte ao Odoo primeiro'}
+   401→          >
+   402→            {isBackingUp ? <Loader2 className="size-4 mr-1.5 animate-spin" /> : <Database className="size-4 mr-1.5" />}
+   403→            {isBackingUp ? 'Backup em andamento…' : 'Backup no Odoo'}
+   404→          </Button>
+   405→          <Button size="sm" onClick={handleCreate} className="bg-emerald-600 hover:bg-emerald-700 text-white">
+   406→            <UserPlus className="size-4 mr-1.5" />
+   407→            Novo Usuário
+   408→          </Button>
+   409→        </div>
+   410→      </div>
+   411→
+   412→      {/* v7.24 (R6): Backup result banner */}
+   413→      {backupResult && (
+   414→        <Alert variant={backupResult.success ? 'default' : 'destructive'}>
+   415→          {backupResult.success
+   416→            ? <CheckCircle2 className="size-4" />
+   417→            : <AlertCircle className="size-4" />}
+   418→          <AlertDescription>
+   419→            {backupResult.success
+   420→              ? `Backup concluído: ${backupResult.backed}/${backupResult.total} usuário(s) salvos no chatter do Odoo.`
+   421→              : `Backup parcial: ${backupResult.backed}/${backupResult.total} ok, ${backupResult.failed.length} falha(s).`}
+   422→            {backupResult.failed.length > 0 && (
+   423→              <ul className="mt-1 ml-4 text-xs list-disc">
+   424→                {backupResult.failed.map((f, i) => (
+   425→                  <li key={i}>{f.email}: {f.error}</li>
+   426→                ))}
+   427→              </ul>
+   428→            )}
+   429→            <span className="block mt-1 text-xs text-muted-foreground">
+   430→              Realizado em {new Date(backupResult.at).toLocaleString('pt-BR')}
+   431→            </span>
+   432→          </AlertDescription>
+   433→        </Alert>
+   434→      )}
+   435→
+   436→      {error && (
+   437→        <Alert variant="destructive">
+   438→          <AlertDescription>{error}</AlertDescription>
+   439→        </Alert>
+   440→      )}
+   441→
+   442→      <Card>
+   443→        <CardContent className="p-0">
+   444→          {isLoading ? (
+   445→            <div className="flex items-center justify-center py-12">
+   446→              <Loader2 className="size-6 animate-spin text-muted-foreground" />
+   447→            </div>
+   448→          ) : users.length === 0 ? (
+   449→            <div className="text-center py-12">
+   450→              <UserIcon className="size-10 mx-auto text-muted-foreground/50 mb-2" />
+   451→              <p className="text-sm text-muted-foreground">Nenhum usuário cadastrado</p>
+   452→            </div>
+   453→          ) : (
+   454→            <Table>
+   455→              <TableHeader>
+   456→                <TableRow>
+   457→                  <TableHead>Usuário</TableHead>
+   458→                  <TableHead>Telefone WA</TableHead>
+   459→                  <TableHead>Odoo</TableHead>
+   460→                  <TableHead>Perfil</TableHead>
+   461→                  <TableHead>Status</TableHead>
+   462→                  <TableHead className="text-right">Ações</TableHead>
+   463→                </TableRow>
+   464→              </TableHeader>
+   465→              <TableBody>
+   466→                {users.map((user) => (
+   467→                  <TableRow key={user.id}>
+   468→                    <TableCell>
+   469→                      <div className="flex flex-col">
+   470→                        <span className="font-medium text-sm flex items-center gap-1.5">
+   471→                          {user.name || user.email}
+   472→                          {user.role === 'admin' && (
+   473→                            <Shield className="size-3 text-amber-600" />
+   474→                          )}
+   475→                        </span>
+   476→                        <span className="text-xs text-muted-foreground flex items-center gap-1">
+   477→                          <Mail className="size-3" />
+   478→                          {user.email}
+   479→                        </span>
+   480→                      </div>
+   481→                    </TableCell>
+   482→                    <TableCell>
+   483→                      {user.whatsappPhone ? (
+   484→                        <span className="text-sm flex items-center gap-1">
+   485→                          <Phone className="size-3 text-muted-foreground" />
+   486→                          {user.whatsappPhone}
+   487→                        </span>
+   488→                      ) : (
+   489→                        <span className="text-xs text-muted-foreground">—</span>
+   490→                      )}
+   491→                    </TableCell>
+   492→                    <TableCell>
+   493→                      {user.odooUrl ? (
+   494→                        <div className="flex flex-col text-xs">
+   495→                          <span className="font-medium truncate max-w-[160px]">{user.odooUsername || '?'}</span>
+   496→                          <span className="text-muted-foreground truncate max-w-[160px]">
+   497→                            {user.odooDb}@{(() => {
+   498→                              try { return new URL(user.odooUrl!).hostname } catch { return user.odooUrl }
+   499→                            })()}
+   500→                          </span>
+   501→                        </div>
+   502→                      ) : (
+   503→                        <span className="text-xs text-muted-foreground">Usa config global</span>
+   504→                      )}
+   505→                    </TableCell>
+   506→                    <TableCell>
+   507→                      {user.role === 'admin' ? (
+   508→                        <Badge className="bg-amber-100 text-amber-800 border-amber-200">Admin</Badge>
+   509→                      ) : (
+   510→                        <Badge variant="outline">Usuário</Badge>
+   511→                      )}
+   512→                    </TableCell>
+   513→                    <TableCell>
+   514→                      {user.isActive ? (
+   515→                        <Badge className="bg-emerald-100 text-emerald-800 border-emerald-200">Ativo</Badge>
+   516→                      ) : (
+   517→                        <Badge variant="secondary">Inativo</Badge>
+   518→                      )}
+   519→                    </TableCell>
+   520→                    <TableCell className="text-right">
+   521→                      <div className="flex items-center justify-end gap-1">
+   522→                        <Button
+   523→                          variant="ghost"
+   524→                          size="icon"
+   525→                          className="size-8"
+   526→                          onClick={() => openChangePassword(user)}
+   527→                          title="Alterar senha"
+   528→                        >
+   529→                          <Key className="size-4" />
+   530→                        </Button>
+   531→                        <Button
+   532→                          variant="ghost"
+   533→                          size="icon"
+   534→                          className="size-8"
+   535→                          onClick={() => {
+   536→                            setTestLoginUser(user)
+   537→                            setTestLoginPassword('')
+   538→                            setTestLoginResult(null)
+   539→                          }}
+   540→                          title="Testar login"
+   541→                        >
+   542→                          <FlaskConical className="size-4" />
+   543→                        </Button>
+   544→                        <Button
+   545→                          variant="ghost"
+   546→                          size="icon"
+   547→                          className="size-8"
+   548→                          onClick={() => handleEdit(user)}
+   549→                          title="Editar"
+   550→                        >
+   551→                          <Pencil className="size-4" />
+   552→                        </Button>
+   553→                        <Button
+   554→                          variant="ghost"
+   555→                          size="icon"
+   556→                          className="size-8 hover:bg-destructive/10 hover:text-destructive"
+   557→                          onClick={() => handleDelete(user)}
+   558→                          title="Excluir"
+   559→                        >
+   560→                          <Trash2 className="size-4" />
+   561→                        </Button>
+   562→                      </div>
+   563→                    </TableCell>
+   564→                  </TableRow>
+   565→                ))}
+   566→              </TableBody>
+   567→            </Table>
+   568→          )}
+   569→        </CardContent>
+   570→      </Card>
+   571→
+   572→      {/* v7.29: Alterar senha dialog */}
+   573→      <Dialog open={!!pwdUser} onOpenChange={(o) => { if (!o) setPwdUser(null) }}>
+   574→        <DialogContent className="max-w-md">
+   575→          <DialogHeader>
+   576→            <DialogTitle className="flex items-center gap-2">
+   577→              <Key className="size-5 text-emerald-600" />
+   578→              Alterar senha
+   579→            </DialogTitle>
+   580→            <DialogDescription>
+   581→              {pwdUser && (
+   582→                <>Redefinir a senha de <strong>{pwdUser.email}</strong>. A nova senha fica salva no Firebase (hasheada) e passa a valer no próximo login.</>
+   583→              )}
+   584→            </DialogDescription>
+   585→          </DialogHeader>
+   586→
+   587→          <div className="space-y-3 py-2">
+   588→            <div className="space-y-1.5">
+   589→              <Label htmlFor="new-pwd" className="flex items-center gap-1">
+   590→                Nova senha *
+   591→                <Button
+   592→                  type="button"
+   593→                  variant="ghost"
+   594→                  size="sm"
+   595→                  className="size-6 p-0 ml-auto"
+   596→                  onClick={() => {
+   597→                    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789!@#$%&*'
+   598→                    let pwd = ''
+   599→                    const arr = new Uint32Array(12)
+   600→                    crypto.getRandomValues(arr)
+   601→                    for (let i = 0; i < 12; i++) pwd += chars[arr[i] % chars.length]
+   602→                    setNewPassword(pwd)
+   603→                    setShowNewPassword(true)
+   604→                  }}
+   605→                  title="Gerar senha forte"
+   606→                >
+   607→                  <Dices className="size-3.5" />
+   608→                </Button>
+   609→                <Button
+   610→                  type="button"
+   611→                  variant="ghost"
+   612→                  size="sm"
+   613→                  className="size-6 p-0"
+   614→                  onClick={() => setShowNewPassword(s => !s)}
+   615→                  title={showNewPassword ? 'Ocultar' : 'Mostrar'}
+   616→                >
+   617→                  {showNewPassword ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
+   618→                </Button>
+   619→              </Label>
+   620→              <Input
+   621→                id="new-pwd"
+   622→                type={showNewPassword ? 'text' : 'password'}
+   623→                value={newPassword}
+   624→                onChange={(e) => setNewPassword(e.target.value)}
+   625→                placeholder="Mínimo 6 caracteres"
+   626→                className="font-mono"
+   627→                minLength={6}
+   628→              />
+   629→            </div>
+   630→
+   631→            {newPassword && (
+   632→              <div className="flex items-center justify-between rounded-md bg-muted/40 border px-3 py-2">
+   633→                <code className="font-mono text-sm break-all pr-2">{newPassword}</code>
+   634→                <Button type="button" variant="ghost" size="sm" className="shrink-0" onClick={copyNewPassword}>
+   635→                  {pwdCopied ? <CheckCircle2 className="size-4 text-emerald-600" /> : <span className="text-xs">Copiar</span>}
+   636→                </Button>
+   637→              </div>
+   638→            )}
+   639→
+   640→            {newPassword && (
+   641→              <p className="text-xs text-muted-foreground">
+   642→                Compartilhe a senha com o usuário de forma segura (WhatsApp/telefone). Você também pode usar &quot;Testar login&quot; depois para confirmar.
+   643→              </p>
+   644→            )}
+   645→          </div>
+   646→
+   647→          <DialogFooter className="gap-2">
+   648→            <Button variant="outline" onClick={() => setPwdUser(null)} disabled={isChangingPwd}>
+   649→              Cancelar
+   650→            </Button>
+   651→            <Button
+   652→              onClick={handleChangePassword}
+   653→              disabled={isChangingPwd || !newPassword.trim() || newPassword.trim().length < 6}
+   654→              className="bg-emerald-600 hover:bg-emerald-700 text-white"
+   655→            >
+   656→              {isChangingPwd && <Loader2 className="size-4 mr-1.5 animate-spin" />}
+   657→              Salvar nova senha
+   658→            </Button>
+   659→          </DialogFooter>
+   660→        </DialogContent>
+   661→      </Dialog>
+   662→
+   663→      {/* v7.26: Test-login dialog */}
+   664→      <Dialog open={!!testLoginUser} onOpenChange={(o) => { if (!o) setTestLoginUser(null) }}>
+   665→        <DialogContent className="max-w-lg">
+   666→          <DialogHeader>
+   667→            <DialogTitle className="flex items-center gap-2">
+   668→              <FlaskConical className="size-5 text-amber-600" />
+   669→              Testar login
+   670→            </DialogTitle>
+   671→            <DialogDescription>
+   672→              {testLoginUser && (
+   673→                <>Verificar senha de <strong>{testLoginUser.email}</strong> sem fazer login como este usuário.</>
+   674→              )}
+   675→            </DialogDescription>
+   676→          </DialogHeader>
+   677→
+   678→          <div className="space-y-3 py-2">
+   679→            <div className="space-y-1.5">
+   680→              <Label htmlFor="test-pwd" className="flex items-center gap-1">
+   681→                <Key className="size-3" />
+   682→                Senha para testar
+   683→                <Button
+   684→                  type="button"
+   685→                  variant="ghost"
+   686→                  size="sm"
+   687→                  className="size-6 p-0 ml-auto"
+   688→                  onClick={() => setShowPassword(s => !s)}
+   689→                  title={showPassword ? 'Ocultar' : 'Mostrar'}
+   690→                >
+   691→                  {showPassword ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
+   692→                </Button>
+   693→              </Label>
+   694→              <Input
+   695→                id="test-pwd"
+   696→                type={showPassword ? 'text' : 'password'}
+   697→                value={testLoginPassword}
+   698→                onChange={(e) => setTestLoginPassword(e.target.value)}
+   699→                placeholder="Digite a senha que o usuário está tentando usar"
+   700→                className="font-mono"
+   701→                onKeyDown={(e) => { if (e.key === 'Enter' && testLoginPassword) handleTestLogin() }}
+   702→              />
+   703→            </div>
+   704→
+   705→            <Button
+   706→              onClick={handleTestLogin}
+   707→              disabled={isTestingLogin || !testLoginPassword}
+   708→              className="w-full"
+   709→            >
+   710→              {isTestingLogin ? <Loader2 className="size-4 mr-1.5 animate-spin" /> : <FlaskConical className="size-4 mr-1.5" />}
+   711→              Testar senha
+   712→            </Button>
+   713→
+   714→            {testLoginResult && (
+   715→              <div className={`rounded-md border p-3 text-sm space-y-1 ${
+   716→                testLoginResult.passwordOk
+   717→                  ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
+   718→                  : 'bg-red-50 border-red-200 text-red-900'
+   719→              }`}>
+   720→                <div className="flex items-center gap-2 font-medium">
+   721→                  {testLoginResult.passwordOk
+   722→                    ? <><CheckCircle2 className="size-4" /> Senha correta! Login deve funcionar.</>
+   723→                    : <><AlertCircle className="size-4" /> Senha incorreta.</>}
+   724→                </div>
+   725→                <div className="text-xs space-y-0.5 mt-2 font-mono">
+   726→                  <div>Usuário encontrado: <strong>{testLoginResult.found ? 'sim' : 'não'}</strong></div>
+   727→                  <div>Ativo: <strong>{testLoginResult.isActive ? 'sim' : 'não'}</strong></div>
+   728→                  <div>Role: <strong>{testLoginResult.role}</strong></div>
+   729→                  <div>Hash armazenado (prefix): <code>{testLoginResult.hashPrefix}</code></div>
+   730→                  <div>Hash length: <strong>{testLoginResult.hashLength}</strong> chars</div>
+   731→                  {testLoginResult.providedHashPreview && (
+   732→                    <div>Novo hash da senha digitada (prefix): <code>{testLoginResult.providedHashPreview}</code></div>
+   733→                  )}
+   734→                </div>
+   735→                {!testLoginResult.passwordOk && testLoginResult.found && (
+   736→                  <div className="text-xs mt-2 p-2 bg-amber-50 border border-amber-200 rounded">
+   737→                    <strong>Sugestão:</strong> Edite o usuário, clique no botão <Dices className="size-3 inline" /> para gerar uma senha forte,
+   738→                    salve, copie a senha e envie ao usuário. Use esta tela novamente para confirmar.
+   739→                  </div>
+   740→                )}
+   741→              </div>
+   742→            )}
+   743→
+   744→            <div className="text-xs text-muted-foreground">
+   745→              <p>Este teste não faz login — apenas verifica se a senha bate com o hash armazenado.</p>
+   746→              <p>Também registra logs no servidor (timestamp + email + resultado) para diagnóstico.</p>
+   747→            </div>
+   748→          </div>
+   749→        </DialogContent>
+   750→      </Dialog>
+   751→
+   752→      <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
+   753→        <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
+   754→          <DialogHeader>
+   755→            <DialogTitle>
+   756→              {editState.id ? 'Editar Usuário' : 'Novo Usuário'}
+   757→            </DialogTitle>
+   758→            <DialogDescription>
+   759→              {editState.id
+   760→                ? 'Altere os campos abaixo. Deixe a senha em branco para manter a atual.'
+   761→                : 'Preencha os campos para criar um novo usuário do middleware.'}
+   762→            </DialogDescription>
+   763→          </DialogHeader>
+   764→
+   765→          <div className="space-y-4 py-2">
+   766→            <div className="grid grid-cols-2 gap-3">
+   767→              <div className="space-y-1.5">
+   768→                <Label htmlFor="edit-email">Email *</Label>
+   769→                <Input
+   770→                  id="edit-email"
+   771→                  type="email"
+   772→                  value={editState.email}
+   773→                  onChange={(e) => setEditState(s => ({ ...s, email: e.target.value }))}
+   774→                  placeholder="voce@empresa.com"
+   775→                  required
+   776→                />
+   777→              </div>
+   778→              <div className="space-y-1.5">
+   779→                <Label htmlFor="edit-name">Nome</Label>
+   780→                <Input
+   781→                  id="edit-name"
+   782→                  value={editState.name}
+   783→                  onChange={(e) => setEditState(s => ({ ...s, name: e.target.value }))}
+   784→                  placeholder="Nome do usuário"
+   785→                />
+   786→              </div>
+   787→            </div>
+   788→
+   789→            <div className="grid grid-cols-2 gap-3">
+   790→              <div className="space-y-1.5">
+   791→                <Label htmlFor="edit-password" className="flex items-center gap-1">
+   792→                  <Key className="size-3" />
+   793→                  {editState.id ? 'Nova senha (opcional)' : 'Senha *'}
+   794→                  <Button
+   795→                    type="button"
+   796→                    variant="ghost"
+   797→                    size="sm"
+   798→                    className="size-6 p-0 ml-auto"
+   799→                    onClick={generatePassword}
+   800→                    title="Gerar senha forte"
+   801→                  >
+   802→                    <Dices className="size-3.5" />
+   803→                  </Button>
+   804→                  <Button
+   805→                    type="button"
+   806→                    variant="ghost"
+   807→                    size="sm"
+   808→                    className="size-6 p-0"
+   809→                    onClick={() => setShowPassword(s => !s)}
+   810→                    title={showPassword ? 'Ocultar' : 'Mostrar'}
+   811→                  >
+   812→                    {showPassword ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
+   813→                  </Button>
+   814→                </Label>
+   815→                <Input
+   816→                  id="edit-password"
+   817→                  type={showPassword ? 'text' : 'password'}
+   818→                  value={editState.password}
+   819→                  onChange={(e) => setEditState(s => ({ ...s, password: e.target.value }))}
+   820→                  placeholder={editState.id ? 'Deixe em branco para manter' : 'Mínimo 6 caracteres'}
+   821→                  required={!editState.id}
+   822→                  className="font-mono"
+   823→                />
+   824→                {editState.password && showPassword && (
+   825→                  <p className="text-xs text-emerald-600">
+   826→                    Senha gerada: <code className="font-mono bg-muted px-1 rounded">{editState.password}</code>
+   827→                  </p>
+   828→                )}
+   829→              </div>
+   830→              <div className="space-y-1.5">
+   831→                <Label htmlFor="edit-phone">Telefone WhatsApp</Label>
+   832→                <Input
+   833→                  id="edit-phone"
+   834→                  value={editState.whatsappPhone}
+   835→                  onChange={(e) => setEditState(s => ({ ...s, whatsappPhone: e.target.value }))}
+   836→                  placeholder="5511999999999"
+   837→                />
+   838→              </div>
+   839→            </div>
+   840→
+   841→            <div className="grid grid-cols-2 gap-3">
+   842→              <div className="space-y-1.5">
+   843→                <Label>Perfil</Label>
+   844→                <Select
+   845→                  value={editState.role}
+   846→                  onValueChange={(v) => setEditState(s => ({ ...s, role: v as 'user' | 'admin' }))}
+   847→                >
+   848→                  <SelectTrigger>
+   849→                    <SelectValue />
+   850→                  </SelectTrigger>
+   851→                  <SelectContent>
+   852→                    <SelectItem value="user">Usuário</SelectItem>
+   853→                    <SelectItem value="admin">
+   854→                      <span className="flex items-center gap-1.5">
+   855→                        <Shield className="size-3" /> Admin
+   856→                      </span>
+   857→                    </SelectItem>
+   858→                  </SelectContent>
+   859→                </Select>
+   860→              </div>
+   861→              <div className="space-y-1.5">
+   862→                <Label>Status</Label>
+   863→                <div className="flex items-center gap-2 h-9">
+   864→                  <Switch
+   865→                    checked={editState.isActive}
+   866→                    onCheckedChange={(v) => setEditState(s => ({ ...s, isActive: v }))}
+   867→                  />
+   868→                  <span className="text-sm">
+   869→                    {editState.isActive ? 'Ativo' : 'Inativo'}
+   870→                  </span>
+   871→                </div>
+   872→              </div>
+   873→            </div>
+   874→
+   875→            <div className="rounded-md bg-muted/30 border p-3 space-y-3">
+   876→              <div className="flex items-center gap-2 text-sm font-medium">
+   877→                <ExternalLink className="size-4" />
+   878→                Configuração Odoo (por usuário)
+   879→                <span className="text-xs font-normal text-muted-foreground">
+   880→                  — opcional, usa config global se vazio
+   881→                </span>
+   882→              </div>
+   883→              <div className="grid grid-cols-2 gap-3">
+   884→                <div className="space-y-1.5">
+   885→                  <Label htmlFor="edit-odoo-url">URL Odoo</Label>
+   886→                  <Input
+   887→                    id="edit-odoo-url"
+   888→                    value={editState.odooUrl}
+   889→                    onChange={(e) => setEditState(s => ({ ...s, odooUrl: e.target.value }))}
+   890→                    placeholder="https://empresa.odoo.com"
+   891→                  />
+   892→                </div>
+   893→                <div className="space-y-1.5">
+   894→                  <Label htmlFor="edit-odoo-db">Banco de dados</Label>
+   895→                  <Input
+   896→                    id="edit-odoo-db"
+   897→                    value={editState.odooDb}
+   898→                    onChange={(e) => setEditState(s => ({ ...s, odooDb: e.target.value }))}
+   899→                    placeholder="empresa_db"
+   900→                  />
+   901→                </div>
+   902→                <div className="space-y-1.5">
+   903→                  <Label htmlFor="edit-odoo-user">Usuário Odoo</Label>
+   904→                  <Input
+   905→                    id="edit-odoo-user"
+   906→                    value={editState.odooUsername}
+   907→                    onChange={(e) => setEditState(s => ({ ...s, odooUsername: e.target.value }))}
+   908→                    placeholder="login odoo"
+   909→                  />
+   910→                </div>
+   911→                <div className="space-y-1.5">
+   912→                  <Label htmlFor="edit-odoo-pass" className="flex items-center gap-1">
+   913→                    <Key className="size-3" />
+   914→                    {editState.id ? 'Nova senha Odoo (opcional)' : 'Senha Odoo / API Key'}
+   915→                  </Label>
+   916→                  <Input
+   917→                    id="edit-odoo-pass"
+   918→                    type="password"
+   919→                    value={editState.odooPassword}
+   920→                    onChange={(e) => setEditState(s => ({ ...s, odooPassword: e.target.value }))}
+   921→                    placeholder={editState.id ? 'Deixe em branco para manter' : 'senha ou API key'}
+   922→                  />
+   923→                </div>
+   924→              </div>
+   925→            </div>
+   926→          </div>
+   927→
+   928→          <DialogFooter className="gap-2">
+   929→            <Button variant="outline" onClick={() => setDialogOpen(false)} disabled={isSaving}>
+   930→              Cancelar
+   931→            </Button>
+   932→            <Button
+   933→              onClick={handleSave}
+   934→              disabled={isSaving || !editState.email || (!editState.id && !editState.password)}
+   935→              className="bg-emerald-600 hover:bg-emerald-700 text-white"
+   936→            >
+   937→              {isSaving && <Loader2 className="size-4 mr-1.5 animate-spin" />}
+   938→              {editState.id ? 'Salvar alterações' : 'Criar usuário'}
+   939→            </Button>
+   940→          </DialogFooter>
+   941→        </DialogContent>
+   942→      </Dialog>
+   943→    </div>
+   944→  )
+   945→}
+   946→
