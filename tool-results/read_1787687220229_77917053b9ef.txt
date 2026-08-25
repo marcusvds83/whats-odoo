@@ -1282,3 +1282,79 @@
   1282→  - package.json (7.35.0)
   1283→  - src/app/login/page.tsx (footer version string)
   1284→
+  1285→---
+  1286→Task ID: v7.36
+  1287→Agent: Main Agent
+  1288→Task: Restore external inbound message delivery and phone contacts visibility for non-admin + admin users (keep ownership isolation for conversations initiated via the system)
+  1289→
+  1290→Work Log:
+  1291→- Identified root cause: v7.35.0 ownership filter was too aggressive — it skipped ALL unclaimed conversations (no owner yet) for non-admin users, which is exactly what external inbound messages are. So external leads were being silently dropped for non-admins. Device contacts were also subject to ownership filtering, hiding the entire phone address book from non-admin users.
+  1292→- Reviewed all 8 v7.35 ownership filter sites: messages.upsert, messages.update, chats.upsert, chats.update, messaging-history.set (chats), messaging-history.set (messages), onGetMessages, onRefreshMessages, getSortedConversations.isOwnerOf, and device-contact loop.
+  1293→- v7.36 fix pattern: KEEP the "if (owner && owner !== this.userId) continue" line (still hides conversations owned by OTHER users). REMOVE the "if (!owner && !isAdmin) continue" line (was blocking external inbound messages for non-admins).
+  1294→- getSortedConversations.isOwnerOf now returns true for unclaimed (no owner) → external leads visible to all. Device contacts no longer subject to ownership filter (they're just an address book, not conversations).
+  1295→- onGetMessages / onRefreshMessages: kept access block for conversations owned by ANOTHER user, removed block on unclaimed conversations.
+  1296→- messaging-history.set (initial history sync): now loads unclaimed chats/messages for all users — so historical external conversations reappear.
+  1297→- Bumped version to 7.36.0 in package.json and login page footer.
+  1298→- Ran `node -c src/server/user-session.js` → SYNTAX_OK.
+  1299→
+  1300→Stage Summary:
+  1301→- File edited: src/server/user-session.js (8 filter sites relaxed), package.json, src/app/login/page.tsx
+  1302→- Behavior change: external inbound messages and phone contacts are now visible to BOTH admin and normal users. Only conversations already OWNED BY ANOTHER user remain hidden from non-admin users. Admin continues to see everything.
+  1303→- Compatibility: ownership claim logic (claimConversation in onSendMessage/onSendMedia/onSendMediaBase64) is untouched — first user to respond to an unclaimed lead still becomes its owner.
+  1304→
+  1305→---
+  1306→Task ID: v7.37
+  1307→Agent: Main Agent
+  1308→Task: Persist conversation state to Firestore so phone contacts and conversations survive Render deploys (which wipe the ephemeral disk)
+  1309→
+  1310→Work Log:
+  1311→- Root cause analysis: Render's ephemeral disk wipes `data/conv_state_<userId>.json` on every deploy. The WhatsApp auth state survives (already in Firestore via wa-firestore-auth-state.cjs), but the conversation snapshot (deviceContacts, conversations, contactNames, lidToPhoneMap, message history) does NOT. Without a fresh QR scan, Baileys won't re-fire messaging-history.set, so deviceContacts stays empty after every deploy.
+  1312→- This explains why v7.36's filter relaxation didn't help: there was simply no data in memory to display.
+  1313→- Added _buildSnapshot() helper that produces the snapshot object (shared by disk + Firestore writes).
+  1314→- Modified persistConversationsToDisk() to also call _persistConversationsToFirestore() (fire-and-forget async).
+  1315→- Added _persistConversationsToFirestore() — writes to Firestore collection `wa_conv_states` keyed by userId. Stores snapshot as JSON string (Firestore docs have 1 MiB limit; typical usage is well under).
+  1316→- Refactored loadConversationsFromDisk() to use new _applySnapshot() helper. If disk file is missing (typical post-deploy), spawns async _loadConversationsFromFirestore() to fetch and apply from Firestore.
+  1317→- Added _loadConversationsFromFirestore() — fetches wa_conv_states/{userId}, parses snapshot JSON, applies to Maps, emits whatsapp:conversations event so frontend sees restored data immediately.
+  1318→- Added _applySnapshot() — shared logic that populates conversations/contactNames/deviceContacts/lidToPhoneMap Maps from a snapshot. Preserves v7.35 ownership filter (conversations owned by other users are skipped).
+  1319→- Updated 3 logout paths to also delete wa_conv_states doc: connection-close loggedOut, force-new-QR, explicit logout. Otherwise next QR scan would inherit stale state.
+  1320→- Bumped version to 7.37.0 in package.json and login page footer.
+  1321→- Ran `node -c src/server/user-session.js` → SYNTAX_OK.
+  1322→
+  1323→Stage Summary:
+  1324→- File edited: src/server/user-session.js, package.json, src/app/login/page.tsx
+  1325→- Behavior change: Conversation state (contacts + conversations + messages) now persists to Firestore on every debounced save (every ~30s when dirty). On startup, if disk file is missing, falls back to Firestore. Survives Render deploys, restarts, sleep/wake cycles.
+  1326→- IMPORTANT: For users with existing WhatsApp sessions, after deploying v7.37 they should do "Logout" + re-scan QR ONCE to trigger a fresh history sync that loads all phone contacts. After that, the state will be persisted and survive future deploys automatically.
+  1327→- Compatibility: v7.36 ownership rules preserved (unclaimed conversations visible to everyone; conversations owned by another user hidden from non-admins).
+  1328→
+  1329→---
+  1330→Task ID: v7.38
+  1331→Agent: Main Agent
+  1332→Task: Fix admin not receiving messages from conversations owned by other users (regression from v7.35 ownership filter)
+  1333→
+  1334→Work Log:
+  1335→- Analyzed user-provided screenshot via VLM agent. Key findings:
+  1336→  * Sidebar showed "v7.32 fix WA connect + auto-QR" — a HARDCODED string in src/app/page.tsx that never tracked package.json version
+  1337→  * Conversations list showed "Sem mensagens" for ALL contacts including ones with chat activity visible
+  1338→  * The Kako chat showed only Odoo-pulled chatter + outgoing echo, NO incoming WhatsApp messages
+  1339→  * Both admin and normal users affected
+  1340→- Root cause: v7.35 ownership filter was `if (owner && owner !== this.userId) continue` WITHOUT an admin bypass. This meant admin was ALSO filtered out from conversations owned by other users. So when normal user X owned conversation Y, admin's session would skip ALL incoming messages for Y — admin saw the conversation in the list (loaded from disk) but with no new messages.
+  1341→- v7.36 did NOT fix this — it only relaxed the unclaimed filter, not the owned-by-another-user filter.
+  1342→- Fix: Added `&& !_isAdmin` to all 9 ownership filter sites so admin bypasses the filter entirely:
+  1343→  1. messages.upsert (line 2199)
+  1344→  2. messages.update (line 2459)
+  1345→  3. chats.upsert (line 2596)
+  1346→  4. chats.update (line 2633)
+  1347→  5. messaging-history.set chats loop (line 2013)
+  1348→  6. messaging-history.set messages loop (line 2058)
+  1349→  7. _applySnapshot disk/Firestore load (line 673)
+  1350→  8. onGetMessages (line 2819)
+  1351→  9. onRefreshMessages (line 2847)
+  1352→- Also updated hardcoded sidebar version string in src/app/page.tsx from "v7.32 fix WA connect + auto-QR" to "v7.38 • Mensagens chegam para todos" so the user can confirm the deploy took effect.
+  1353→- Bumped version to 7.38.0 in package.json and login page footer.
+  1354→- Ran `node -c src/server/user-session.js` → SYNTAX_OK.
+  1355→
+  1356→Stage Summary:
+  1357→- File edited: src/server/user-session.js (9 filter sites), src/app/page.tsx (sidebar version), package.json, src/app/login/page.tsx
+  1358→- Behavior change: Admin now sees ALL messages (including from conversations owned by other users) — restores v7.34 "todos chegam tudo" behavior. Non-admin still only sees own + unclaimed conversations.
+  1359→- After deploy, admin should test by sending a fresh message FROM an external phone TO the WhatsApp number — should now arrive immediately for both admin and any non-admin user (unclaimed conversation visible to all).
+  1360→
