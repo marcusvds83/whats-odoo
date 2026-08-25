@@ -136,4 +136,39 @@ async function loadUserById(userId, prismaClient) {
   return prismaClient.user.findUnique({ where: { id: String(userId) } })
 }
 
-module.exports = { loadUserById, firebaseConfigured }
+/**
+ * v7.39.1: Find the first active admin user (role === 'admin', isActive !== false).
+ * Used by SessionManager.getOrCreate so non-admin users can share the admin's
+ * UserSession (and therefore the admin's WhatsApp socket, conversations, and
+ * Odoo connection). Without this, each non-admin user would start their own
+ * Baileys socket — which is never connected because they never scanned a QR.
+ *
+ * Prefers Firestore when configured; otherwise uses Prisma (SQLite).
+ * @param {object} prismaClient
+ * @returns {Promise<object|null>}
+ */
+async function findAdminUser(prismaClient) {
+  const firestore = getFirestore()
+  if (firestore) {
+    try {
+      const snap = await firestore.collection('users')
+        .where('role', '==', 'admin')
+        .where('isActive', '!=', false)
+        .orderBy('createdAt', 'asc')
+        .limit(1)
+        .get()
+      if (snap.empty) return null
+      const doc = snap.docs[0]
+      const rec = toRecord(doc)
+      return rec && !rec.isActive ? null : rec
+    } catch (err) {
+      console.error(`[user-lookup] Firestore admin lookup failed, falling back to SQLite: ${err && err.message}`)
+    }
+  }
+  return prismaClient.user.findFirst({
+    where: { role: 'admin', isActive: true },
+    orderBy: { createdAt: 'asc' },
+  })
+}
+
+module.exports = { loadUserById, findAdminUser, firebaseConfigured }

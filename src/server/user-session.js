@@ -3987,12 +3987,16 @@ class UserSession {
 // ====================================================================
 
 class SessionManager {
-  constructor({ io, prisma, loadUserById }) {
+  constructor({ io, prisma, loadUserById, findAdminUser }) {
     this.io = io
     this.prisma = prisma
     // Route user lookup through the Firestore-capable bridge when provided
     // (Firestore for logins; otherwise falls back to SQLite/Prisma).
     this.loadUserById = loadUserById || null
+    // v7.39.1: Admin-lookup bridge — used by getOrCreate() to delegate
+    // non-admin users to the admin's UserSession. Same Firestore/SQLite
+    // fallback pattern as loadUserById.
+    this.findAdminUser = findAdminUser || null
     this.sessions = new Map()  // userId -> UserSession
     // v7.34: pending-promises map to dedupe concurrent getOrCreate() calls.
     // Without this, when a browser opens two socket connections in parallel
@@ -4093,7 +4097,7 @@ class SessionManager {
     }
   }
 
-  async getOrCreate(userId) {
+  async getOrCreate(userId, _isDelegated = false) {
     // v7.35: ensure conversation owner registry is loaded before any session
     // starts processing messages. Idempotent — first call kicks off the load,
     // subsequent calls await the same promise.
@@ -4119,6 +4123,43 @@ class SessionManager {
         // getOrCreate() might have finished first and inserted a session.
         const raced = this.sessions.get(userId)
         if (raced) return raced
+
+        // v7.39.1: Non-admin users share the ADMIN's UserSession.
+        // ----------------------------------------------------------------
+        // Each UserSession starts its own Baileys WhatsApp socket. If only
+        // the admin has scanned the QR code, only the admin's socket is
+        // connected — non-admin users would have a dead socket and never
+        // receive `messages.upsert` events, so they never see incoming
+        // messages and the auto-sync to Odoo never fires for them either.
+        //
+        // Fix: when a non-admin user logs in, delegate them to the admin's
+        // UserSession. They share the admin's WA socket, conversations,
+        // Odoo connection, and connectedSockets — so they receive every
+        // `whatsapp:message` event the admin's socket emits, can send
+        // messages via the admin's socket, and their Odoo chatter is
+        // synced via the admin's connection.
+        //
+        // The only admin-exclusive feature that remains is creating users
+        // (tab "Usuários" + /api/users route), which is gated in the
+        // frontend (auth-context) and middleware.ts — unaffected here.
+        //
+        // Cycle protection: _isDelegated prevents infinite recursion if
+        // findAdminUser somehow returns the same userId (it shouldn't, but
+        // defensive programming costs nothing).
+        if (user.role !== 'admin' && !_isDelegated && this.findAdminUser) {
+          const adminUser = await this.findAdminUser(this.prisma)
+          if (adminUser && String(adminUser.id) !== String(userId)) {
+            console.log(`[SessionManager] Non-admin ${user.email} (${userId}) → delegating to admin session (${adminUser.id} / ${adminUser.email})`)
+            // Cache the admin's user record so the recursive getOrCreate
+            // doesn't hit the DB again. We do this by setting sessions.get
+            // ... actually, the recursive call will do its own DB lookup.
+            // Just delegate and return.
+            return await this.getOrCreate(adminUser.id, true)
+          }
+          if (!adminUser) {
+            console.warn(`[SessionManager] No admin user found — non-admin ${user.email} will have own (likely disconnected) session`)
+          }
+        }
 
         const s = new UserSession({ userId, user, io: this.io, prisma: this.prisma, sessionManager: this })
         this.sessions.set(userId, s)
