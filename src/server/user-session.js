@@ -665,7 +665,7 @@ class UserSession {
     // Admin loads all conversations. Conversations with no owner (external
     // leads) are kept — they're visible to everyone per v7.36 rules.
     const _sm = this.sessionManager
-    const _isAdmin = this.user && this.user.role === 'admin'
+    const _isAdmin = true  // v7.39: todos os usuários veem todas as conversas (apenas criação de usuários é admin-only)
     for (const c of snapshot.conversations || []) {
       if (!c.jid || !isValidPhoneJid(c.jid)) continue
       if (_sm) {
@@ -777,7 +777,7 @@ class UserSession {
     // conversation). Only conversations OWNED BY ANOTHER user remain hidden.
     const conversationJids = new Set(this.conversations.keys())
     const deviceContactEntries = []
-    const isAdmin = this.user && this.user.role === 'admin'
+    const isAdmin = true  // v7.39: todos os usuários veem todas as conversas (apenas criação de usuários é admin-only)
     const isOwnerOf = (jid) => {
       if (isAdmin) return true  // admin sees everything
       if (!this.sessionManager) return true  // no registry → no filtering (test mode)
@@ -1995,7 +1995,7 @@ class UserSession {
       // v7.36: Unclaimed chats (no owner yet) are now loaded for ALL users
       // (admin + non-admin) — so external message history is visible to
       // everyone. Only chats OWNED BY ANOTHER user are skipped.
-      const _isAdmin = this.user && this.user.role === 'admin'
+      const _isAdmin = true  // v7.39: todos os usuários veem todas as conversas (apenas criação de usuários é admin-only)
       const _sm = this.sessionManager
       for (const chat of chats) {
         let jid = normalizeJid(chat.id)
@@ -2009,7 +2009,7 @@ class UserSession {
         // external leads' history is visible to all users.
         if (_sm) {
           const owner = _sm.getConversationOwner(jid)
-          const _isAdmin = this.user && this.user.role === 'admin'
+          const _isAdmin = true  // v7.39: todos os usuários veem todas as conversas (apenas criação de usuários é admin-only)
           if (owner && owner !== this.userId && !_isAdmin) continue
         }
         const contactName = this.contactNames.get(jid) || null
@@ -2054,7 +2054,7 @@ class UserSession {
         // are loaded for everyone so external leads are visible to all users.
         if (_sm) {
           const owner = _sm.getConversationOwner(jid)
-          const _isAdmin = this.user && this.user.role === 'admin'
+          const _isAdmin = true  // v7.39: todos os usuários veem todas as conversas (apenas criação de usuários é admin-only)
           if (owner && owner !== this.userId && !_isAdmin) continue
         }
 
@@ -2195,7 +2195,7 @@ class UserSession {
           //   Unclaimed (external inbound) and own conversations are processed.
           if (this.sessionManager) {
             const owner = this.sessionManager.getConversationOwner(jid)
-            const _isAdmin = this.user && this.user.role === 'admin'
+            const _isAdmin = true  // v7.39: todos os usuários veem todas as conversas (apenas criação de usuários é admin-only)
             if (owner && owner !== this.userId && !_isAdmin) {
               console.log(`[WA:${this.userId}] upsert msg skipped — conversation ${jid} owned by user ${owner}`)
               continue
@@ -2455,7 +2455,7 @@ class UserSession {
           // another user. Unclaimed conversations are processed for everyone.
           if (this.sessionManager) {
             const owner = this.sessionManager.getConversationOwner(jid)
-            const _isAdmin = this.user && this.user.role === 'admin'
+            const _isAdmin = true  // v7.39: todos os usuários veem todas as conversas (apenas criação de usuários é admin-only)
             if (owner && owner !== this.userId && !_isAdmin) continue
           }
           const conv = this.conversations.get(jid)
@@ -2592,7 +2592,7 @@ class UserSession {
         // Admin sees all chats. Unclaimed chats are processed for everyone.
         if (this.sessionManager) {
           const owner = this.sessionManager.getConversationOwner(jid)
-          const _isAdmin = this.user && this.user.role === 'admin'
+          const _isAdmin = true  // v7.39: todos os usuários veem todas as conversas (apenas criação de usuários é admin-only)
           if (owner && owner !== this.userId && !_isAdmin) continue
         }
         if (!this.conversations.has(jid)) {
@@ -2629,7 +2629,7 @@ class UserSession {
         // Unclaimed conversations can be updated by anyone.
         if (this.sessionManager) {
           const owner = this.sessionManager.getConversationOwner(jid)
-          const _isAdmin = this.user && this.user.role === 'admin'
+          const _isAdmin = true  // v7.39: todos os usuários veem todas as conversas (apenas criação de usuários é admin-only)
           if (owner && owner !== this.userId && !_isAdmin) continue
         }
         const conv = this.conversations.get(jid)
@@ -2815,7 +2815,7 @@ class UserSession {
     // are accessible to everyone.
     if (jid && this.sessionManager) {
       const owner = this.sessionManager.getConversationOwner(jid)
-      const isAdmin = this.user && this.user.role === 'admin'
+      const isAdmin = true  // v7.39: todos os usuários veem todas as conversas (apenas criação de usuários é admin-only)
       if (owner && owner !== this.userId && !isAdmin) {
         console.warn(`[WA:${this.userId}] onGetMessages denied for ${jid} — owned by ${owner}`)
         callback?.({ messages: [], error: 'Acesso negado a esta conversa' })
@@ -2843,7 +2843,7 @@ class UserSession {
       // Admin, own, and unclaimed conversations are accessible to everyone.
       if (this.sessionManager) {
         const owner = this.sessionManager.getConversationOwner(jid)
-        const isAdmin = this.user && this.user.role === 'admin'
+        const isAdmin = true  // v7.39: todos os usuários veem todas as conversas (apenas criação de usuários é admin-only)
         if (owner && owner !== this.userId && !isAdmin) {
           console.warn(`[WA:${this.userId}] onRefreshMessages denied for ${jid} — owned by ${owner}`)
           callback?.({ success: false, error: 'Acesso negado a esta conversa', messages: [] })

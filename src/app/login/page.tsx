@@ -220,7 +220,7 @@ export default function LoginPage() {
         </Suspense>
 
         <p className="text-xs text-muted-foreground text-center mt-4">
-          v7.38.0 • Mensagens chegam para todos
+          v7.39.0 • Todos com poderes de admin
         </p>
       </div>
     </div>

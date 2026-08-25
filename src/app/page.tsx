@@ -536,7 +536,7 @@ export default function HomePage() {
             {!sidebarCollapsed && (
               <div className="hidden lg:block min-w-0">
                 <p className="text-sm font-bold leading-tight truncate">Whats-Odoo</p>
-                <p className="text-[10px] text-muted-foreground">v7.38 • Mensagens chegam para todos</p>
+                <p className="text-[10px] text-muted-foreground">v7.39.0 • Todos com poderes de admin</p>
               </div>
             )}
           </div>
