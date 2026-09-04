@@ -81,6 +81,12 @@ const TAB_CONFIG: Record<ModelKey, { model: string; label: string; singular: str
   tasks: { model: 'project.task', label: 'Projetos', singular: 'Tarefa', icon: ClipboardList, placeholder: 'Buscar tarefa por nome, projeto...' },
 }
 
+// v7.39.2: Abas visíveis no painel Odoo. Vendas e Projetos foram removidos
+// a pedido do usuário — só Contatos e Oportunidades aparecem agora.
+// As chaves 'sales' e 'tasks' continuam em TAB_CONFIG para não quebrar
+// outros componentes que referenciam esses modelos, mas não são renderizadas.
+const VISIBLE_TABS: ModelKey[] = ['contacts', 'leads']
+
 // ---------- Debounce helper ----------
 
 function useDebounce(callback: (tab: ModelKey, query: string) => void, delay: number) {
@@ -419,7 +425,7 @@ export function OdooLinkPanel({
       <Tabs value={activeTab} onValueChange={(v) => setActiveTab(v as ModelKey)} className="flex flex-1 flex-col overflow-hidden">
         <div className="border-b px-3 pt-3">
           <TabsList className="w-full">
-            {(Object.entries(TAB_CONFIG) as [ModelKey, typeof TAB_CONFIG[ModelKey]][]).map(([key, cfg]) => {
+            {(VISIBLE_TABS.map((key) => [key, TAB_CONFIG[key]] as [ModelKey, typeof TAB_CONFIG[ModelKey]])).map(([key, cfg]) => {
               const Icon = cfg.icon
               return (
                 <TabsTrigger key={key} value={key} className="flex-1 gap-1 text-xs">
@@ -458,7 +464,7 @@ export function OdooLinkPanel({
             </div>
 
             {/* Create new */}
-            {(activeTab === 'contacts' || activeTab === 'leads' || activeTab === 'tasks') && (
+            {(activeTab === 'contacts' || activeTab === 'leads') && (
               <CreateRecordDialog
                 tab={activeTab}
                 open={createDialogOpen}
@@ -476,7 +482,7 @@ export function OdooLinkPanel({
         </div>
 
         {/* Results */}
-        {(Object.entries(TAB_CONFIG) as [ModelKey, typeof TAB_CONFIG[ModelKey]][]).map(([key, cfg]) => (
+        {(VISIBLE_TABS.map((key) => [key, TAB_CONFIG[key]] as [ModelKey, typeof TAB_CONFIG[ModelKey]])).map(([key, cfg]) => (
           <TabsContent key={key} value={key} className="flex-1 overflow-hidden mt-0">
             <ScrollArea className="h-full">
               <div className="space-y-2 p-3">

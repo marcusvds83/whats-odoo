@@ -220,7 +220,7 @@ export default function LoginPage() {
         </Suspense>
 
         <p className="text-xs text-muted-foreground text-center mt-4">
-          v7.39.1 • Todos compartilham a conexão do admin
+          v7.39.2 • Abas Vendas e Projetos removidas do painel Odoo
         </p>
       </div>
     </div>

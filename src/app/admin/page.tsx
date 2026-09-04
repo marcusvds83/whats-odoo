@@ -218,7 +218,7 @@ function AdminLoginForm() {
         </Card>
 
         <p className="text-xs text-slate-500 text-center mt-4">
-          v7.39.1 • Área administrativa
+          v7.39.2 • Área administrativa
         </p>
       </div>
     </div>
