@@ -1,0 +1,1137 @@
+     1→import { createServer } from 'http'
+     2→import { Server } from 'socket.io'
+     3→import { createClient, createSecureClient } from 'xmlrpc'
+     4→
+     5→// ========== Configuration ==========
+     6→const PORT = 3002
+     7→
+     8→// Odoo connection config (received from frontend, stored in memory)
+     9→let odooConfig: {
+    10→  url: string
+    11→  db: string
+    12→  username: string
+    13→  password: string
+    14→  uid: number | null
+    15→} = {
+    16→  url: '',
+    17→  db: '',
+    18→  username: '',
+    19→  password: '',
+    20→  uid: null,
+    21→}
+    22→
+    23→// Auto-sync settings
+    24→interface AutoSyncSettings {
+    25→  enabled: boolean
+    26→  autoCreateContact: boolean
+    27→  autoCreateLead: boolean
+    28→  autoPostMessages: boolean
+    29→  autoCreateActivity: boolean
+    30→  leadPrefix: string
+    31→  leadTeamId: number | null
+    32→  leadUserId: number | null
+    33→}
+    34→
+    35→let autoSyncSettings: AutoSyncSettings = {
+    36→  enabled: true,
+    37→  autoCreateContact: true,
+    38→  autoCreateLead: true,
+    39→  autoPostMessages: true,
+    40→  autoCreateActivity: true,
+    41→  leadPrefix: '[WhatsApp] ',
+    42→  leadTeamId: null,
+    43→  leadUserId: null,
+    44→}
+    45→
+    46→// Cache of available fields per model (auto-detected)
+    47→const modelFieldsCache = new Map<string, Set<string>>()
+    48→
+    49→// Cache of phone -> Odoo record IDs (to avoid re-creating contacts/leads)
+    50→const phoneToPartnerCache = new Map<string, { partnerId: number; leadId: number | null; leadCreated: boolean }>()
+    51→
+    52→// ========== HTTP + Socket.io Server ==========
+    53→const httpServer = createServer()
+    54→const io = new Server(httpServer, {
+    55→  path: '/socket.io',
+    56→  cors: { origin: '*', methods: ['GET', 'POST'] },
+    57→  pingTimeout: 60000,
+    58→  pingInterval: 25000,
+    59→})
+    60→
+    61→// ========== Odoo XML-RPC Client ==========
+    62→function makeXmlRpcClient(path: string) {
+    63→  const url = new URL(odooConfig.url)
+    64→  const isHttps = url.protocol === 'https:'
+    65→  const options = {
+    66→    host: url.hostname,
+    67→    port: parseInt(url.port) || (isHttps ? 443 : 80),
+    68→    path,
+    69→  }
+    70→  // CRITICAL: Must use createSecureClient for HTTPS (Odoo SaaS)
+    71→  return isHttps ? createSecureClient(options) : createClient(options)
+    72→}
+    73→
+    74→function getOdooClient(path: string = '/xmlrpc/2/object') {
+    75→  return makeXmlRpcClient(path)
+    76→}
+    77→
+    78→function odooAuthenticate(): Promise<number> {
+    79→  return new Promise((resolve, reject) => {
+    80→    const client = makeXmlRpcClient('/xmlrpc/2/common')
+    81→
+    82→    client.methodCall('authenticate', [
+    83→      odooConfig.db,
+    84→      odooConfig.username,
+    85→      odooConfig.password,
+    86→      {},
+    87→    ], (error: any, value: any) => {
+    88→      if (error) {
+    89→        reject(error)
+    90→      } else if (!value) {
+    91→        reject(new Error('Authentication failed - invalid credentials'))
+    92→      } else {
+    93→        resolve(value)
+    94→      }
+    95→    })
+    96→  })
+    97→}
+    98→
+    99→function odooExecuteKw(
+   100→  model: string,
+   101→  method: string,
+   102→  args: any[],
+   103→  kwargs: any = {}
+   104→): Promise<any> {
+   105→  return new Promise((resolve, reject) => {
+   106→    if (!odooConfig.uid) {
+   107→      reject(new Error('Not authenticated with Odoo'))
+   108→      return
+   109→    }
+   110→
+   111→    const client = getOdooClient()
+   112→    client.methodCall(
+   113→      'execute_kw',
+   114→      [
+   115→        odooConfig.db,
+   116→        odooConfig.uid,
+   117→        odooConfig.password,
+   118→        model,
+   119→        method,
+   120→        args,
+   121→        kwargs,
+   122→      ],
+   123→      (error: any, value: any) => {
+   124→        if (error) {
+   125→          reject(error)
+   126→        } else {
+   127→          resolve(value)
+   128→        }
+   129→      }
+   130→    )
+   131→  })
+   132→}
+   133→
+   134→// ========== Smart Field Detection ==========
+   135→
+   136→async function getAvailableFields(model: string): Promise<Set<string>> {
+   137→  if (modelFieldsCache.has(model)) {
+   138→    return modelFieldsCache.get(model)!
+   139→  }
+   140→
+   141→  try {
+   142→    const fields = await odooExecuteKw(model, 'fields_get', [], {
+   143→      attributes: ['string', 'type'],
+   144→    })
+   145→    const fieldNames = new Set(Object.keys(fields))
+   146→    modelFieldsCache.set(model, fieldNames)
+   147→    console.log(`[Odoo] Model ${model} has ${fieldNames.size} fields. Custom checks: whatsapp=${fieldNames.has('whatsapp')}, whatsapp_number=${fieldNames.has('whatsapp_number')}`)
+   148→    return fieldNames
+   149→  } catch (error: any) {
+   150→    console.error(`[Odoo] Failed to get fields for ${model}:`, error.message)
+   151→    return new Set()
+   152→  }
+   153→}
+   154→
+   155→async function filterExistingFields(model: string, requestedFields: string[]): Promise<string[]> {
+   156→  const available = await getAvailableFields(model)
+   157→  const existing = requestedFields.filter(f => available.has(f))
+   158→  if (!existing.includes('id') && available.has('id')) existing.unshift('id')
+   159→  if (!existing.includes('name') && available.has('name')) existing.push('name')
+   160→  return existing
+   161→}
+   162→
+   163→async function buildSafeValues(model: string, values: Record<string, any>): Promise<Record<string, any>> {
+   164→  const available = await getAvailableFields(model)
+   165→  const safe: Record<string, any> = {}
+   166→  for (const [key, value] of Object.entries(values)) {
+   167→    if (available.has(key)) {
+   168→      safe[key] = value
+   169→    } else {
+   170→      console.log(`[Odoo] Field "${key}" does not exist on ${model}, skipping`)
+   171→    }
+   172→  }
+   173→  return safe
+   174→}
+   175→
+   176→async function smartWriteWhatsAppNumber(model: string, ids: number[], phone: string): Promise<boolean> {
+   177→  const available = await getAvailableFields(model)
+   178→  const values: Record<string, any> = {}
+   179→
+   180→  if (available.has('whatsapp')) {
+   181→    values.whatsapp = phone
+   182→    console.log(`[Odoo] Using custom field "whatsapp" on ${model}`)
+   183→  }
+   184→  if (available.has('whatsapp_number')) {
+   185→    values.whatsapp_number = phone
+   186→    console.log(`[Odoo] Using custom field "whatsapp_number" on ${model}`)
+   187→  }
+   188→  if (available.has('phone')) {
+   189→    values.phone = phone
+   190→  }
+   191→  if (available.has('mobile') && !values.whatsapp) {
+   192→    values.mobile = phone
+   193→  }
+   194→
+   195→  if (Object.keys(values).length === 0) {
+   196→    console.log(`[Odoo] No phone/whatsapp fields found on ${model}, skipping write`)
+   197→    return false
+   198→  }
+   199→
+   200→  return odooWrite(model, ids, values)
+   201→}
+   202→
+   203→// ========== High-level Odoo Operations ==========
+   204→
+   205→async function odooSearch(
+   206→  model: string,
+   207→  domain: any[],
+   208→  fields: string[] = [],
+   209→  limit: number = 80,
+   210→  offset: number = 0
+   211→): Promise<any[]> {
+   212→  const safeFields = fields.length > 0
+   213→    ? await filterExistingFields(model, fields)
+   214→    : []
+   215→  return odooExecuteKw(model, 'search_read', [domain], {
+   216→    fields: safeFields.length > 0 ? safeFields : undefined,
+   217→    limit,
+   218→    offset,
+   219→  })
+   220→}
+   221→
+   222→async function odooRead(
+   223→  model: string,
+   224→  ids: number[],
+   225→  fields: string[] = []
+   226→): Promise<any[]> {
+   227→  const safeFields = fields.length > 0
+   228→    ? await filterExistingFields(model, fields)
+   229→    : []
+   230→  return odooExecuteKw(model, 'read', [ids], {
+   231→    fields: safeFields.length > 0 ? safeFields : undefined,
+   232→  })
+   233→}
+   234→
+   235→async function odooCreate(model: string, values: Record<string, any>): Promise<number> {
+   236→  const safeValues = await buildSafeValues(model, values)
+   237→  return odooExecuteKw(model, 'create', [safeValues])
+   238→}
+   239→
+   240→async function odooWrite(model: string, ids: number[], values: Record<string, any>): Promise<boolean> {
+   241→  const safeValues = await buildSafeValues(model, values)
+   242→  return odooExecuteKw(model, 'write', [ids, safeValues])
+   243→}
+   244→
+   245→async function odooSearchOrCreate(
+   246→  model: string,
+   247→  domain: any[],
+   248→  values: Record<string, any>
+   249→): Promise<{ id: number; created: boolean }> {
+   250→  const existing = await odooExecuteKw(model, 'search', [domain], { limit: 1 })
+   251→  if (existing && existing.length > 0) {
+   252→    const safeValues = await buildSafeValues(model, values)
+   253→    await odooWrite(model, existing, safeValues)
+   254→    return { id: existing[0], created: false }
+   255→  }
+   256→  const safeValues = await buildSafeValues(model, values)
+   257→  const newId = await odooCreate(model, safeValues)
+   258→  return { id: newId, created: true }
+   259→}
+   260→
+   261→async function odooPostMessage(
+   262→  model: string,
+   263→  recordId: number,
+   264→  message: string,
+   265→): Promise<any> {
+   266→  return odooExecuteKw(model, 'message_post', [recordId], {
+   267→    body: message,
+   268→    message_type: 'comment',
+   269→    subtype_xmlid: 'mail.mt_comment',
+   270→  })
+   271→}
+   272→
+   273→async function odooCreateActivity(
+   274→  model: string,
+   275→  recordId: number,
+   276→  summary: string,
+   277→  note: string,
+   278→): Promise<number> {
+   279→  try {
+   280→    const activityTypeId = await findWhatsAppActivityType()
+   281→    const values: Record<string, any> = {
+   282→      res_model: model,
+   283→      res_id: recordId,
+   284→      summary,
+   285→      note,
+   286→      activity_type_id: activityTypeId || 1, // fallback to default type
+   287→    }
+   288→
+   289→    if (autoSyncSettings.leadUserId) {
+   290→      values.user_id = autoSyncSettings.leadUserId
+   291→    }
+   292→
+   293→    return await odooExecuteKw('mail.activity', 'create', [values])
+   294→  } catch (error: any) {
+   295→    console.error(`[Odoo] Failed to create activity:`, error.message)
+   296→    return 0
+   297→  }
+   298→}
+   299→
+   300→async function findWhatsAppActivityType(): Promise<number | null> {
+   301→  try {
+   302→    const types = await odooExecuteKw('mail.activity.type', 'search_read', [
+   303→      [['name', 'ilike', 'WhatsApp']],
+   304→    ], { fields: ['id', 'name'], limit: 1 })
+   305→    if (types && types.length > 0) {
+   306→      return types[0].id
+   307→    }
+   308→  } catch {
+   309→    // Activity type might not exist, that's OK
+   310→  }
+   311→  return null
+   312→}
+   313→
+   314→async function odooGetFields(
+   315→  model: string,
+   316→  attributes: string[] = ['string', 'help', 'type', 'required', 'readonly']
+   317→): Promise<any> {
+   318→  return odooExecuteKw(model, 'fields_get', [], {
+   319→    attributes,
+   320→  })
+   321→}
+   322→
+   323→// ========== AUTO-SYNC ENGINE ==========
+   324→
+   325→async function autoSyncWhatsAppMessage(data: {
+   326→  jid: string
+   327→  phone: string
+   328→  pushName?: string | null
+   329→  textContent?: string | null
+   330→  mediaType?: string | null
+   331→  fromMe: boolean
+   332→  timestamp: string
+   333→}): Promise<{
+   334→  partnerId: number | null
+   335→  leadId: number | null
+   336→  mailMessageId: number | null
+   337→  activityId: number | null
+   338→  created: { partner: boolean; lead: boolean }
+   339→  errors: string[]
+   340→}> {
+   341→  const result = {
+   342→    partnerId: null as number | null,
+   343→    leadId: null as number | null,
+   344→    mailMessageId: null as number | null,
+   345→    activityId: null as number | null,
+   346→    created: { partner: false, lead: false },
+   347→    errors: [] as string[],
+   348→  }
+   349→
+   350→  if (!autoSyncSettings.enabled || !odooConfig.uid) {
+   351→    return result
+   352→  }
+   353→
+   354→  console.log(`[AutoSync] Processing message from ${data.phone} (${data.pushName || 'unknown'})`)
+   355→
+   356→  try {
+   357→    // Step 1: Create or update contact in res.partner
+   358→    if (autoSyncSettings.autoCreateContact) {
+   359→      const contactName = data.pushName || `WhatsApp ${data.phone}`
+   360→      const domain = ['|', ['phone', 'ilike', data.phone], ['mobile', 'ilike', data.phone]]
+   361→      const contactValues: Record<string, any> = {
+   362→        name: contactName,
+   363→        phone: data.phone,
+   364→        mobile: data.phone,
+   365→      }
+   366→
+   367→      // Try to set whatsapp field if it exists
+   368→      const partnerFields = await getAvailableFields('res.partner')
+   369→      if (partnerFields.has('whatsapp')) {
+   370→        contactValues.whatsapp = data.phone
+   371→      }
+   372→      if (partnerFields.has('whatsapp_number')) {
+   373→        contactValues.whatsapp_number = data.phone
+   374→      }
+   375→
+   376→      const partnerResult = await odooSearchOrCreate('res.partner', domain, contactValues)
+   377→      result.partnerId = partnerResult.id
+   378→      result.created.partner = partnerResult.created
+   379→
+   380→      // Update cache
+   381→      const cached = phoneToPartnerCache.get(data.phone)
+   382→      if (cached) {
+   383→        cached.partnerId = partnerResult.id
+   384→      } else {
+   385→        phoneToPartnerCache.set(data.phone, { partnerId: partnerResult.id, leadId: null, leadCreated: false })
+   386→      }
+   387→
+   388→      console.log(`[AutoSync] Contact ${partnerResult.created ? 'created' : 'updated'}: res.partner#${partnerResult.id}`)
+   389→    }
+   390→
+   391→    // Step 2: Create lead in crm.lead for new conversations (only for incoming messages)
+   392→    if (autoSyncSettings.autoCreateLead && !data.fromMe && result.partnerId) {
+   393→      // Check cache first
+   394→      const cached = phoneToPartnerCache.get(data.phone)
+   395→      if (cached && cached.leadId && cached.leadCreated) {
+   396→        result.leadId = cached.leadId
+   397→      } else {
+   398→        // Check if there's already a lead for this partner with WhatsApp prefix
+   399→        const existingLeads = await odooSearch('crm.lead', [
+   400→          ['partner_id', '=', result.partnerId],
+   401→          ['name', 'like', autoSyncSettings.leadPrefix],
+   402→          ['type', '=', 'lead'],
+   403→        ], ['id', 'name'], 1)
+   404→
+   405→        if (existingLeads && existingLeads.length > 0) {
+   406→          result.leadId = existingLeads[0].id
+   407→          // Update cache
+   408→          if (cached) {
+   409→            cached.leadId = existingLeads[0].id
+   410→            cached.leadCreated = true
+   411→          }
+   412→          console.log(`[AutoSync] Found existing lead: crm.lead#${existingLeads[0].id}`)
+   413→        } else {
+   414→          // Create new lead
+   415→          const leadName = `${autoSyncSettings.leadPrefix}${data.pushName || data.phone}`
+   416→          const leadValues: Record<string, any> = {
+   417→            name: leadName,
+   418→            type: 'lead',
+   419→            partner_id: result.partnerId,
+   420→            phone: data.phone,
+   421→            description: `Conversa iniciada via WhatsApp em ${new Date().toLocaleString('pt-BR')}`,
+   422→          }
+   423→
+   424→          // Try to set custom whatsapp field
+   425→          const leadFields = await getAvailableFields('crm.lead')
+   426→          if (leadFields.has('whatsapp_number')) {
+   427→            leadValues.whatsapp_number = data.phone
+   428→          }
+   429→
+   430→          if (autoSyncSettings.leadTeamId) {
+   431→            leadValues.team_id = autoSyncSettings.leadTeamId
+   432→          }
+   433→          if (autoSyncSettings.leadUserId) {
+   434→            leadValues.user_id = autoSyncSettings.leadUserId
+   435→          }
+   436→
+   437→          result.leadId = await odooCreate('crm.lead', leadValues)
+   438→          result.created.lead = true
+   439→
+   440→          // Update cache
+   441→          if (cached) {
+   442→            cached.leadId = result.leadId
+   443→            cached.leadCreated = true
+   444→          } else {
+   445→            phoneToPartnerCache.set(data.phone, { partnerId: result.partnerId, leadId: result.leadId, leadCreated: true })
+   446→          }
+   447→
+   448→          console.log(`[AutoSync] Lead created: crm.lead#${result.leadId}`)
+   449→        }
+   450→      }
+   451→    }
+   452→
+   453→    // Step 3: Post message as mail.message in Odoo chatter
+   454→    if (autoSyncSettings.autoPostMessages && !data.fromMe) {
+   455→      const targetModel = result.leadId ? 'crm.lead' : (result.partnerId ? 'res.partner' : null)
+   456→      const targetId = result.leadId || result.partnerId
+   457→
+   458→      if (targetModel && targetId) {
+   459→        const direction = data.fromMe ? 'Enviada' : 'Recebida'
+   460→        const mediaLabel = data.mediaType ? ` [${data.mediaType}]` : ''
+   461→        const msgBody = data.textContent
+   462→          ? `<p><strong>📱 WhatsApp ${direction}:</strong>${mediaLabel}</p><p>${escapeHtml(data.textContent)}</p>`
+   463→          : `<p><strong>📱 WhatsApp ${direction}:</strong>${mediaLabel} [Mídia]</p>`
+   464→
+   465→        try {
+   466→          result.mailMessageId = await odooPostMessage(targetModel, targetId, msgBody)
+   467→          console.log(`[AutoSync] Message posted on ${targetModel}#${targetId}: mail.message#${result.mailMessageId}`)
+   468→        } catch (error: any) {
+   469→          result.errors.push(`Failed to post message: ${error.message}`)
+   470→          console.error(`[AutoSync] Failed to post message:`, error.message)
+   471→        }
+   472→      }
+   473→    }
+   474→
+   475→    // Step 4: Create activity notification for the first message of a new lead
+   476→    if (autoSyncSettings.autoCreateActivity && result.created.lead && result.leadId) {
+   477→      const summary = 'Nova mensagem WhatsApp'
+   478→      const note = `Contato ${data.pushName || data.phone} iniciou uma conversa via WhatsApp.\n\nMensagem: ${data.textContent || '[Mídia]'}`
+   479→
+   480→      try {
+   481→        result.activityId = await odooCreateActivity('crm.lead', result.leadId, summary, note)
+   482→        console.log(`[AutoSync] Activity created: mail.activity#${result.activityId}`)
+   483→      } catch (error: any) {
+   484→        result.errors.push(`Failed to create activity: ${error.message}`)
+   485→      }
+   486→    }
+   487→
+   488→  } catch (error: any) {
+   489→    result.errors.push(`Auto-sync error: ${error.message}`)
+   490→    console.error(`[AutoSync] Error:`, error.message)
+   491→  }
+   492→
+   493→  // Emit sync result to all connected clients
+   494→  io.emit('odoo:autosync:result', {
+   495→    phone: data.phone,
+   496→    ...result,
+   497→  })
+   498→
+   499→  return result
+   500→}
+   501→
+   502→function escapeHtml(text: string): string {
+   503→  return text
+   504→    .replace(/&/g, '&amp;')
+   505→    .replace(/</g, '&lt;')
+   506→    .replace(/>/g, '&gt;')
+   507→    .replace(/\n/g, '<br/>')
+   508→}
+   509→
+   510→function stripHtml(html: string): string {
+   511→  // Replace <br/> and <br> and <p> with newlines first
+   512→  let text = html
+   513→    .replace(/<br\s*\/?>/gi, '\n')
+   514→    .replace(/<\/p>/gi, '\n')
+   515→    .replace(/<p[^>]*>/gi, '')
+   516→    .replace(/<[^>]+>/g, '') // strip all remaining tags
+   517→    .replace(/&nbsp;/g, ' ')
+   518→    .replace(/&amp;/g, '&')
+   519→    .replace(/&lt;/g, '<')
+   520→    .replace(/&gt;/g, '>')
+   521→    .replace(/&quot;/g, '"')
+   522→    .replace(/&#39;/g, "'")
+   523→    .trim()
+   524→  // Collapse multiple blank lines
+   525→  text = text.replace(/\n{3,}/g, '\n\n')
+   526→  return text
+   527→}
+   528→
+   529→// ========== Socket.io Events ==========
+   530→io.on('connection', (socket) => {
+   531→  console.log(`[Odoo IO] Client connected: ${socket.id}`)
+   532→
+   533→  socket.emit('odoo:status', {
+   534→    connected: !!odooConfig.uid,
+   535→    url: odooConfig.url,
+   536→    db: odooConfig.db,
+   537→    username: odooConfig.username,
+   538→  })
+   539→
+   540→  // Send current auto-sync settings
+   541→  socket.emit('odoo:autosync:settings', autoSyncSettings)
+   542→
+   543→  // ===== Authentication =====
+   544→  socket.on(
+   545→    'odoo:authenticate',
+   546→    async (data: { url: string; db: string; username: string; password: string }, callback) => {
+   547→      try {
+   548→        odooConfig = { ...data, uid: null }
+   549→        modelFieldsCache.clear()
+   550→        phoneToPartnerCache.clear()
+   551→        const uid = await odooAuthenticate()
+   552→        odooConfig.uid = uid
+   553→        console.log(`[Odoo] Authenticated as ${data.username} (uid: ${uid})`)
+   554→
+   555→        // Pre-cache fields for main models
+   556→        await getAvailableFields('res.partner')
+   557→        await getAvailableFields('crm.lead')
+   558→
+   559→        io.emit('odoo:status', {
+   560→          connected: true,
+   561→          url: odooConfig.url,
+   562→          db: odooConfig.db,
+   563→          username: odooConfig.username,
+   564→        })
+   565→        callback({ success: true, uid })
+   566→      } catch (error: any) {
+   567→        console.error('[Odoo] Auth error:', error.message)
+   568→        callback({ success: false, error: error.message })
+   569→      }
+   570→    }
+   571→  )
+   572→
+   573→  // ===== Disconnect =====
+   574→  socket.on('odoo:disconnect', (callback) => {
+   575→    odooConfig = { url: '', db: '', username: '', password: '', uid: null }
+   576→    modelFieldsCache.clear()
+   577→    phoneToPartnerCache.clear()
+   578→    io.emit('odoo:status', { connected: false })
+   579→    callback({ success: true })
+   580→  })
+   581→
+   582→  // ===== Auto-Sync Settings =====
+   583→  socket.on(
+   584→    'odoo:autosync:update-settings',
+   585→    async (data: Partial<AutoSyncSettings>, callback) => {
+   586→      try {
+   587→        autoSyncSettings = { ...autoSyncSettings, ...data }
+   588→        console.log('[Odoo] Auto-sync settings updated:', autoSyncSettings)
+   589→        io.emit('odoo:autosync:settings', autoSyncSettings)
+   590→        callback({ success: true, settings: autoSyncSettings })
+   591→      } catch (error: any) {
+   592→        callback({ success: false, error: error.message })
+   593→      }
+   594→    }
+   595→  )
+   596→
+   597→  socket.on('odoo:autosync:get-settings', (callback) => {
+   598→    callback({ success: true, settings: autoSyncSettings })
+   599→  })
+   600→
+   601→  // ===== Auto-Sync Trigger (called by WhatsApp service) =====
+   602→  socket.on(
+   603→    'odoo:autosync:message',
+   604→    async (data: {
+   605→      jid: string
+   606→      phone: string
+   607→      pushName?: string | null
+   608→      textContent?: string | null
+   609→      mediaType?: string | null
+   610→      fromMe: boolean
+   611→      timestamp: string
+   612→    }, callback) => {
+   613→      console.log(`[Odoo] Auto-sync message received from ${data.phone}`)
+   614→      try {
+   615→        const result = await autoSyncWhatsAppMessage(data)
+   616→        if (callback) callback({ success: true, ...result })
+   617→      } catch (error: any) {
+   618→        console.error('[Odoo] Auto-sync error:', error.message)
+   619→        if (callback) callback({ success: false, error: error.message })
+   620→      }
+   621→    }
+   622→  )
+   623→
+   624→  // ===== Contacts (res.partner) =====
+   625→  socket.on(
+   626→    'odoo:contacts:search',
+   627→    async (data: { query?: string; limit?: number }, callback) => {
+   628→      try {
+   629→        const domain = data.query
+   630→          ? ['|', '|', ['name', 'ilike', data.query], ['phone', 'ilike', data.query], ['mobile', 'ilike', data.query]]
+   631→          : []
+   632→        const records = await odooSearch('res.partner', domain, [
+   633→          'name', 'phone', 'mobile', 'email', 'whatsapp', 'image_128',
+   634→          'is_company', 'country_id', 'state_id', 'city',
+   635→        ], data.limit || 20)
+   636→        callback({ success: true, data: records })
+   637→      } catch (error: any) {
+   638→        callback({ success: false, error: error.message })
+   639→      }
+   640→    }
+   641→  )
+   642→
+   643→  socket.on(
+   644→    'odoo:contacts:create',
+   645→    async (data: { name: string; phone?: string; mobile?: string; whatsapp?: string; email?: string }, callback) => {
+   646→      try {
+   647→        const values: Record<string, any> = { name: data.name }
+   648→        if (data.phone) values.phone = data.phone
+   649→        if (data.mobile) values.mobile = data.mobile
+   650→        if (data.whatsapp) values.whatsapp = data.whatsapp
+   651→        if (data.email) values.email = data.email
+   652→
+   653→        const id = await odooCreate('res.partner', values)
+   654→        callback({ success: true, id })
+   655→        io.emit('odoo:record:created', { model: 'res.partner', id, values })
+   656→      } catch (error: any) {
+   657→        callback({ success: false, error: error.message })
+   658→      }
+   659→    }
+   660→  )
+   661→
+   662→  socket.on(
+   663→    'odoo:contacts:search-or-create',
+   664→    async (data: { phone: string; name?: string }, callback) => {
+   665→      try {
+   666→        const domain = ['|', ['phone', 'ilike', data.phone], ['mobile', 'ilike', data.phone]]
+   667→        const values: Record<string, any> = {
+   668→          name: data.name || `WhatsApp ${data.phone}`,
+   669→          phone: data.phone,
+   670→          mobile: data.phone,
+   671→        }
+   672→        const result = await odooSearchOrCreate('res.partner', domain, values)
+   673→        callback({ success: true, ...result })
+   674→      } catch (error: any) {
+   675→        callback({ success: false, error: error.message })
+   676→      }
+   677→    }
+   678→  )
+   679→
+   680→  // ===== CRM Leads =====
+   681→  socket.on(
+   682→    'odoo:leads:search',
+   683→    async (data: { query?: string; limit?: number }, callback) => {
+   684→      try {
+   685→        const domain = data.query
+   686→          ? ['|', ['name', 'ilike', data.query], ['partner_name', 'ilike', data.query]]
+   687→          : []
+   688→        const records = await odooSearch('crm.lead', domain, [
+   689→          'name', 'partner_id', 'partner_name', 'phone', 'mobile', 'email_from',
+   690→          'type', 'stage_id', 'probability', 'user_id', 'team_id',
+   691→          'create_date', 'write_date', 'whatsapp_number',
+   692→        ], data.limit || 20)
+   693→        callback({ success: true, data: records })
+   694→      } catch (error: any) {
+   695→        callback({ success: false, error: error.message })
+   696→      }
+   697→    }
+   698→  )
+   699→
+   700→  socket.on(
+   701→    'odoo:leads:create',
+   702→    async (data: {
+   703→      name: string
+   704→      phone?: string
+   705→      partner_id?: number
+   706→      partner_name?: string
+   707→      description?: string
+   708→      type?: string
+   709→      whatsapp_number?: string
+   710→      messages?: Array<{
+   711→        fromMe: boolean
+   712→        textContent: string | null
+   713→        mediaType?: string | null
+   714→        timestamp: string
+   715→      }>
+   716→    }, callback) => {
+   717→      try {
+   718→        const values: Record<string, any> = {
+   719→          name: data.name,
+   720→          type: data.type || 'lead',
+   721→        }
+   722→        if (data.phone) values.phone = data.phone
+   723→        if (data.partner_id) values.partner_id = data.partner_id
+   724→        if (data.partner_name) values.partner_name = data.partner_name
+   725→        if (data.description) values.description = data.description
+   726→        if (data.whatsapp_number) values.whatsapp_number = data.whatsapp_number
+   727→
+   728→        const id = await odooCreate('crm.lead', values)
+   729→
+   730→        // If conversation history was provided, post all messages to the chatter
+   731→        let postedMessages = 0
+   732→        if (data.messages && data.messages.length > 0) {
+   733→          console.log(`[Odoo] Posting ${data.messages.length} history messages to crm.lead#${id}`)
+   734→          // Sort by timestamp ascending so chatter shows chronological order
+   735→          const sorted = [...data.messages].sort(
+   736→            (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+   737→          )
+   738→          for (const m of sorted) {
+   739→            try {
+   740→              const direction = m.fromMe ? 'Enviada' : 'Recebida'
+   741→              const dateLabel = new Date(m.timestamp).toLocaleString('pt-BR')
+   742→              const mediaLabel = m.mediaType ? ` [${m.mediaType}]` : ''
+   743→              const body = m.textContent
+   744→                ? `<p><strong>📱 WhatsApp ${direction}</strong> <em>(${dateLabel})</em>${mediaLabel}</p><p>${escapeHtml(m.textContent)}</p>`
+   745→                : `<p><strong>📱 WhatsApp ${direction}</strong> <em>(${dateLabel})</em>${mediaLabel} [Mídia]</p>`
+   746→              await odooPostMessage('crm.lead', id, body)
+   747→              postedMessages++
+   748→            } catch (err: any) {
+   749→              console.error(`[Odoo] Failed to post history message:`, err.message)
+   750→            }
+   751→          }
+   752→          console.log(`[Odoo] Posted ${postedMessages}/${data.messages.length} messages to crm.lead#${id}`)
+   753→        }
+   754→
+   755→        callback({ success: true, id, postedMessages })
+   756→        io.emit('odoo:record:created', { model: 'crm.lead', id, values })
+   757→      } catch (error: any) {
+   758→        callback({ success: false, error: error.message })
+   759→      }
+   760→    }
+   761→  )
+   762→
+   763→  // ===== Fetch conversation history from Odoo chatter =====
+   764→  // Reads mail.message records attached to a given model/record and converts
+   765→  // them back to WhatsApp-style message objects so the frontend can merge
+   766→  // them into the local conversation.
+   767→  socket.on(
+   768→    'odoo:fetch-history',
+   769→    async (data: {
+   770→      model: string
+   771→      recordId: number
+   772→      limit?: number
+   773→    }, callback) => {
+   774→      try {
+   775→        if (!odooConfig.uid) {
+   776→          callback({ success: false, error: 'Not authenticated with Odoo' })
+   777→          return
+   778→        }
+   779→
+   780→        // Read mail.message records linked to this record
+   781→        const domain = [
+   782→          ['model', '=', data.model],
+   783→          ['res_id', '=', data.recordId],
+   784→        ]
+   785→        const messages = await odooExecuteKw('mail.message', 'search_read', [domain], {
+   786→          fields: ['id', 'body', 'author_id', 'email_from', 'date', 'message_type', 'subtype_id', 'create_date'],
+   787→          order: 'date asc',
+   788→          limit: data.limit || 200,
+   789→        })
+   790→
+   791→        // Convert each mail.message back to a WhatsApp-style message
+   792→        // We try to detect direction (sent/received) and strip HTML
+   793→        const converted = (messages || []).map((msg: any) => {
+   794→          const body: string = msg.body || ''
+   795→          // Strip HTML tags
+   796→          const plainText = stripHtml(body)
+   797→          // Detect direction from "Enviada" / "Recebida" markers we wrote earlier
+   798→          const isSent = /WhatsApp\s+Enviada/i.test(body)
+   799→          const isReceived = /WhatsApp\s+Recebida/i.test(body)
+   800→
+   801→          // If neither marker matches, this is some other chatter message (note, etc.)
+   802→          // Treat as a received message by default
+   803→          const fromMe = isSent
+   804→
+   805→          // Try to extract a timestamp — prefer the explicit date in body, fall back to msg.date
+   806→          let timestamp: string
+   807→          const dateMatch = body.match(/\(([^)]+)\)/)
+   808→          if (dateMatch) {
+   809→            const parsed = new Date(dateMatch[1])
+   810→            if (!isNaN(parsed.getTime())) {
+   811→              timestamp = parsed.toISOString()
+   812→            } else {
+   813→              timestamp = msg.date || msg.create_date || new Date().toISOString()
+   814→            }
+   815→          } else {
+   816→            timestamp = msg.date || msg.create_date || new Date().toISOString()
+   817→          }
+   818→
+   819→          return {
+   820→            externalId: `odoo-${msg.id}`,
+   821→            fromMe,
+   822→            textContent: plainText || null,
+   823→            mediaType: null,
+   824→            timestamp,
+   825→            source: 'odoo',
+   826→          }
+   827→        })
+   828→
+   829→        callback({ success: true, data: converted })
+   830→      } catch (error: any) {
+   831→        callback({ success: false, error: error.message })
+   832→      }
+   833→    }
+   834→  )
+   835→
+   836→  // ===== Sales (sale.order) =====
+   837→  socket.on(
+   838→    'odoo:sales:search',
+   839→    async (data: { query?: string; limit?: number }, callback) => {
+   840→      try {
+   841→        const domain = data.query
+   842→          ? ['|', ['name', 'ilike', data.query], ['partner_id', 'ilike', data.query]]
+   843→          : []
+   844→        const records = await odooSearch('sale.order', domain, [
+   845→          'name', 'partner_id', 'state', 'date_order', 'amount_total',
+   846→          'user_id', 'team_id', 'whatsapp_number',
+   847→        ], data.limit || 20)
+   848→        callback({ success: true, data: records })
+   849→      } catch (error: any) {
+   850→        callback({ success: false, error: error.message })
+   851→      }
+   852→    }
+   853→  )
+   854→
+   855→  socket.on(
+   856→    'odoo:sales:create',
+   857→    async (data: {
+   858→      partner_id: number
+   859→      whatsapp_number?: string
+   860→    }, callback) => {
+   861→      try {
+   862→        const values: Record<string, any> = {
+   863→          partner_id: data.partner_id,
+   864→        }
+   865→        if (data.whatsapp_number) values.whatsapp_number = data.whatsapp_number
+   866→
+   867→        const id = await odooCreate('sale.order', values)
+   868→        callback({ success: true, id })
+   869→        io.emit('odoo:record:created', { model: 'sale.order', id, values })
+   870→      } catch (error: any) {
+   871→        callback({ success: false, error: error.message })
+   872→      }
+   873→    }
+   874→  )
+   875→
+   876→  // ===== Projects (project.task) =====
+   877→  socket.on(
+   878→    'odoo:projects:search',
+   879→    async (data: { query?: string; project_id?: number; limit?: number }, callback) => {
+   880→      try {
+   881→        const domain: any[] = []
+   882→        if (data.query) {
+   883→          domain.push('|', ['name', 'ilike', data.query], ['description', 'ilike', data.query])
+   884→        }
+   885→        if (data.project_id) {
+   886→          domain.push(['project_id', '=', data.project_id])
+   887→        }
+   888→        const records = await odooSearch('project.task', domain, [
+   889→          'name', 'description', 'project_id', 'stage_id', 'user_ids',
+   890→          'partner_id', 'priority', 'create_date', 'date_deadline',
+   891→          'whatsapp_number',
+   892→        ], data.limit || 20)
+   893→        callback({ success: true, data: records })
+   894→      } catch (error: any) {
+   895→        callback({ success: false, error: error.message })
+   896→      }
+   897→    }
+   898→  )
+   899→
+   900→  socket.on(
+   901→    'odoo:projects:create',
+   902→    async (data: {
+   903→      name: string
+   904→      project_id?: number
+   905→      partner_id?: number
+   906→      description?: string
+   907→      whatsapp_number?: string
+   908→    }, callback) => {
+   909→      try {
+   910→        const values: Record<string, any> = { name: data.name }
+   911→        if (data.project_id) values.project_id = data.project_id
+   912→        if (data.partner_id) values.partner_id = data.partner_id
+   913→        if (data.description) values.description = data.description
+   914→        if (data.whatsapp_number) values.whatsapp_number = data.whatsapp_number
+   915→
+   916→        const id = await odooCreate('project.task', values)
+   917→        callback({ success: true, id })
+   918→        io.emit('odoo:record:created', { model: 'project.task', id, values })
+   919→      } catch (error: any) {
+   920→        callback({ success: false, error: error.message })
+   921→      }
+   922→    }
+   923→  )
+   924→
+   925→  // ===== Projects list =====
+   926→  socket.on(
+   927→    'odoo:projects:list',
+   928→    async (data: { limit?: number }, callback) => {
+   929→      try {
+   930→        const records = await odooSearch('project.project', [], [
+   931→          'name', 'label_tasks', 'user_id', 'partner_id',
+   932→        ], data.limit || 50)
+   933→        callback({ success: true, data: records })
+   934→      } catch (error: any) {
+   935→        callback({ success: false, error: error.message })
+   936→      }
+   937→    }
+   938→  )
+   939→
+   940→  // ===== Link WhatsApp conversation to Odoo record =====
+   941→  socket.on(
+   942→    'odoo:link-conversation',
+   943→    async (data: {
+   944→      jid: string
+   945→      model: string
+   946→      recordId: number
+   947→      phone?: string
+   948→    }, callback) => {
+   949→      try {
+   950→        const phone = data.phone || data.jid.split('@')[0]
+   951→
+   952→        await smartWriteWhatsAppNumber(data.model, [data.recordId], phone)
+   953→
+   954→        try {
+   955→          await odooPostMessage(data.model, data.recordId,
+   956→            `<p><strong>[WhatsApp Middleware]</strong> Conversa vinculada — Número: ${phone}</p>`
+   957→          )
+   958→        } catch {
+   959→          // Chatter might not be available on all models, ignore
+   960→        }
+   961→
+   962→        callback({ success: true })
+   963→        io.emit('odoo:conversation:linked', {
+   964→          jid: data.jid,
+   965→          model: data.model,
+   966→          recordId: data.recordId,
+   967→        })
+   968→      } catch (error: any) {
+   969→        callback({ success: false, error: error.message })
+   970→      }
+   971→    }
+   972→  )
+   973→
+   974→  // ===== Log message in Odoo (mail.thread chatter) =====
+   975→  socket.on(
+   976→    'odoo:log-message',
+   977→    async (data: {
+   978→      model: string
+   979→      recordId: number
+   980→      message: string
+   981→      fromWhatsApp?: boolean
+   982→    }, callback) => {
+   983→      try {
+   984→        const body = data.fromWhatsApp
+   985→          ? `<p><strong>[WhatsApp]</strong> ${data.message}</p>`
+   986→          : data.message
+   987→        await odooPostMessage(data.model, data.recordId, body)
+   988→        callback({ success: true })
+   989→      } catch (error: any) {
+   990→        callback({ success: false, error: error.message })
+   991→      }
+   992→    }
+   993→  )
+   994→
+   995→  // ===== Get model fields =====
+   996→  socket.on(
+   997→    'odoo:fields',
+   998→    async (data: { model: string }, callback) => {
+   999→      try {
+  1000→        const fields = await odooGetFields(data.model)
+  1001→        callback({ success: true, data: fields })
+  1002→      } catch (error: any) {
+  1003→        callback({ success: false, error: error.message })
+  1004→      }
+  1005→    }
+  1006→  )
+  1007→
+  1008→  // ===== Check if custom fields exist =====
+  1009→  socket.on(
+  1010→    'odoo:check-fields',
+  1011→    async (data: { model: string; fields: string[] }, callback) => {
+  1012→      try {
+  1013→        const available = await getAvailableFields(data.model)
+  1014→        const result: Record<string, boolean> = {}
+  1015→        for (const field of data.fields) {
+  1016→          result[field] = available.has(field)
+  1017→        }
+  1018→        callback({ success: true, data: result })
+  1019→      } catch (error: any) {
+  1020→        callback({ success: false, error: error.message })
+  1021→      }
+  1022→    }
+  1023→  )
+  1024→
+  1025→  // ===== Generic CRUD =====
+  1026→  socket.on('odoo:search', async (data: { model: string; domain: any[]; fields?: string[]; limit?: number }, callback) => {
+  1027→    try {
+  1028→      const records = await odooSearch(data.model, data.domain, data.fields || [], data.limit || 20)
+  1029→      callback({ success: true, data: records })
+  1030→    } catch (error: any) {
+  1031→      callback({ success: false, error: error.message })
+  1032→    }
+  1033→  })
+  1034→
+  1035→  socket.on('odoo:read', async (data: { model: string; ids: number[]; fields?: string[] }, callback) => {
+  1036→    try {
+  1037→      const records = await odooRead(data.model, data.ids, data.fields || [])
+  1038→      callback({ success: true, data: records })
+  1039→    } catch (error: any) {
+  1040→      callback({ success: false, error: error.message })
+  1041→    }
+  1042→  })
+  1043→
+  1044→  socket.on('odoo:write', async (data: { model: string; ids: number[]; values: Record<string, any> }, callback) => {
+  1045→    try {
+  1046→      const result = await odooWrite(data.model, data.ids, data.values)
+  1047→      callback({ success: true, data: result })
+  1048→    } catch (error: any) {
+  1049→      callback({ success: false, error: error.message })
+  1050→    }
+  1051→  })
+  1052→
+  1053→  // ===== Get teams (for auto-sync settings) =====
+  1054→  socket.on('odoo:teams:search', async (data: { limit?: number }, callback) => {
+  1055→    try {
+  1056→      const records = await odooSearch('crm.team', [], ['name', 'user_id'], data.limit || 20)
+  1057→      callback({ success: true, data: records })
+  1058→    } catch (error: any) {
+  1059→      callback({ success: false, error: error.message })
+  1060→    }
+  1061→  })
+  1062→
+  1063→  // ===== Get users (for auto-sync settings) =====
+  1064→  socket.on('odoo:users:search', async (data: { limit?: number }, callback) => {
+  1065→    try {
+  1066→      const records = await odooSearch('res.users', [], ['name', 'login', 'image_128'], data.limit || 20)
+  1067→      callback({ success: true, data: records })
+  1068→    } catch (error: any) {
+  1069→      callback({ success: false, error: error.message })
+  1070→    }
+  1071→  })
+  1072→
+  1073→  socket.on('disconnect', () => {
+  1074→    console.log(`[Odoo IO] Client disconnected: ${socket.id}`)
+  1075→  })
+  1076→})
+  1077→
+  1078→// ========== Auto-Authenticate from Environment Variables ==========
+  1079→async function autoAuthenticateFromEnv() {
+  1080→  const envUrl = process.env.ODOO_URL
+  1081→  const envDb = process.env.ODOO_DB
+  1082→  const envUsername = process.env.ODOO_USERNAME
+  1083→  const envPassword = process.env.ODOO_PASSWORD
+  1084→
+  1085→  if (envUrl && envDb && envUsername && envPassword) {
+  1086→    console.log(`[Odoo] Auto-authenticating with env vars: ${envUrl} / ${envDb} / ${envUsername}`)
+  1087→    try {
+  1088→      odooConfig = {
+  1089→        url: envUrl,
+  1090→        db: envDb,
+  1091→        username: envUsername,
+  1092→        password: envPassword,
+  1093→        uid: null,
+  1094→      }
+  1095→      modelFieldsCache.clear()
+  1096→      phoneToPartnerCache.clear()
+  1097→      const uid = await odooAuthenticate()
+  1098→      odooConfig.uid = uid
+  1099→      console.log(`[Odoo] Auto-authenticated as ${envUsername} (uid: ${uid})`)
+  1100→
+  1101→      // Pre-cache fields for main models
+  1102→      await getAvailableFields('res.partner')
+  1103→      await getAvailableFields('crm.lead')
+  1104→
+  1105→      io.emit('odoo:status', {
+  1106→        connected: true,
+  1107→        url: odooConfig.url,
+  1108→        db: odooConfig.db,
+  1109→        username: odooConfig.username,
+  1110→      })
+  1111→    } catch (error: any) {
+  1112→      console.error(`[Odoo] Auto-authentication failed: ${error.message}`)
+  1113→      console.error('[Odoo] You can still connect manually via the UI')
+  1114→    }
+  1115→  } else {
+  1116→    console.log('[Odoo] No ODOO_URL/ODOO_DB/ODOO_USERNAME/ODOO_PASSWORD env vars set. Waiting for manual connection via UI.')
+  1117→  }
+  1118→}
+  1119→
+  1120→// ========== Start Server ==========
+  1121→httpServer.listen(PORT, async () => {
+  1122→  console.log(`[Odoo Service] Server running on port ${PORT}`)
+  1123→  console.log(`[Odoo Service] Auto-sync enabled: ${autoSyncSettings.enabled}`)
+  1124→  // Auto-authenticate if env vars are present
+  1125→  await autoAuthenticateFromEnv()
+  1126→})
+  1127→
+  1128→process.on('SIGTERM', () => {
+  1129→  console.log('[Odoo Service] SIGTERM received, shutting down...')
+  1130→  httpServer.close(() => process.exit(0))
+  1131→})
+  1132→
+  1133→process.on('SIGINT', () => {
+  1134→  console.log('[Odoo Service] SIGINT received, shutting down...')
+  1135→  httpServer.close(() => process.exit(0))
+  1136→})
+  1137→

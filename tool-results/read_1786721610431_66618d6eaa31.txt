@@ -1,0 +1,602 @@
+  1800→              mediaFileName = `audio_${msgId}.${ext}`
+  1801→              mediaDuration = m.audioMessage.seconds || null
+  1802→            } else if (mediaType === 'ptt' && m.pttMessage) {
+  1803→              mediaMimeType = m.pttMessage.mimetype || 'audio/ogg'
+  1804→              mediaFileName = `ptt_${msgId}.ogg`
+  1805→              mediaDuration = m.pttMessage.seconds || null
+  1806→            } else if (mediaType === 'document' && m.documentMessage) {
+  1807→              mediaMimeType = m.documentMessage.mimetype || 'application/octet-stream'
+  1808→              mediaFileName = m.documentMessage.fileName || `document_${msgId}`
+  1809→            } else if (mediaType === 'sticker' && m.stickerMessage) {
+  1810→              mediaMimeType = m.stickerMessage.mimetype || 'image/webp'
+  1811→              mediaFileName = `sticker_${msgId}.webp`
+  1812→            }
+  1813→
+  1814→            // Download the actual media file using Baileys' downloadMediaMessage
+  1815→            // This is async and may take a moment for large files
+  1816→            const baileysForDownload = await loadBaileys()
+  1817→            const buffer = await baileysForDownload.downloadMediaMessage(msg, 'buffer', {})
+  1818→            if (buffer && buffer.length > 0) {
+  1819→              // Save to MEDIA_DIR with a unique filename
+  1820→              const MEDIA_DIR_LOCAL = path.join(DATA_DIR, 'media')
+  1821→              try { fs.mkdirSync(MEDIA_DIR_LOCAL, { recursive: true }) } catch {}
+  1822→              // Use msgId + ext to keep filenames unique and traceable
+  1823→              const safeFileName = (mediaFileName || `media_${msgId}`).replace(/[^a-zA-Z0-9._-]/g, '_')
+  1824→              const filePath = path.join(MEDIA_DIR_LOCAL, safeFileName)
+  1825→              fs.writeFileSync(filePath, buffer)
+  1826→              mediaUrl = `/media/${safeFileName}`
+  1827→              console.log(`[WA] ✓ Media downloaded: ${mediaType} → ${mediaUrl} (${buffer.length} bytes)`)
+  1828→            }
+  1829→          } catch (mediaErr) {
+  1830→            console.error(`[WA] Media download failed for ${msgId}: ${mediaErr.message}`)
+  1831→            // Continue anyway — the message text + mediaType label will still show
+  1832→          }
+  1833→        }
+  1834→
+  1835→        const messageData = {
+  1836→          id: msgId || `m-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+  1837→          whatsappId: msgId || null,
+  1838→          fromMe,
+  1839→          textContent,
+  1840→          mediaType,
+  1841→          mediaUrl,
+  1842→          mediaBase64,
+  1843→          fileName: mediaFileName,
+  1844→          mimeType: mediaMimeType,
+  1845→          mediaDuration,
+  1846→          timestamp: messageTimestamp,
+  1847→          status: fromMe ? 'delivered' : 'received',
+  1848→        }
+  1849→
+  1850→        conv.messages.push(messageData)
+  1851→        conv.lastMessage = textContent || (mediaType ? `[${mediaType}]` : '')
+  1852→        conv.lastMessageAt = new Date()
+  1853→        if (!fromMe) conv.unreadCount++
+  1854→
+  1855→        console.log(`[WA] ✓ New message stored in ${jid} fromMe=${fromMe}: ${textContent ? textContent.slice(0, 40) : `[${mediaType}]`}`)
+  1856→        logUpsertEvent({ type: 'stored', jid, fromMe, msgId, preview: (textContent || '').slice(0, 30) })
+  1857→
+  1858→        // Try to fetch profile picture in background (don't block)
+  1859→        if (!conv.avatarUrl) {
+  1860→          waSocket.profilePictureUrl(jid, 'image').then(picUrl => {
+  1861→            if (picUrl) {
+  1862→              conv.avatarUrl = picUrl
+  1863→              io.of('/whatsapp').emit('whatsapp:conversation:update', serializeConversation(conv))
+  1864→            }
+  1865→          }).catch(() => {})
+  1866→        }
+  1867→
+  1868→        // Emit to all clients — the frontend's currentJidRef will decide if it appends to the active chat
+  1869→        // *** IMPORTANT: Use the normalized JID here so the frontend can match it ***
+  1870→        markConversationsDirty(); io.of('/whatsapp').emit('whatsapp:message', {
+  1871→          conversationJid: jid,
+  1872→          message: {
+  1873→            ...messageData,
+  1874→            // Serialize timestamp to ISO string for socket transport
+  1875→            timestamp: messageTimestamp.toISOString(),
+  1876→          },
+  1877→          conversation: serializeConversation(conv),
+  1878→        })
+  1879→        io.of('/whatsapp').emit('whatsapp:conversation:update', serializeConversation(conv))
+  1880→
+  1881→        // Auto-sync to Odoo in background
+  1882→        const phone = extractPhone(jid)
+  1883→        if (phone) {
+  1884→          autoSyncWhatsAppMessage({
+  1885→            jid, phone, pushName: conv.pushName, textContent, mediaType, fromMe,
+  1886→            timestamp: messageTimestamp.toISOString(),
+  1887→            dedupId: msgId,  // v7.14: dedup key for chatter
+  1888→          }).then(result => {
+  1889→            if (result.partnerId || result.leadId) {
+  1890→              io.of('/whatsapp').emit('whatsapp:odoo-sync', {
+  1891→                jid, phone, partnerId: result.partnerId, leadId: result.leadId,
+  1892→                mailMessageId: result.mailMessageId, activityId: result.activityId,
+  1893→                created: result.created, errors: result.errors,
+  1894→              })
+  1895→            }
+  1896→          }).catch(err => console.error('[AutoSync] Error:', err.message))
+  1897→        }
+  1898→      } catch (msgErr) {
+  1899→        // v7.15: Per-message error isolation — log and continue with next message
+  1900→        console.error(`[WA] upsert msg processing error:`, msgErr.message)
+  1901→        try {
+  1902→          console.error(`[WA] failing msg sample:`, JSON.stringify(msg).slice(0, 500))
+  1903→          logUpsertEvent({ type: 'processing-error', error: msgErr.message, sample: JSON.stringify(msg).slice(0, 300) })
+  1904→        } catch {}
+  1905→      }
+  1906→    }
+  1907→  })
+  1908→
+  1909→  // Handle message status updates (sent → delivered → read)
+  1910→  // v7.14: ALSO used as a fallback to capture incoming messages that might
+  1911→  // come through `messages.update` instead of `messages.upsert` in some
+  1912→  // Baileys edge cases (e.g. when receiving from a new device).
+  1913→  waSocket.ev.on('messages.update', async (updates) => {
+  1914→    try {
+  1915→      for (const update of updates || []) {
+  1916→        if (!update.key || !update.key.id) continue
+  1917→        // v7.16: Same LID recovery logic as messages.upsert — when remoteJid is a
+  1918→        // @lid, the phone JID is in `senderPn` (or `participant` as fallback).
+  1919→        const rawJid = update.key.remoteJid
+  1920→        let jid = normalizeJid(rawJid)
+  1921→        if (!jid && rawJid && rawJid.endsWith('@lid')) {
+  1922→          const candidate = update.key.senderPn || update.key.participant || update.key.senderLid
+  1923→          if (candidate) jid = normalizeJid(candidate)
+  1924→        }
+  1925→        if (!jid) continue
+  1926→        const conv = conversations.get(jid)
+  1927→        if (!conv) continue
+  1928→
+  1929→        const existing = conv.messages.find(m => m.whatsappId === update.key.id || m.id === update.key.id)
+  1930→
+  1931→        // v7.14: If the message doesn't exist locally AND the update has a
+  1932→        // message body, treat this as a new incoming message (fallback path).
+  1933→        // This catches the edge case where `messages.upsert` doesn't fire.
+  1934→        if (!existing && update.message) {
+  1935→          console.log(`[WA] messages.update: found NEW message not in upsert — id=${update.key.id} jid=${jid}`)
+  1936→          // Process it inline (do NOT re-emit to avoid recursion)
+  1937→          try {
+  1938→            const m = update.message
+  1939→            const textContent =
+  1940→              m.conversation ||
+  1941→              m.extendedTextMessage?.text ||
+  1942→              m.imageMessage?.caption ||
+  1943→              m.videoMessage?.caption ||
+  1944→              m.documentMessage?.caption || null
+  1945→            let mediaType = null
+  1946→            if (m.imageMessage) mediaType = 'image'
+  1947→            else if (m.videoMessage) mediaType = 'video'
+  1948→            else if (m.audioMessage) mediaType = 'audio'
+  1949→            else if (m.pttMessage) mediaType = 'ptt'
+  1950→            else if (m.documentMessage) mediaType = 'document'
+  1951→            else if (m.stickerMessage) mediaType = 'sticker'
+  1952→            if (!textContent && !mediaType) continue
+  1953→
+  1954→            const fromMe = update.key.fromMe || false
+  1955→            const msgId = update.key.id
+  1956→            if (conv.messages.some(mm => mm.whatsappId === msgId || mm.id === msgId)) continue
+  1957→
+  1958→            let ts
+  1959→            try {
+  1960→              const tsv = typeof update.messageTimestamp === 'number'
+  1961→                ? update.messageTimestamp
+  1962→                : (update.messageTimestamp?.low || update.messageTimestamp || Math.floor(Date.now() / 1000))
+  1963→              ts = new Date(tsv * 1000)
+  1964→              if (isNaN(ts.getTime())) ts = new Date()
+  1965→            } catch { ts = new Date() }
+  1966→
+  1967→            const messageData = {
+  1968→              id: msgId, whatsappId: msgId, fromMe, textContent, mediaType,
+  1969→              timestamp: ts, status: fromMe ? 'delivered' : 'received',
+  1970→            }
+  1971→            conv.messages.push(messageData)
+  1972→            conv.lastMessage = textContent || (mediaType ? `[${mediaType}]` : '')
+  1973→            conv.lastMessageAt = new Date()
+  1974→            if (!fromMe) conv.unreadCount++
+  1975→            console.log(`[WA] ✓ (via update) New message stored in ${jid} fromMe=${fromMe}`)
+  1976→
+  1977→            markConversationsDirty(); io.of('/whatsapp').emit('whatsapp:message', {
+  1978→              conversationJid: jid,
+  1979→              message: { ...messageData, timestamp: ts.toISOString() },
+  1980→              conversation: serializeConversation(conv),
+  1981→            })
+  1982→            io.of('/whatsapp').emit('whatsapp:conversation:update', serializeConversation(conv))
+  1983→
+  1984→            const phone = extractPhone(jid)
+  1985→            if (phone) {
+  1986→              autoSyncWhatsAppMessage({
+  1987→                jid, phone, pushName: conv.pushName, textContent, mediaType, fromMe,
+  1988→                timestamp: ts.toISOString(), dedupId: msgId,
+  1989→              }).catch(err => console.error('[AutoSync] Error:', err.message))
+  1990→            }
+  1991→          } catch (err) {
+  1992→            console.error('[WA] fallback message processing failed:', err.message)
+  1993→          }
+  1994→          continue
+  1995→        }
+  1996→
+  1997→        if (!existing) continue
+  1998→
+  1999→        let newStatus = existing.status
+  2000→        if (update.status === 'read') newStatus = 'read'
+  2001→        else if (update.status === 'delivered' && existing.status !== 'read') newStatus = 'delivered'
+  2002→        else if (update.status === 'played' && existing.mediaType === 'audio') newStatus = 'read'
+  2003→
+  2004→        if (newStatus !== existing.status) {
+  2005→          existing.status = newStatus
+  2006→          io.of('/whatsapp').emit('whatsapp:message:status', {
+  2007→            conversationJid: jid,
+  2008→            messageId: existing.id,
+  2009→            status: newStatus,
+  2010→          })
+  2011→        }
+  2012→      }
+  2013→    } catch (err) {
+  2014→      console.error('[WA] messages.update error:', err.message)
+  2015→    }
+  2016→  })
+  2017→
+  2018→  waSocket.ev.on('contacts.upsert', async (contacts) => {
+  2019→    console.log(`[WA] contacts.upsert: ${contacts.length} contacts received`)
+  2020→    let updatedCount = 0
+  2021→    for (const contact of contacts) {
+  2022→      if (contact.id && isValidPhoneJid(contact.id) && contact.name) {
+  2023→        updateConversationName(contact.id, contact.name)
+  2024→        updatedCount++
+  2025→      }
+  2026→    }
+  2027→    if (updatedCount > 0) {
+  2028→      console.log(`[WA] Updated ${updatedCount} conversation names from device contacts`)
+  2029→      markConversationsDirty(); io.of('/whatsapp').emit('whatsapp:conversations', getSortedConversations())
+  2030→    }
+  2031→  })
+  2032→
+  2033→  waSocket.ev.on('contacts.update', async (updates) => {
+  2034→    let updatedCount = 0
+  2035→    for (const update of updates) {
+  2036→      if (update.id && isValidPhoneJid(update.id) && update.name) {
+  2037→        updateConversationName(update.id, update.name)
+  2038→        updatedCount++
+  2039→      }
+  2040→    }
+  2041→    if (updatedCount > 0) {
+  2042→      console.log(`[WA] Updated ${updatedCount} conversation names from contact updates`)
+  2043→      markConversationsDirty(); io.of('/whatsapp').emit('whatsapp:conversations', getSortedConversations())
+  2044→    }
+  2045→  })
+  2046→
+  2047→  waSocket.ev.on('chats.upsert', async (chats) => {
+  2048→    for (const chat of chats) {
+  2049→      // v7.17: Try to resolve LID chat IDs using the global lidToPhoneMap
+  2050→      let jid = normalizeJid(chat.id)
+  2051→      if (!jid && chat.id && chat.id.endsWith('@lid')) {
+  2052→        jid = lidToPhoneMap.get(chat.id) || null
+  2053→      }
+  2054→      if (!jid) continue
+  2055→      if (!conversations.has(jid)) {
+  2056→        const contactName = contactNames.get(jid) || null
+  2057→        conversations.set(jid, {
+  2058→          jid, name: contactName, phone: extractPhone(jid),
+  2059→          pushName: null, avatarUrl: null, lastMessage: null,
+  2060→          lastMessageAt: chat.t ? new Date(chat.t * 1000) : null,
+  2061→          unreadCount: chat.unreadCount || 0, messages: [],
+  2062→        })
+  2063→      } else {
+  2064→        const conv = conversations.get(jid)
+  2065→        const contactName = contactNames.get(jid)
+  2066→        if (contactName) conv.name = contactName
+  2067→        if (chat.unreadCount !== undefined) conv.unreadCount = chat.unreadCount
+  2068→        if (chat.t && (!conv.lastMessageAt || new Date(chat.t * 1000) > conv.lastMessageAt)) {
+  2069→          conv.lastMessageAt = new Date(chat.t * 1000)
+  2070→        }
+  2071→      }
+  2072→    }
+  2073→    markConversationsDirty(); io.of('/whatsapp').emit('whatsapp:conversations', getSortedConversations())
+  2074→  })
+  2075→
+  2076→  waSocket.ev.on('chats.update', async (updates) => {
+  2077→    for (const update of updates) {
+  2078→      let jid = normalizeJid(update.id)
+  2079→      if (!jid && update.id && update.id.endsWith('@lid')) {
+  2080→        jid = lidToPhoneMap.get(update.id) || null
+  2081→      }
+  2082→      if (!jid) continue
+  2083→      const conv = conversations.get(jid)
+  2084→      if (conv) {
+  2085→        if (update.unreadCount !== undefined) conv.unreadCount = update.unreadCount
+  2086→        if (update.t) conv.lastMessageAt = new Date((update.t) * 1000)
+  2087→      }
+  2088→    }
+  2089→    markConversationsDirty(); io.of('/whatsapp').emit('whatsapp:conversations', getSortedConversations())
+  2090→  })
+  2091→}
+  2092→
+  2093→// ====================================================================
+  2094→// MAIN SERVER — Next.js + Socket.io (single process)
+  2095→// ====================================================================
+  2096→
+  2097→app.prepare().then(async () => {
+  2098→  // v7.22: Media files directory — for serving received/sent media (images, audio, etc.)
+  2099→  const MEDIA_DIR = path.join(DATA_DIR, 'media')
+  2100→  try { fs.mkdirSync(MEDIA_DIR, { recursive: true }) } catch {}
+  2101→  console.log(`[Server] Media dir: ${MEDIA_DIR}`)
+  2102→
+  2103→  const httpServer = createServer((req, res) => {
+  2104→    const parsedUrl = parse(req.url, true)
+  2105→
+  2106→    // v7.22: Serve media files from /media/<filename>
+  2107→    // Files are stored in DATA_DIR/media/ and served publicly (no auth for now —
+  2108→    // they're random cuid-named files).
+  2109→    if (parsedUrl.pathname && parsedUrl.pathname.startsWith('/media/')) {
+  2110→      const fileName = path.basename(parsedUrl.pathname)
+  2111→      // Prevent path traversal — only allow filenames without slashes/dots prefix
+  2112→      if (fileName && !fileName.includes('..') && !fileName.includes('/')) {
+  2113→        const filePath = path.join(MEDIA_DIR, fileName)
+  2114→        if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+  2115→          // Determine content type from extension
+  2116→          const ext = path.extname(fileName).toLowerCase()
+  2117→          const contentTypes = {
+  2118→            '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
+  2119→            '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml',
+  2120→            '.mp3': 'audio/mpeg', '.mp4': 'audio/mp4', '.m4a': 'audio/mp4',
+  2121→            '.ogg': 'audio/ogg', '.oga': 'audio/ogg', '.wav': 'audio/wav',
+  2122→            '.opus': 'audio/ogg',
+  2123→            '.mp4v': 'video/mp4', '.webm': 'video/webm',
+  2124→            '.pdf': 'application/pdf',
+  2125→            '.doc': 'application/msword', '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  2126→            '.xls': 'application/vnd.ms-excel', '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  2127→            '.txt': 'text/plain',
+  2128→          }
+  2129→          const contentType = contentTypes[ext] || 'application/octet-stream'
+  2130→          const stat = fs.statSync(filePath)
+  2131→          res.writeHead(200, {
+  2132→            'Content-Type': contentType,
+  2133→            'Content-Length': stat.size,
+  2134→            'Cache-Control': 'public, max-age=86400',
+  2135→          })
+  2136→          fs.createReadStream(filePath).pipe(res)
+  2137→          return
+  2138→        }
+  2139→      }
+  2140→      res.writeHead(404, { 'Content-Type': 'text/plain' })
+  2141→      res.end('Not found')
+  2142→      return
+  2143→    }
+  2144→
+  2145→    handle(req, res, parsedUrl)
+  2146→  })
+  2147→
+  2148→  const io = new Server(httpServer, {
+  2149→    path: '/socket.io',
+  2150→    cors: { origin: '*', methods: ['GET', 'POST'] },
+  2151→    pingTimeout: 60000,
+  2152→    pingInterval: 25000,
+  2153→  })
+  2154→
+  2155→  const waNamespace = io.of('/whatsapp')
+  2156→  const odooNamespace = io.of('/odoo')
+  2157→
+  2158→  // ========== WHATSAPP NAMESPACE ==========
+  2159→  waNamespace.on('connection', (socket) => {
+  2160→    console.log(`[WA IO] Client connected: ${socket.id}`)
+  2161→
+  2162→    const isConnected = connectionState.connection === 'open'
+  2163→    socket.emit('whatsapp:status', {
+  2164→      connected: isConnected,
+  2165→      reason: isConnected ? undefined : (hasSavedSession ? 'reconnecting' : 'disconnected'),
+  2166→      hasSession: hasSavedSession,
+  2167→    })
+  2168→
+  2169→    if (!isConnected && lastQrCode) {
+  2170→      socket.emit('whatsapp:qr', { qr: lastQrCode })
+  2171→    }
+  2172→
+  2173→    socket.emit('whatsapp:conversations', getSortedConversations())
+  2174→
+  2175→    if (syncState.isSyncing) {
+  2176→      socket.emit('whatsapp:sync-progress', {
+  2177→        isSyncing: true, progress: syncState.progress,
+  2178→        phase: 'historical', chatsCount: syncState.totalChats, contactsCount: syncState.totalContacts,
+  2179→      })
+  2180→    }
+  2181→
+  2182→    socket.on('whatsapp:request-qr', () => {
+  2183→      console.log('[WA IO] QR requested by client')
+  2184→      if (connectionState.connection === 'open') {
+  2185→        socket.emit('whatsapp:status', { connected: true, hasSession: true })
+  2186→      } else if (lastQrCode) {
+  2187→        socket.emit('whatsapp:qr', { qr: lastQrCode })
+  2188→      } else {
+  2189→        if (waSocket) {
+  2190→          try { waSocket.end(undefined) } catch {}
+  2191→          waSocket = null
+  2192→        }
+  2193→        lastQrCode = null
+  2194→        connectWhatsApp(io)
+  2195→      }
+  2196→    })
+  2197→
+  2198→    socket.on('whatsapp:get-messages', (data, callback) => {
+  2199→      const jid = normalizeJid(data?.jid)
+  2200→      const conv = jid ? conversations.get(jid) : null
+  2201→      if (!conv) { callback({ messages: [] }); return }
+  2202→      // Serialize timestamps to ISO strings for socket transport
+  2203→      const messages = conv.messages.slice(-200).map(m => ({
+  2204→        ...m,
+  2205→        timestamp: m.timestamp instanceof Date ? m.timestamp.toISOString() : m.timestamp,
+  2206→      }))
+  2207→      callback({ messages })
+  2208→    })
+  2209→
+  2210→    // ===== v7.15: Manual refresh messages — fetches messages FROM THE PHONE =====
+  2211→    // Called by the "Atualizar" / "Buscar no aparelho" button in the chat view.
+  2212→    //
+  2213→    // STRATEGY:
+  2214→    //   1. Return local cached messages IMMEDIATELY (instant UI feedback)
+  2215→    //   2. If local messages exist → call `fetchMessageHistory(50, anchorKey, anchorTs)`
+  2216→    //      to fetch OLDER messages from WhatsApp servers (fills gaps in history)
+  2217→    //   3. ALWAYS also call `resyncAppState([...])` to force a fresh app-state
+  2218→    //      sync — this triggers `messaging-history.set` with the latest chats/
+  2219→    //      contacts/messages from the phone, INCLUDING messages that may have
+  2220→    //      been missed by `messages.upsert`
+  2221→    //   4. After 2.5s delay, re-emit local messages to all clients so they see
+  2222→    //      any new messages that arrived during the sync
+  2223→    //
+  2224→    // v7.15 fix: previous version did NOTHING if the conversation had 0 local
+  2225→    // messages (because fetchMessageHistory requires an anchor). Now we ALWAYS
+  2226→    // call resyncAppState which works regardless of local state.
+  2227→    socket.on('whatsapp:refresh-messages', async (data, callback) => {
+  2228→      try {
+  2229→        const jid = normalizeJid(data?.jid)
+  2230→        if (!jid) {
+  2231→          callback({ success: false, error: 'Invalid JID', messages: [] })
+  2232→          return
+  2233→        }
+  2234→        const conv = conversations.get(jid)
+  2235→        if (!conv) {
+  2236→          callback({ success: false, error: 'Conversation not found', messages: [] })
+  2237→          return
+  2238→        }
+  2239→
+  2240→        const beforeCount = conv.messages.length
+  2241→        console.log(`[WA] Refresh messages for ${jid} (local count: ${beforeCount})`)
+  2242→
+  2243→        let serverFetchAttempted = false
+  2244→        let serverFetchMethods = []
+  2245→
+  2246→        if (waSocket && connectionState.connection === 'open') {
+  2247→          // Method 1: fetchMessageHistory — fetches OLDER messages from WA servers
+  2248→          // (useful for filling gaps in history). Requires an anchor message.
+  2249→          if (typeof waSocket.fetchMessageHistory === 'function' && conv.messages.length > 0) {
+  2250→            serverFetchAttempted = true
+  2251→            serverFetchMethods.push('fetchMessageHistory')
+  2252→            try {
+  2253→              const lastMsg = conv.messages[conv.messages.length - 1]
+  2254→              const anchorKey = {
+  2255→                remoteJid: jid,
+  2256→                fromMe: lastMsg.fromMe,
+  2257→                id: lastMsg.whatsappId || lastMsg.id,
+  2258→              }
+  2259→              const anchorTs = lastMsg.timestamp instanceof Date
+  2260→                ? Math.floor(lastMsg.timestamp.getTime() / 1000)
+  2261→                : Math.floor(new Date(lastMsg.timestamp).getTime() / 1000)
+  2262→              console.log(`[WA] Triggering fetchMessageHistory for ${jid} (anchor=${anchorKey.id})`)
+  2263→              waSocket.fetchMessageHistory(50, anchorKey, anchorTs)
+  2264→                .then(() => console.log(`[WA] fetchMessageHistory completed for ${jid}`))
+  2265→                .catch(err => console.error(`[WA] fetchMessageHistory error:`, err.message))
+  2266→            } catch (err) {
+  2267→              console.error(`[WA] fetchMessageHistory trigger failed:`, err.message)
+  2268→            }
+  2269→          }
+  2270→
+  2271→          // Method 2: resyncAppState — forces a fresh app-state sync (heavier but
+  2272→          // more thorough). This is the ONLY way to fetch messages from the phone
+  2273→          // when we have no local anchor message. ALWAYS run this on refresh.
+  2274→          if (typeof waSocket.resyncAppState === 'function') {
+  2275→            serverFetchAttempted = true
+  2276→            serverFetchMethods.push('resyncAppState')
+  2277→            try {
+  2278→              console.log(`[WA] Triggering resyncAppState for refresh`)
+  2279→              waSocket.resyncAppState(['critical_block', 'critical_unblock_low', 'regular_high', 'regular_low', 'regular'], false)
+  2280→                .then(() => console.log(`[WA] resyncAppState completed for refresh`))
+  2281→                .catch(err => console.error(`[WA] resyncAppState error:`, err.message))
+  2282→            } catch (err) {
+  2283→              console.error(`[WA] resyncAppState trigger failed:`, err.message)
+  2284→            }
+  2285→          }
+  2286→        } else {
+  2287→          console.log(`[WA] Refresh skipped server-fetch — WA not connected`)
+  2288→        }
+  2289→
+  2290→        // Return local messages immediately (for instant UI feedback)
+  2291→        const messages = conv.messages.slice(-200).map(m => ({
+  2292→          ...m,
+  2293→          timestamp: m.timestamp instanceof Date ? m.timestamp.toISOString() : m.timestamp,
+  2294→        }))
+  2295→        callback({
+  2296→          success: true,
+  2297→          messages,
+  2298→          count: messages.length,
+  2299→          serverFetchAttempted,
+  2300→          serverFetchMethods,
+  2301→        })
+  2302→
+  2303→        // v7.15: After 2.5s delay, re-emit local messages to ALL clients.
+  2304→        // This catches any new messages that arrived during the async fetch.
+  2305→        setTimeout(() => {
+  2306→          const c = conversations.get(jid)
+  2307→          if (c) {
+  2308→            const msgs = c.messages.slice(-200).map(m => ({
+  2309→              ...m,
+  2310→              timestamp: m.timestamp instanceof Date ? m.timestamp.toISOString() : m.timestamp,
+  2311→            }))
+  2312→            const afterCount = msgs.length
+  2313→            console.log(`[WA] Refresh result for ${jid}: ${beforeCount} → ${afterCount} msgs`)
+  2314→            io.of('/whatsapp').emit('whatsapp:messages:refreshed', { jid, messages: msgs })
+  2315→            io.of('/whatsapp').emit('whatsapp:conversation:update', serializeConversation(c))
+  2316→          }
+  2317→        }, 2500)
+  2318→      } catch (error) {
+  2319→        console.error('[WA] refresh-messages error:', error.message)
+  2320→        callback({ success: false, error: error.message, messages: [] })
+  2321→      }
+  2322→    })
+  2323→
+  2324→    // ===== v7.15: Debug endpoint — returns recent upsert events =====
+  2325→    // Used to troubleshoot "messages not arriving" issues. The user can call
+  2326→    // this from the browser console to see if `messages.upsert` is firing
+  2327→    // and what message types are being received.
+  2328→    socket.on('whatsapp:debug-events', (data, callback) => {
+  2329→      try {
+  2330→        callback({
+  2331→          success: true,
+  2332→          recentEvents: recentUpsertEvents,
+  2333→          connectionState: connectionState.connection,
+  2334→          waSocketExists: !!waSocket,
+  2335→          waSocketReadyState: waSocket?.ws?.readyState,
+  2336→          totalConversations: conversations.size,
+  2337→          totalContacts: deviceContacts.size,
+  2338→          totalPostedChatter: postedChatterIds.size,
+  2339→          hasFetchMessageHistory: typeof waSocket?.fetchMessageHistory === 'function',
+  2340→          hasResyncAppState: typeof waSocket?.resyncAppState === 'function',
+  2341→        })
+  2342→      } catch (error) {
+  2343→        callback({ success: false, error: error.message })
+  2344→      }
+  2345→    })
+  2346→
+  2347→    // ===== v7.14: Debug endpoint — get server-side state for a JID =====
+  2348→    // Used to troubleshoot "messages not arriving" issues.
+  2349→    socket.on('whatsapp:debug-jid', (data, callback) => {
+  2350→      try {
+  2351→        const jid = normalizeJid(data?.jid)
+  2352→        const conv = jid ? conversations.get(jid) : null
+  2353→        callback({
+  2354→          success: true,
+  2355→          jid,
+  2356→          normalizedJid: jid,
+  2357→          hasConversation: !!conv,
+  2358→          messageCount: conv ? conv.messages.length : 0,
+  2359→          lastMessage: conv?.lastMessage || null,
+  2360→          lastMessageAt: conv?.lastMessageAt ? conv.lastMessageAt.toISOString() : null,
+  2361→          connectionState: connectionState.connection,
+  2362→          waSocketExists: !!waSocket,
+  2363→          totalConversations: conversations.size,
+  2364→          totalContacts: deviceContacts.size,
+  2365→          totalPostedChatter: postedChatterIds.size,
+  2366→        })
+  2367→      } catch (error) {
+  2368→        callback({ success: false, error: error.message })
+  2369→      }
+  2370→    })
+  2371→
+  2372→    socket.on('whatsapp:send-message', async (data, callback) => {
+  2373→      try {
+  2374→        if (!waSocket || connectionState.connection !== 'open') {
+  2375→          callback({ success: false, error: 'WhatsApp not connected' })
+  2376→          return
+  2377→        }
+  2378→        const jid = normalizeJid(data?.jid)
+  2379→        if (!jid) {
+  2380→          callback({ success: false, error: 'Invalid contact JID' })
+  2381→          return
+  2382→        }
+  2383→
+  2384→        const sent = await waSocket.sendMessage(jid, { text: data.text })
+  2385→        const conv = getOrCreateConversation(jid)
+  2386→        if (!conv) { callback({ success: false, error: 'Could not create conversation' }); return }
+  2387→
+  2388→        const msgId = sent?.key?.id || `m-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
+  2389→        // Skip if message already exists (e.g., if upsert beat us to it)
+  2390→        if (!conv.messages.some(m => m.whatsappId === msgId || m.id === msgId)) {
+  2391→          const messageTimestamp = new Date()
+  2392→          const messageData = {
+  2393→            id: msgId,
+  2394→            whatsappId: msgId,
+  2395→            fromMe: true,
+  2396→            textContent: data.text,
+  2397→            mediaType: null,
+  2398→            timestamp: messageTimestamp,
+  2399→            status: 'sent',
+
+[showing lines 1800-2399 of 3440; use offset=2400 with limit to continue reading]

@@ -1,0 +1,2002 @@
+     1→// ====================================================================
+     2→// Whats-Odoo v7.21 — SINGLE-PROCESS SERVER
+     3→// Everything in one process: Next.js + WhatsApp (Baileys) + Odoo (XML-RPC)
+     4→// Designed for Render 512MB RAM
+     5→//
+     6→// v7.21 changes:
+     7→//   - NEW: "Reconnect brings back history" — the Odoo chatter is now the
+     8→//     durable conversation database. On every WA reconnect (and on every
+     9→//     Odoo auth success), we automatically scan all res.partner records
+    10→//     that have WhatsApp chatter messages and pull them back into the
+    11→//     local conversation state. Survives deploys, crashes, disk wipes.
+    12→//   - NEW: syncAllConversationsFromOdoo() — scans mail.message for our
+    13→//     WhatsApp marker (body ilike "WhatsApp"), groups by res.partner,
+    14→//     reads phone from whichever field exists, finds/creates the local
+    15→//     conversation, and pulls chatter via pullOdooChatterIntoConversation
+    16→//     (which already dedupes by externalId + content+timestamp).
+    17→//   - NEW: Socket endpoints — 'odoo:sync-all-history' (manual trigger),
+    18→//     'odoo:sync-status' (in-progress + last run stats).
+    19→//   - NEW: Progress events — 'whatsapp:odoo-sync-progress' emitted at
+    20→//     phases: starting → fetching_partners → processing → complete/error.
+    21→//   - Hooks: fires 8s after WA 'open' event (gives WA resyncAppState
+    22→//     time to start, and gives Odoo auto-auth time to complete). Also
+    23→//     fires 3s after Odoo auth success if WA is already connected.
+    24→//     Idempotent — has an in-progress lock so concurrent calls no-op.
+    25→//
+    26→// v7.20 changes (preserved):
+    27→//   - REVERTED contacts/conversations separation: Conversas tab now shows
+    28→//     BOTH actual conversations AND device contacts (v7.16 behavior).
+    29→//   - FIXED Odoo 19.4 "Invalid field res.partner.mobile" error.
+    30→//   - Auto-create Lead is OFF by default.
+    31→//   - Create Project Task now works with smart defaults + error surfacing.
+    32→//
+    33→// v7.19 changes (preserved):
+    34→//   - autoCreateLead default = false
+    35→//   - Lead/Opportunity creation posts messages to chatter AND writes
+    36→//     transcript to the description field (Notes)
+    37→//
+    38→// v7.17-v7.18 changes (preserved):
+    39→//   - Session persistence across deploys (conversations saved to disk)
+    40→//   - LID JID resolution (senderPn fallback for incoming DMs)
+    41→//   - Odoo auto-auth retry (fixes "Parou de Criar Leads" on cold start)
+    42→// ====================================================================
+    43→
+    44→const { createServer } = require('http')
+    45→const { parse } = require('url')
+    46→const next = require('next')
+    47→const { Server } = require('socket.io')
+    48→const { createClient, createSecureClient } = require('xmlrpc')
+    49→const path = require('path')
+    50→const fs = require('fs')
+    51→
+    52→// Ensure production mode on Render
+    53→if (!process.env.NODE_ENV) process.env.NODE_ENV = 'production'
+    54→const dev = process.env.NODE_ENV !== 'production'
+    55→const hostname = process.env.HOSTNAME || '0.0.0.0'
+    56→const port = parseInt(process.env.PORT || '10000', 10)
+    57→
+    58→const app = next({ dev, hostname, port })
+    59→const handle = app.getRequestHandler()
+    60→
+    61→// ========== Paths ==========
+    62→const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data')
+    63→const AUTH_FOLDER = path.join(DATA_DIR, 'auth_store')
+    64→const CONV_STATE_FILE = path.join(DATA_DIR, 'conversation-state.json')
+    65→
+    66→// Create directories on startup
+    67→function ensureDirs() {
+    68→  try { fs.mkdirSync(DATA_DIR, { recursive: true }) } catch {}
+    69→  try { fs.mkdirSync(AUTH_FOLDER, { recursive: true }) } catch {}
+    70→}
+    71→ensureDirs()
+    72→
+    73→console.log(`[Server] Data dir: ${DATA_DIR}`)
+    74→console.log(`[Server] Auth folder: ${AUTH_FOLDER}`)
+    75→
+    76→// v7.17: Persistence diagnostics — verify the data dir is writable and
+    77→// the auth folder has session files. This helps diagnose "lost session
+    78→// after deploy" issues. If the disk isn't actually attached, the logs
+    79→// will show it immediately.
+    80→function runPersistenceDiagnostics() {
+    81→  try {
+    82→    // Check if DATA_DIR is writable
+    83→    const testFile = path.join(DATA_DIR, '.write-test')
+    84→    fs.writeFileSync(testFile, `persist-test-${Date.now()}`)
+    85→    fs.unlinkSync(testFile)
+    86→    console.log(`[Server] ✓ Data dir is writable: ${DATA_DIR}`)
+    87→
+    88→    // Check auth folder contents
+    89→    if (fs.existsSync(AUTH_FOLDER)) {
+    90→      const files = fs.readdirSync(AUTH_FOLDER)
+    91→      const hasCreds = files.includes('creds.json')
+    92→      console.log(`[Server] Auth folder: ${files.length} files, creds.json=${hasCreds ? 'PRESENT' : 'MISSING'}`)
+    93→      if (hasCreds) {
+    94→        const stats = fs.statSync(path.join(AUTH_FOLDER, 'creds.json'))
+    95→        console.log(`[Server] ✓ WhatsApp session found (creds.json last modified: ${stats.mtime.toISOString()})`)
+    96→      } else {
+    97→        console.log(`[Server] ⚠ No WhatsApp session — will need new QR code scan`)
+    98→      }
+    99→    }
+   100→
+   101→    // Check conversation state file
+   102→    if (fs.existsSync(CONV_STATE_FILE)) {
+   103→      const stats = fs.statSync(CONV_STATE_FILE)
+   104→      console.log(`[Server] ✓ Conversation state file found (last modified: ${stats.mtime.toISOString()})`)
+   105→    }
+   106→  } catch (err) {
+   107→    console.error(`[Server] ✗ Persistence diagnostics FAILED: ${err.message}`)
+   108→    console.error(`[Server] ✗ DATA_DIR (${DATA_DIR}) may not be writable. Session will NOT persist across deploys!`)
+   109→  }
+   110→}
+   111→runPersistenceDiagnostics()
+   112→
+   113→// v7.17: Persist in-memory conversations to disk so they survive deploys.
+   114→// Baileys auth files already persist on disk, but the in-memory conversations
+   115→// Map (chats + messages) is lost on every restart. We save a snapshot to
+   116→// conversation-state.json periodically and on shutdown. On startup, we load
+   117→// it back so the user doesn't see an empty conversation list while the
+   118→// resyncAppState completes.
+   119→function persistConversationsToDisk() {
+   120→  try {
+   121→    const snapshot = {
+   122→      version: 1,
+   123→      savedAt: new Date().toISOString(),
+   124→      conversations: Array.from(conversations.values()).map(c => ({
+   125→        jid: c.jid,
+   126→        name: c.name,
+   127→        phone: c.phone,
+   128→        pushName: c.pushName,
+   129→        avatarUrl: c.avatarUrl,
+   130→        lastMessage: c.lastMessage,
+   131→        lastMessageAt: c.lastMessageAt ? c.lastMessageAt.toISOString() : null,
+   132→        unreadCount: c.unreadCount,
+   133→        messages: c.messages.map(m => ({
+   134→          ...m,
+   135→          timestamp: m.timestamp instanceof Date ? m.timestamp.toISOString() : m.timestamp,
+   136→        })),
+   137→      })),
+   138→      contactNames: Array.from(contactNames.entries()),
+   139→      deviceContacts: Array.from(deviceContacts.values()),
+   140→      lidToPhoneMap: Array.from(lidToPhoneMap.entries()),
+   141→    }
+   142→    fs.writeFileSync(CONV_STATE_FILE, JSON.stringify(snapshot), 'utf8')
+   143→    console.log(`[Server] Persisted ${snapshot.conversations.length} conversations to disk`)
+   144→  } catch (err) {
+   145→    console.error(`[Server] Failed to persist conversations: ${err.message}`)
+   146→  }
+   147→}
+   148→
+   149→function loadConversationsFromDisk() {
+   150→  try {
+   151→    if (!fs.existsSync(CONV_STATE_FILE)) {
+   152→      console.log(`[Server] No saved conversation state — starting fresh`)
+   153→      return
+   154→    }
+   155→    const raw = fs.readFileSync(CONV_STATE_FILE, 'utf8')
+   156→    const snapshot = JSON.parse(raw)
+   157→    if (!snapshot || snapshot.version !== 1) {
+   158→      console.log(`[Server] Saved conversation state is old format — ignoring`)
+   159→      return
+   160→    }
+   161→
+   162→    let loaded = 0
+   163→    for (const c of snapshot.conversations || []) {
+   164→      if (!c.jid || !isValidPhoneJid(c.jid)) continue
+   165→      conversations.set(c.jid, {
+   166→        jid: c.jid,
+   167→        name: c.name || null,
+   168→        phone: c.phone || extractPhone(c.jid),
+   169→        pushName: c.pushName || null,
+   170→        avatarUrl: c.avatarUrl || null,
+   171→        lastMessage: c.lastMessage || null,
+   172→        lastMessageAt: c.lastMessageAt ? new Date(c.lastMessageAt) : null,
+   173→        unreadCount: c.unreadCount || 0,
+   174→        messages: (c.messages || []).map(m => ({
+   175→          ...m,
+   176→          timestamp: m.timestamp ? new Date(m.timestamp) : new Date(),
+   177→        })),
+   178→      })
+   179→      loaded++
+   180→    }
+   181→
+   182→    for (const [jid, name] of snapshot.contactNames || []) {
+   183→      contactNames.set(jid, name)
+   184→    }
+   185→
+   186→    for (const c of snapshot.deviceContacts || []) {
+   187→      if (c.jid) deviceContacts.set(c.jid, c)
+   188→    }
+   189→
+   190→    for (const [lid, phone] of snapshot.lidToPhoneMap || []) {
+   191→      lidToPhoneMap.set(lid, phone)
+   192→    }
+   193→
+   194→    console.log(`[Server] ✓ Loaded ${loaded} conversations, ${contactNames.size} contact names, ${deviceContacts.size} device contacts from disk (saved ${snapshot.savedAt})`)
+   195→  } catch (err) {
+   196→    console.error(`[Server] Failed to load conversations from disk: ${err.message}`)
+   197→  }
+   198→}
+   199→// NOTE: loadConversationsFromDisk() is called later, after the conversations/
+   200→// contactNames/deviceContacts/lidToPhoneMap Maps and helper functions are
+   201→// defined (in the WhatsApp module below). The function itself is hoisted.
+   202→
+   203→// v7.17: Persist conversations every 30 seconds (debounced — only if changed)
+   204→let lastPersistTs = 0
+   205→let conversationDirty = false
+   206→function markConversationsDirty() { conversationDirty = true }
+   207→setInterval(() => {
+   208→  if (conversationDirty && Date.now() - lastPersistTs > 25_000) {
+   209→    conversationDirty = false
+   210→    lastPersistTs = Date.now()
+   211→    persistConversationsToDisk()
+   212→  }
+   213→}, 30_000)
+   214→
+   215→// Persist on shutdown
+   216→process.on('SIGTERM', () => {
+   217→  console.log('[Server] SIGTERM — persisting conversations to disk...')
+   218→  persistConversationsToDisk()
+   219→})
+   220→process.on('SIGINT', () => {
+   221→  console.log('[Server] SIGINT — persisting conversations to disk...')
+   222→  persistConversationsToDisk()
+   223→})
+   224→
+   225→// ====================================================================
+   226→// ODOO MODULE — In-process (no separate service)
+   227→// ====================================================================
+   228→
+   229→let odooConfig = {
+   230→  url: '',
+   231→  db: '',
+   232→  username: '',
+   233→  password: '',
+   234→  uid: null,
+   235→}
+   236→
+   237→// v7.19: autoCreateLead default is FALSE per user request — leads/opportunities
+   238→// must only be created EXPLICITLY via the side menu "Criar Oportunidade" button,
+   239→// which carries the conversation history to chatter AND the description/notes field.
+   240→let autoSyncSettings = {
+   241→  enabled: true,
+   242→  autoCreateContact: true,
+   243→  autoCreateLead: false,
+   244→  autoPostMessages: true,
+   245→  autoCreateActivity: false,
+   246→  leadPrefix: '[WhatsApp] ',
+   247→  leadTeamId: null,
+   248→  leadUserId: null,
+   249→}
+   250→
+   251→// v7.17: Background re-auth timer — if Odoo auth fails on startup, we retry
+   252→// every 60s until it succeeds. This prevents "Parou de Criar Leads" when Odoo
+   253→// was temporarily unreachable during the middleware's cold start.
+   254→let odooReauthTimer = null
+   255→
+   256→const modelFieldsCache = new Map()
+   257→const phoneToPartnerCache = new Map()
+   258→
+   259→// Track which WhatsApp message IDs have already been posted to Odoo chatter.
+   260→// Key format: `${jid}|${whatsappId}` — used to PREVENT DUPLICATES in chatter.
+   261→// v7.14: We must NEVER duplicate what was posted to Odoo chatter.
+   262→const postedChatterIds = new Set()
+   263→
+   264→// v7.15: Ring buffer of recent `messages.upsert` events for debugging.
+   265→// When the user reports "messages aren't arriving", we can inspect this via
+   266→// the `whatsapp:debug-events` socket endpoint to see whether upsert is even
+   267→// firing, what JIDs are coming through, and what message types we're receiving.
+   268→const recentUpsertEvents = []
+   269→const MAX_RECENT_EVENTS = 50
+   270→function logUpsertEvent(event) {
+   271→  try {
+   272→    recentUpsertEvents.push({ ts: new Date().toISOString(), ...event })
+   273→    while (recentUpsertEvents.length > MAX_RECENT_EVENTS) recentUpsertEvents.shift()
+   274→  } catch {}
+   275→}
+   276→
+   277→// Track active lead IDs by phone — refreshed on every auto-sync.
+   278→// Used so we can post messages to the lead's chatter too (in addition to partner).
+   279→const phoneToActiveLeadCache = new Map()
+   280→
+   281→function makeXmlRpcClient(p) {
+   282→  const url = new URL(odooConfig.url)
+   283→  const isHttps = url.protocol === 'https:'
+   284→  const options = {
+   285→    host: url.hostname,
+   286→    port: parseInt(url.port) || (isHttps ? 443 : 80),
+   287→    path: p,
+   288→  }
+   289→  return isHttps ? createSecureClient(options) : createClient(options)
+   290→}
+   291→
+   292→function odooAuthenticate() {
+   293→  return new Promise((resolve, reject) => {
+   294→    const client = makeXmlRpcClient('/xmlrpc/2/common')
+   295→    client.methodCall('authenticate', [odooConfig.db, odooConfig.username, odooConfig.password, {}], (error, value) => {
+   296→      if (error) reject(error)
+   297→      else if (!value) reject(new Error('Authentication failed - invalid credentials'))
+   298→      else resolve(value)
+   299→    })
+   300→  })
+   301→}
+   302→
+   303→function odooExecuteKw(model, method, args, kwargs = {}) {
+   304→  return new Promise((resolve, reject) => {
+   305→    if (!odooConfig.uid) {
+   306→      reject(new Error('Not authenticated with Odoo'))
+   307→      return
+   308→    }
+   309→    const client = makeXmlRpcClient('/xmlrpc/2/object')
+   310→    client.methodCall('execute_kw', [odooConfig.db, odooConfig.uid, odooConfig.password, model, method, args, kwargs], (error, value) => {
+   311→      if (error) reject(error)
+   312→      else resolve(value)
+   313→    })
+   314→  })
+   315→}
+   316→
+   317→async function getAvailableFields(model) {
+   318→  if (modelFieldsCache.has(model)) return modelFieldsCache.get(model)
+   319→  try {
+   320→    const fields = await odooExecuteKw(model, 'fields_get', [], { attributes: ['string', 'type'] })
+   321→    const fieldNames = new Set(Object.keys(fields))
+   322→    modelFieldsCache.set(model, fieldNames)
+   323→    console.log(`[Odoo] Model ${model} has ${fieldNames.size} fields`)
+   324→    return fieldNames
+   325→  } catch (error) {
+   326→    console.error(`[Odoo] Failed to get fields for ${model}:`, error.message)
+   327→    return new Set()
+   328→  }
+   329→}
+   330→
+   331→async function filterExistingFields(model, requestedFields) {
+   332→  const available = await getAvailableFields(model)
+   333→  const existing = requestedFields.filter(f => available.has(f))
+   334→  if (!existing.includes('id') && available.has('id')) existing.unshift('id')
+   335→  if (!existing.includes('name') && available.has('name')) existing.push('name')
+   336→  return existing
+   337→}
+   338→
+   339→async function buildSafeValues(model, values) {
+   340→  const available = await getAvailableFields(model)
+   341→  const safe = {}
+   342→  for (const [key, value] of Object.entries(values)) {
+   343→    if (available.has(key)) safe[key] = value
+   344→  }
+   345→  return safe
+   346→}
+   347→
+   348→async function odooSearch(model, domain, fields = [], limit = 80, offset = 0) {
+   349→  const safeFields = fields.length > 0 ? await filterExistingFields(model, fields) : []
+   350→  return odooExecuteKw(model, 'search_read', [domain], {
+   351→    fields: safeFields.length > 0 ? safeFields : undefined,
+   352→    limit,
+   353→    offset,
+   354→  })
+   355→}
+   356→
+   357→// v7.20: Build a phone-number search domain that ONLY uses fields the model
+   358→// actually has. This prevents "Invalid field X.Y" errors on Odoo versions
+   359→// where some phone-like fields don't exist or aren't searchable (e.g. on
+   360→// Odoo 19.4, res.partner.mobile is no longer directly searchable).
+   361→// Returns a domain like:
+   362→//   [['phone', 'ilike', x]]
+   363→//   ['|', ['phone', 'ilike', x], ['whatsapp', 'ilike', x]]
+   364→//   ['|', ['phone', 'ilike', x], ['|', ['mobile', 'ilike', x], ['whatsapp', 'ilike', x]]]
+   365→// If no candidate fields exist, falls back to searching by name.
+   366→async function buildPhoneSearchDomain(model, phone, candidateFields = ['phone', 'mobile', 'whatsapp', 'whatsapp_number']) {
+   367→  if (!phone) return []
+   368→  const available = await getAvailableFields(model)
+   369→  const usable = candidateFields.filter(f => available.has(f))
+   370→  if (usable.length === 0) {
+   371→    return [['name', 'ilike', phone]]
+   372→  }
+   373→  if (usable.length === 1) {
+   374→    return [[usable[0], 'ilike', phone]]
+   375→  }
+   376→  const domain = []
+   377→  for (let i = 0; i < usable.length - 1; i++) domain.push('|')
+   378→  for (const f of usable) domain.push([f, 'ilike', phone])
+   379→  return domain
+   380→}
+   381→
+   382→async function odooRead(model, ids, fields = []) {
+   383→  const safeFields = fields.length > 0 ? await filterExistingFields(model, fields) : []
+   384→  return odooExecuteKw(model, 'read', [ids], {
+   385→    fields: safeFields.length > 0 ? safeFields : undefined,
+   386→  })
+   387→}
+   388→
+   389→async function odooCreate(model, values) {
+   390→  const safeValues = await buildSafeValues(model, values)
+   391→  return odooExecuteKw(model, 'create', [safeValues])
+   392→}
+   393→
+   394→async function odooWrite(model, ids, values) {
+   395→  const safeValues = await buildSafeValues(model, values)
+   396→  return odooExecuteKw(model, 'write', [ids, safeValues])
+   397→}
+   398→
+   399→async function odooSearchOrCreate(model, domain, values) {
+   400→  const existing = await odooExecuteKw(model, 'search', [domain], { limit: 1 })
+   401→  if (existing && existing.length > 0) {
+   402→    const safeValues = await buildSafeValues(model, values)
+   403→    await odooWrite(model, existing, safeValues)
+   404→    return { id: existing[0], created: false }
+   405→  }
+   406→  const safeValues = await buildSafeValues(model, values)
+   407→  const newId = await odooCreate(model, safeValues)
+   408→  return { id: newId, created: true }
+   409→}
+   410→
+   411→async function odooPostMessage(model, recordId, message) {
+   412→  return odooExecuteKw(model, 'message_post', [recordId], {
+   413→    body: message,
+   414→    message_type: 'comment',
+   415→    subtype_xmlid: 'mail.mt_comment',
+   416→  })
+   417→}
+   418→
+   419→async function findWhatsAppActivityType() {
+   420→  try {
+   421→    const types = await odooExecuteKw('mail.activity.type', 'search_read', [[['name', 'ilike', 'WhatsApp']]], { fields: ['id', 'name'], limit: 1 })
+   422→    if (types && types.length > 0) return types[0].id
+   423→  } catch {}
+   424→  return null
+   425→}
+   426→
+   427→async function odooCreateActivity(model, recordId, summary, note) {
+   428→  try {
+   429→    const activityTypeId = await findWhatsAppActivityType()
+   430→    const values = {
+   431→      res_model: model,
+   432→      res_id: recordId,
+   433→      summary,
+   434→      note,
+   435→      activity_type_id: activityTypeId || 1,
+   436→    }
+   437→    if (autoSyncSettings.leadUserId) values.user_id = autoSyncSettings.leadUserId
+   438→    return await odooExecuteKw('mail.activity', 'create', [values])
+   439→  } catch (error) {
+   440→    console.error(`[Odoo] Failed to create activity:`, error.message)
+   441→    return 0
+   442→  }
+   443→}
+   444→
+   445→function escapeHtml(text) {
+   446→  return String(text || '')
+   447→    .replace(/&/g, '&amp;')
+   448→    .replace(/</g, '&lt;')
+   449→    .replace(/>/g, '&gt;')
+   450→    .replace(/\n/g, '<br/>')
+   451→}
+   452→
+   453→// v7.19: Build a plain-text transcript of the WhatsApp conversation that will
+   454→// be written to the `description` field (Notes) of the CRM lead/opportunity.
+   455→// Format is human-readable, chronological, with direction + date + text per line.
+   456→// Returns an empty string if there are no messages.
+   457→function buildConversationTranscript(messages) {
+   458→  if (!Array.isArray(messages) || messages.length === 0) return ''
+   459→
+   460→  const sorted = [...messages].sort(
+   461→    (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+   462→  )
+   463→
+   464→  const lines = sorted.map((m) => {
+   465→    const direction = m.fromMe ? 'Eu' : 'Contato'
+   466→    const dateLabel = new Date(m.timestamp).toLocaleString('pt-BR')
+   467→    const mediaLabel = m.mediaType ? ` [${m.mediaType}]` : ''
+   468→    const text = m.textContent && m.textContent.trim()
+   469→      ? m.textContent
+   470→      : '[Mídia]'
+   471→    return `[${dateLabel}] ${direction}${mediaLabel}: ${text}`
+   472→  })
+   473→
+   474→  return `Conversa WhatsApp:\n${lines.join('\n')}`
+   475→}
+   476→
+   477→async function autoSyncWhatsAppMessage(data) {
+   478→  const result = {
+   479→    partnerId: null, leadId: null, mailMessageId: null, activityId: null,
+   480→    created: { partner: false, lead: false }, errors: [],
+   481→    chatterPosted: false, chatterLeadPosted: false,
+   482→  }
+   483→
+   484→  // v7.17: Detailed skip logging — when lead creation silently fails, we need
+   485→  // to know WHY. This was the root cause of "Parou de Criar Leads".
+   486→  if (!autoSyncSettings.enabled) {
+   487→    console.log('[AutoSync] SKIP — autoSyncSettings.enabled is false')
+   488→    return result
+   489→  }
+   490→  if (!odooConfig.uid) {
+   491→    console.log('[AutoSync] SKIP — Odoo not authenticated (uid is null). Lead creation and chatter sync will NOT happen. Check ODOO_URL/DB/USERNAME/PASSWORD env vars.')
+   492→    return result
+   493→  }
+   494→
+   495→  // v7.14: NEVER duplicate chatter posts — check dedup set FIRST.
+   496→  // We dedup by whatsappId (or fallback id) so the same message is never posted twice.
+   497→  const dedupKey = data.dedupId
+   498→    ? `${data.jid}|${data.dedupId}`
+   499→    : `${data.jid}|${data.fromMe ? 'out' : 'in'}|${data.timestamp}|${(data.textContent || '').slice(0, 50)}`
+   500→  if (postedChatterIds.has(dedupKey)) {
+   501→    console.log(`[AutoSync] Skipping — already posted to chatter: ${dedupKey}`)
+   502→    return result
+   503→  }
+   504→
+   505→  console.log(`[AutoSync] Processing message from ${data.phone} (fromMe=${data.fromMe}, autoCreateLead=${autoSyncSettings.autoCreateLead}, autoCreateContact=${autoSyncSettings.autoCreateContact})`)
+   506→
+   507→  try {
+   508→    // ===== Step 1: Always ensure partner exists (for both sent AND received) =====
+   509→    if (autoSyncSettings.autoCreateContact) {
+   510→      const contactName = data.pushName || `WhatsApp ${data.phone}`
+   511→      // v7.20: Use buildPhoneSearchDomain to avoid the "Invalid field res.partner.mobile"
+   512→      // error on Odoo 19.4 (mobile is not directly searchable there).
+   513→      const partnerFields = await getAvailableFields('res.partner')
+   514→      const domain = await buildPhoneSearchDomain('res.partner', data.phone)
+   515→
+   516→      // Build contact values — only include fields that actually exist on the model
+   517→      const contactValues = { name: contactName, phone: data.phone }
+   518→      if (partnerFields.has('mobile')) contactValues.mobile = data.phone
+   519→      if (partnerFields.has('whatsapp')) contactValues.whatsapp = data.phone
+   520→      if (partnerFields.has('whatsapp_number')) contactValues.whatsapp_number = data.phone
+   521→
+   522→      const partnerResult = await odooSearchOrCreate('res.partner', domain, contactValues)
+   523→      result.partnerId = partnerResult.id
+   524→      result.created.partner = partnerResult.created
+   525→
+   526→      const cached = phoneToPartnerCache.get(data.phone)
+   527→      if (cached) cached.partnerId = partnerResult.id
+   528→      else phoneToPartnerCache.set(data.phone, { partnerId: partnerResult.id, leadId: null, leadCreated: false })
+   529→    }
+   530→
+   531→    // ===== Step 2: For INCOMING messages, ensure a lead exists =====
+   532→    // v7.14: Only create leads for incoming messages (new prospect reaching out).
+   533→    if (autoSyncSettings.autoCreateLead && !data.fromMe && result.partnerId) {
+   534→      const cached = phoneToPartnerCache.get(data.phone)
+   535→      if (cached && cached.leadId && cached.leadCreated) {
+   536→        result.leadId = cached.leadId
+   537→        console.log(`[AutoSync] Lead reused from cache: crm.lead#${result.leadId} (partner=${result.partnerId})`)
+   538→      } else {
+   539→        // Search for an EXISTING open lead for this partner (any name, not just our prefix)
+   540→        // — this prevents creating duplicate leads if one already exists.
+   541→        const existingLeads = await odooSearch('crm.lead', [
+   542→          ['partner_id', '=', result.partnerId],
+   543→          ['type', '=', 'lead'],
+   544→          ['active', '=', true],
+   545→        ], ['id', 'name', 'stage_id'], 1)
+   546→
+   547→        if (existingLeads && existingLeads.length > 0) {
+   548→          result.leadId = existingLeads[0].id
+   549→          if (cached) { cached.leadId = existingLeads[0].id; cached.leadCreated = true }
+   550→          else phoneToPartnerCache.set(data.phone, { partnerId: result.partnerId, leadId: existingLeads[0].id, leadCreated: true })
+   551→          console.log(`[AutoSync] Lead reused from Odoo search: crm.lead#${result.leadId} (name="${existingLeads[0].name}")`)
+   552→        } else {
+   553→          // No existing lead — create one with the WhatsApp prefix
+   554→          const leadName = `${autoSyncSettings.leadPrefix}${data.pushName || data.phone}`
+   555→          const leadValues = {
+   556→            name: leadName, type: 'lead', partner_id: result.partnerId, phone: data.phone,
+   557→            description: `Conversa iniciada via WhatsApp em ${new Date().toLocaleString('pt-BR')}`,
+   558→          }
+   559→          const leadFields = await getAvailableFields('crm.lead')
+   560→          if (leadFields.has('whatsapp_number')) leadValues.whatsapp_number = data.phone
+   561→          if (autoSyncSettings.leadTeamId) leadValues.team_id = autoSyncSettings.leadTeamId
+   562→          if (autoSyncSettings.leadUserId) leadValues.user_id = autoSyncSettings.leadUserId
+   563→
+   564→          try {
+   565→            result.leadId = await odooCreate('crm.lead', leadValues)
+   566→            result.created.lead = true
+   567→            if (cached) { cached.leadId = result.leadId; cached.leadCreated = true }
+   568→            else phoneToPartnerCache.set(data.phone, { partnerId: result.partnerId, leadId: result.leadId, leadCreated: true })
+   569→            console.log(`[AutoSync] ✓ NEW Lead created: crm.lead#${result.leadId} (name="${leadName}", partner=${result.partnerId})`)
+   570→          } catch (error) {
+   571→            console.error(`[AutoSync] ✗ Lead creation FAILED for partner ${result.partnerId}: ${error.message}`)
+   572→            result.errors.push(`Lead creation failed: ${error.message}`)
+   573→          }
+   574→        }
+   575→      }
+   576→    } else if (autoSyncSettings.autoCreateLead && data.fromMe) {
+   577→      // v7.17: Log why we're skipping lead creation for outgoing messages
+   578→      console.log(`[AutoSync] Lead creation skipped — outgoing message (fromMe=true). Leads are only created for incoming messages.`)
+   579→    }
+   580→
+   581→    // ===== Step 2.5: For OUTGOING messages, find an active lead by phone (if any) =====
+   582→    // v7.14: When user sends a message, if there's an open lead for this contact,
+   583→    // we also want to post to that lead's chatter.
+   584→    if (data.fromMe && result.partnerId) {
+   585→      // Check cache first
+   586→      let cachedLeadId = phoneToActiveLeadCache.get(data.phone)
+   587→      if (!cachedLeadId) {
+   588→        const cached = phoneToPartnerCache.get(data.phone)
+   589→        if (cached && cached.leadId && cached.leadCreated) {
+   590→          cachedLeadId = cached.leadId
+   591→        } else {
+   592→          // Search for any active lead for this partner
+   593→          const existingLeads = await odooSearch('crm.lead', [
+   594→            ['partner_id', '=', result.partnerId],
+   595→            ['type', '=', 'lead'],
+   596→            ['active', '=', true],
+   597→          ], ['id'], 1)
+   598→          if (existingLeads && existingLeads.length > 0) {
+   599→            cachedLeadId = existingLeads[0].id
+   600→            if (cached) { cached.leadId = cachedLeadId; cached.leadCreated = true }
+   601→          }
+   602→        }
+   603→        if (cachedLeadId) {
+   604→          phoneToActiveLeadCache.set(data.phone, cachedLeadId)
+   605→          result.leadId = cachedLeadId
+   606→        }
+   607→      } else {
+   608→        result.leadId = cachedLeadId
+   609→      }
+   610→    }
+   611→
+   612→    // ===== Step 3: ALWAYS post to chatter (incoming AND outgoing) =====
+   613→    // v7.14: User requested "Atualizar o chatter no contato à cada mensagem enviada/recebida"
+   614→    // We post to: (a) partner chatter ALWAYS, (b) lead chatter if there's an open lead.
+   615→    if (autoSyncSettings.autoPostMessages && result.partnerId) {
+   616→      const direction = data.fromMe ? 'Enviada' : 'Recebida'
+   617→      const mediaLabel = data.mediaType ? ` [${data.mediaType}]` : ''
+   618→      const tsLabel = `(${data.timestamp})`
+   619→      const msgBody = data.textContent
+   620→        ? `<p><strong>📱 WhatsApp ${direction}:</strong>${mediaLabel} ${tsLabel}</p><p>${escapeHtml(data.textContent)}</p>`
+   621→        : `<p><strong>📱 WhatsApp ${direction}:</strong>${mediaLabel} ${tsLabel} [Mídia]</p>`
+   622→
+   623→      // (a) Always post to partner chatter
+   624→      try {
+   625→        result.mailMessageId = await odooPostMessage('res.partner', result.partnerId, msgBody)
+   626→        result.chatterPosted = true
+   627→        console.log(`[AutoSync] ✓ Posted to partner ${result.partnerId} chatter: ${direction}`)
+   628→      } catch (error) {
+   629→        result.errors.push(`Failed to post to partner chatter: ${error.message}`)
+   630→      }
+   631→
+   632→      // (b) If there's an open lead, ALSO post to lead chatter (but only once per message)
+   633→      if (result.leadId) {
+   634→        try {
+   635→          await odooPostMessage('crm.lead', result.leadId, msgBody)
+   636→          result.chatterLeadPosted = true
+   637→          console.log(`[AutoSync] ✓ Posted to lead ${result.leadId} chatter: ${direction}`)
+   638→        } catch (error) {
+   639→          result.errors.push(`Failed to post to lead chatter: ${error.message}`)
+   640→        }
+   641→      }
+   642→    }
+   643→
+   644→    // ===== Step 4: Create activity ONLY for new leads =====
+   645→    if (autoSyncSettings.autoCreateActivity && result.created.lead && result.leadId) {
+   646→      try {
+   647→        result.activityId = await odooCreateActivity('crm.lead', result.leadId, 'Nova mensagem WhatsApp', `Contato ${data.pushName || data.phone} iniciou uma conversa via WhatsApp.\n\nMensagem: ${data.textContent || '[Mídia]'}`)
+   648→      } catch (error) {
+   649→        result.errors.push(`Failed to create activity: ${error.message}`)
+   650→      }
+   651→    }
+   652→
+   653→    // ===== Step 5: Mark this message as posted (for dedup) =====
+   654→    // Only mark if at least one chatter post succeeded
+   655→    if (result.chatterPosted || result.chatterLeadPosted) {
+   656→      postedChatterIds.add(dedupKey)
+   657→      // Cap the set size to prevent memory leak (keep last 5000 entries)
+   658→      if (postedChatterIds.size > 5000) {
+   659→        const firstKey = postedChatterIds.values().next().value
+   660→        postedChatterIds.delete(firstKey)
+   661→      }
+   662→    }
+   663→  } catch (error) {
+   664→    result.errors.push(`Auto-sync error: ${error.message}`)
+   665→    console.error(`[AutoSync] Error:`, error.message)
+   666→  }
+   667→
+   668→  return result
+   669→}
+   670→
+   671→async function autoAuthenticateFromEnv() {
+   672→  const envUrl = process.env.ODOO_URL
+   673→  const envDb = process.env.ODOO_DB
+   674→  const envUsername = process.env.ODOO_USERNAME
+   675→  const envPassword = process.env.ODOO_PASSWORD
+   676→
+   677→  if (envUrl && envDb && envUsername && envPassword) {
+   678→    console.log(`[Odoo] Auto-authenticating with env vars: ${envUrl} / ${envDb} / ${envUsername}`)
+   679→    // v7.17: Retry auth up to 3 times with 5s delay between attempts.
+   680→    // This handles transient network errors and Odoo being briefly unavailable
+   681→    // during a cold start. If all retries fail, lead creation / chatter sync
+   682→    // will be skipped silently — which is the "Parou de Criar Leads" bug.
+   683→    for (let attempt = 1; attempt <= 3; attempt++) {
+   684→      try {
+   685→        odooConfig = { url: envUrl, db: envDb, username: envUsername, password: envPassword, uid: null }
+   686→        if (attempt === 1) {
+   687→          modelFieldsCache.clear()
+   688→          phoneToPartnerCache.clear()
+   689→        }
+   690→        const uid = await odooAuthenticate()
+   691→        odooConfig.uid = uid
+   692→        console.log(`[Odoo] Auto-authenticated as ${envUsername} (uid: ${uid}) on attempt ${attempt}`)
+   693→        await getAvailableFields('res.partner')
+   694→        await getAvailableFields('crm.lead')
+   695→        io.of('/odoo').emit('odoo:status', {
+   696→          connected: true, url: odooConfig.url, db: odooConfig.db, username: odooConfig.username,
+   697→        })
+   698→        // v7.21: If WhatsApp is already connected, pull conversation history
+   699→        // from Odoo chatter now. This handles the case where WA connected
+   700→        // before Odoo auth completed (e.g. Odoo was slow on startup).
+   701→        if (waSocket && connectionState.connection === 'open') {
+   702→          console.log('[Odoo] WA is connected — scheduling Odoo history sync in 3s')
+   703→          setTimeout(() => {
+   704→            syncAllConversationsFromOdoo(io, { silent: false }).catch(err =>
+   705→              console.error('[Odoo] Post-auth history sync failed:', err.message)
+   706→            )
+   707→          }, 3000)
+   708→        }
+   709→        return // success
+   710→      } catch (error) {
+   711→        console.error(`[Odoo] Auto-auth attempt ${attempt}/3 failed: ${error.message}`)
+   712→        if (attempt < 3) {
+   713→          console.log(`[Odoo] Retrying in 5s...`)
+   714→          await new Promise(r => setTimeout(r, 5000))
+   715→        }
+   716→      }
+   717→    }
+   718→    console.error(`[Odoo] All auto-auth attempts failed. Lead creation and chatter sync will NOT work until manual auth via UI.`)
+   719→    // v7.17: Schedule a background retry every 60s until auth succeeds.
+   720→    // This handles the case where Odoo was down during startup but comes back later.
+   721→    if (!odooReauthTimer) {
+   722→      odooReauthTimer = setInterval(async () => {
+   723→        if (odooConfig.uid) {
+   724→          clearInterval(odooReauthTimer)
+   725→          odooReauthTimer = null
+   726→          return
+   727→        }
+   728→        console.log(`[Odoo] Background re-auth attempt...`)
+   729→        try {
+   730→          const uid = await odooAuthenticate()
+   731→          odooConfig.uid = uid
+   732→          console.log(`[Odoo] Background re-auth SUCCESS (uid: ${uid})`)
+   733→          await getAvailableFields('res.partner')
+   734→          await getAvailableFields('crm.lead')
+   735→          io.of('/odoo').emit('odoo:status', {
+   736→            connected: true, url: odooConfig.url, db: odooConfig.db, username: odooConfig.username,
+   737→          })
+   738→          clearInterval(odooReauthTimer)
+   739→          odooReauthTimer = null
+   740→          // v7.21: Pull Odoo chatter history now that we finally have auth
+   741→          if (waSocket && connectionState.connection === 'open') {
+   742→            console.log('[Odoo] WA is connected — scheduling Odoo history sync in 3s (post re-auth)')
+   743→            setTimeout(() => {
+   744→              syncAllConversationsFromOdoo(io, { silent: false }).catch(err =>
+   745→                console.error('[Odoo] Post re-auth history sync failed:', err.message)
+   746→              )
+   747→            }, 3000)
+   748→          }
+   749→        } catch (error) {
+   750→          console.log(`[Odoo] Background re-auth still failing: ${error.message}`)
+   751→        }
+   752→      }, 60_000)
+   753→    }
+   754→  }
+   755→}
+   756→
+   757→// ====================================================================
+   758→// WHATSAPP MODULE — In-process (Baileys)
+   759→// ====================================================================
+   760→
+   761→let waSocket = null
+   762→let connectionState = { connection: 'close' }
+   763→let hasSavedSession = fs.existsSync(path.join(AUTH_FOLDER, 'creds.json'))
+   764→let lastQrCode = null
+   765→let reconnectAttempts = 0
+   766→let watchdogTimer = null
+   767→
+   768→// Conversations store
+   769→const conversations = new Map()
+   770→const contactNames = new Map()
+   771→
+   772→// Device contacts phonebook — full list of contacts synced from device
+   773→// (even those without an existing conversation yet).
+   774→// Each entry: { jid, phone, name, avatarUrl }
+   775→const deviceContacts = new Map()
+   776→
+   777→// v7.17: Global LID → phone JID map.
+   778→// WhatsApp's new privacy format uses @lid JIDs for chats. The actual phone JID
+   779→// is recoverable from msg.key.senderPn on each message. We maintain a global
+   780→// map so that chats.upsert / chats.update / contacts.upsert events (which only
+   781→// have the LID) can be resolved to phone JIDs.
+   782→const lidToPhoneMap = new Map()
+   783→
+   784→let syncState = { isSyncing: false, progress: 0, totalChats: 0, totalContacts: 0, totalMessages: 0 }
+   785→
+   786→// v7.17: Now that all Maps are defined, load persisted conversation state.
+   787→// This restores conversations/contacts/messages from the previous run so the
+   788→// user doesn't see an empty list while Baileys reconnects and resyncs.
+   789→loadConversationsFromDisk()
+   790→
+   791→// ========== JID Normalization ==========
+   792→// Baileys can deliver JIDs in several forms:
+   793→//   5511999888777@s.whatsapp.net            — canonical DM
+   794→//   5511999888777:7@s.whatsapp.net          — DM with device suffix (multi-device send)
+   795→//   5511999888777:7:3@s.whatsapp.net        — DM with device + agent suffix
+   796→//   5511999888777@lid                        — Linked Identity (newer protocol)
+   797→// We normalize everything to canonical form: <digits>@s.whatsapp.net
+   798→function normalizeJid(jid) {
+   799→  if (!jid || typeof jid !== 'string') return null
+   800→  const atIdx = jid.indexOf('@')
+   801→  if (atIdx < 0) return null
+   802→  const server = jid.slice(atIdx + 1)
+   803→  if (server !== 's.whatsapp.net') return null
+   804→  const userCombined = jid.slice(0, atIdx)
+   805→  // Strip :device and _agent suffixes — keep only the phone digits
+   806→  const user = userCombined.split(':')[0].split('_')[0]
+   807→  if (!/^\d{7,}$/.test(user)) return null
+   808→  return `${user}@s.whatsapp.net`
+   809→}
+   810→
+   811→function isValidPhoneJid(jid) {
+   812→  return normalizeJid(jid) !== null
+   813→}
+   814→
+   815→function extractPhone(jid) {
+   816→  const normalized = normalizeJid(jid)
+   817→  return normalized ? normalized.split('@')[0] : null
+   818→}
+   819→
+   820→// Compatibility alias — many call sites use jidNormalizedUser()
+   821→function jidNormalizedUser(jid) {
+   822→  return normalizeJid(jid) || jid
+   823→}
+   824→
+   825→function getOrCreateConversation(jid, pushName) {
+   826→  // Always normalize first — Baileys may send 5511999888777:7@s.whatsapp.net
+   827→  const normalizedJid = normalizeJid(jid)
+   828→  if (!normalizedJid) return null
+   829→  const cachedName = contactNames.get(normalizedJid) || null
+   830→  const phone = extractPhone(normalizedJid)
+   831→
+   832→  if (!conversations.has(normalizedJid)) {
+   833→    conversations.set(normalizedJid, {
+   834→      jid: normalizedJid,
+   835→      name: cachedName || pushName || null,
+   836→      phone,
+   837→      pushName: pushName || null,
+   838→      avatarUrl: null,
+   839→      lastMessage: null,
+   840→      lastMessageAt: new Date(),
+   841→      unreadCount: 0,
+   842→      messages: [],
+   843→    })
+   844→  }
+   845→  const conv = conversations.get(normalizedJid)
+   846→  if (cachedName) {
+   847→    conv.name = cachedName
+   848→  } else if (pushName && !conv.name) {
+   849→    conv.pushName = pushName
+   850→  }
+   851→
+   852→  // Also track in deviceContacts phonebook (so conversations started from
+   853→  // incoming messages appear in the Contacts tab too)
+   854→  const displayName = cachedName || pushName || phone
+   855→  if (phone) {
+   856→    if (!deviceContacts.has(normalizedJid)) {
+   857→      deviceContacts.set(normalizedJid, { jid: normalizedJid, phone, name: displayName, avatarUrl: null })
+   858→    } else if (cachedName) {
+   859→      deviceContacts.get(normalizedJid).name = cachedName
+   860→    }
+   861→  }
+   862→
+   863→  return conv
+   864→}
+   865→
+   866→function serializeConversation(conv) {
+   867→  if (!conv) return null
+   868→  return {
+   869→    jid: conv.jid,
+   870→    name: conv.name,
+   871→    phone: conv.phone,
+   872→    pushName: conv.pushName,
+   873→    avatarUrl: conv.avatarUrl,
+   874→    lastMessage: conv.lastMessage,
+   875→    lastMessageAt: conv.lastMessageAt ? conv.lastMessageAt.toISOString() : null,
+   876→    unreadCount: conv.unreadCount,
+   877→    messageCount: conv.messages.length,
+   878→  }
+   879→}
+   880→
+   881→function getSortedConversations() {
+   882→  // v7.20: Restored v7.16 behavior — Conversas tab shows BOTH actual
+   883→  // conversations AND device contacts that don't have a conversation yet.
+   884→  // The user can click any device contact to start chatting immediately
+   885→  // (whatsapp:send-message creates the conversation on-the-fly via
+   886→  // getOrCreateConversation).
+   887→  //
+   888→  // v7.17 had separated these into two tabs, but that broke the UX because
+   889→  // clicking a contact in the Contatos tab would fail to open a chat view
+   890→  // (selectedConversation was null since the contact wasn't in conversations).
+   891→  // The v7.18 fix tried to work around this with an explicit start-conversation
+   892→  // flow, but that flow had its own bugs (errors when Odoo mobile field invalid,
+   893→  // race conditions, etc). Reverting to the unified list is the simplest fix.
+   894→
+   895→  // Build a set of JIDs that are already in conversations
+   896→  const conversationJids = new Set(conversations.keys())
+   897→
+   898→  // Convert device contacts (that don't have a conversation yet) into
+   899→  // conversation-like objects so they show up in the Conversas list.
+   900→  const deviceContactEntries = []
+   901→  for (const contact of deviceContacts.values()) {
+   902→    if (conversationJids.has(contact.jid)) continue
+   903→    deviceContactEntries.push({
+   904→      jid: contact.jid,
+   905→      name: contact.name,
+   906→      phone: contact.phone,
+   907→      pushName: null,
+   908→      avatarUrl: contact.avatarUrl || null,
+   909→      lastMessage: null,
+   910→      lastMessageAt: null,
+   911→      unreadCount: 0,
+   912→      messageCount: 0,
+   913→      // Custom flag — frontend can use this to show "Sem mensagens" placeholder
+   914→      _isDeviceContact: true,
+   915→    })
+   916→  }
+   917→
+   918→  return Array.from(conversations.values())
+   919→    .filter(conv => isValidPhoneJid(conv.jid))
+   920→    .map(serializeConversation)
+   921→    .filter(Boolean)
+   922→    .concat(deviceContactEntries)
+   923→    .sort((a, b) => {
+   924→      // Conversations with messages always come first
+   925→      const tA = a.lastMessageAt ? new Date(a.lastMessageAt).getTime() : 0
+   926→      const tB = b.lastMessageAt ? new Date(b.lastMessageAt).getTime() : 0
+   927→      if (tA === 0 && tB === 0) {
+   928→        // Both are device contacts without messages — sort by name
+   929→        return (a.name || a.phone || '').localeCompare(b.name || b.phone || '')
+   930→      }
+   931→      return tB - tA
+   932→    })
+   933→}
+   934→
+   935→function updateConversationName(jid, contactName) {
+   936→  const normalizedJid = normalizeJid(jid)
+   937→  if (!normalizedJid) return
+   938→  contactNames.set(normalizedJid, contactName)
+   939→  // Also track in deviceContacts phonebook
+   940→  const phone = extractPhone(normalizedJid)
+   941→  const existing = deviceContacts.get(normalizedJid)
+   942→  if (existing) {
+   943→    existing.name = contactName
+   944→  } else if (phone) {
+   945→    deviceContacts.set(normalizedJid, { jid: normalizedJid, phone, name: contactName, avatarUrl: null })
+   946→  }
+   947→  const conv = conversations.get(normalizedJid)
+   948→  if (conv) conv.name = contactName
+   949→}
+   950→
+   951→// Normalize a phone number (strip non-digits) to a WhatsApp JID
+   952→function normalizePhoneToJid(phone) {
+   953→  if (!phone) return null
+   954→  const digits = String(phone).replace(/\D/g, '')
+   955→  if (digits.length < 7) return null
+   956→  return `${digits}@s.whatsapp.net`
+   957→}
+   958→
+   959→// Serialize device contacts list (sorted by name)
+   960→function getDeviceContactsList() {
+   961→  return Array.from(deviceContacts.values())
+   962→    .sort((a, b) => (a.name || '').localeCompare(b.name || ''))
+   963→}
+   964→
+   965→// v7.17: Extract a display name from a message's pushName field
+   966→// (used when creating a conversation from a history-sync message that
+   967→// arrived before its chat was processed)
+   968→function pushNameFallback(msg) {
+   969→  return msg?.pushName || null
+   970→}
+   971→
+   972→// Strip HTML tags from a string (used to convert Odoo chatter HTML to plain text)
+   973→function stripHtml(html) {
+   974→  if (!html) return ''
+   975→  let text = String(html)
+   976→    .replace(/<br\s*\/?>/gi, '\n')
+   977→    .replace(/<\/p>/gi, '\n')
+   978→    .replace(/<p[^>]*>/gi, '')
+   979→    .replace(/<[^>]+>/g, '')
+   980→    .replace(/&nbsp;/g, ' ')
+   981→    .replace(/&amp;/g, '&')
+   982→    .replace(/&lt;/g, '<')
+   983→    .replace(/&gt;/g, '>')
+   984→    .replace(/&quot;/g, '"')
+   985→    .replace(/&#39;/g, "'")
+   986→    .trim()
+   987→  text = text.replace(/\n{3,}/g, '\n\n')
+   988→  return text
+   989→}
+   990→
+   991→// Fetch chatter messages from Odoo (mail.message) and merge them into a conversation.
+   992→// Returns the number of messages added. Used by "start conversation from Odoo"
+   993→// and by the "Pull from Odoo" button.
+   994→async function pullOdooChatterIntoConversation(jid, model, recordId, limit = 200) {
+   995→  if (!odooConfig.uid) return 0
+   996→  if (!isValidPhoneJid(jid)) return 0
+   997→  const conv = conversations.get(jid)
+   998→  if (!conv) return 0
+   999→
+  1000→  try {
+  1001→    const domain = [
+  1002→      ['model', '=', model],
+  1003→      ['res_id', '=', recordId],
+  1004→    ]
+  1005→    const messages = await odooExecuteKw('mail.message', 'search_read', [domain], {
+  1006→      fields: ['id', 'body', 'author_id', 'email_from', 'date', 'message_type', 'subtype_id', 'create_date'],
+  1007→      order: 'date asc',
+  1008→      limit,
+  1009→    })
+  1010→
+  1011→    let added = 0
+  1012→    for (const msg of (messages || [])) {
+  1013→      const body = msg.body || ''
+  1014→      const plainText = stripHtml(body)
+  1015→      // Detect direction from "Enviada" / "Recebida" markers we wrote earlier
+  1016→      const isSent = /WhatsApp\s+Enviada/i.test(body)
+  1017→      const fromMe = isSent
+  1018→
+  1019→      // Extract timestamp — prefer date in body parentheses, fall back to msg.date
+  1020→      let timestamp
+  1021→      const dateMatch = body.match(/\(([^)]+)\)/)
+  1022→      if (dateMatch) {
+  1023→        const parsed = new Date(dateMatch[1])
+  1024→        if (!isNaN(parsed.getTime())) timestamp = parsed
+  1025→      }
+  1026→      if (!timestamp) timestamp = new Date(msg.date || msg.create_date || Date.now())
+  1027→
+  1028→      // Dedup by externalId
+  1029→      const externalId = `odoo-${msg.id}`
+  1030→      if (conv.messages.some(m => m.whatsappId === externalId)) continue
+  1031→      // Dedup by content + timestamp window
+  1032→      const isDup = conv.messages.some(m =>
+  1033→        m.fromMe === fromMe &&
+  1034→        m.textContent === plainText &&
+  1035→        Math.abs(m.timestamp.getTime() - timestamp.getTime()) < 5000
+  1036→      )
+  1037→      if (isDup) continue
+  1038→
+  1039→      conv.messages.push({
+  1040→        id: externalId,
+  1041→        whatsappId: externalId,
+  1042→        fromMe,
+  1043→        textContent: plainText || null,
+  1044→        mediaType: null,
+  1045→        timestamp,
+  1046→        status: 'delivered',
+  1047→      })
+  1048→      added++
+  1049→    }
+  1050→
+  1051→    if (added > 0) {
+  1052→      // Sort messages by timestamp
+  1053→      conv.messages.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime())
+  1054→      // Update lastMessage if needed
+  1055→      const last = conv.messages[conv.messages.length - 1]
+  1056→      if (!conv.lastMessageAt || last.timestamp > conv.lastMessageAt) {
+  1057→        conv.lastMessageAt = last.timestamp
+  1058→        if (last.textContent) conv.lastMessage = last.textContent
+  1059→      }
+  1060→    }
+  1061→    return added
+  1062→  } catch (err) {
+  1063→    console.error(`[Odoo] Chatter pull failed for ${model}#${recordId}:`, err.message)
+  1064→    return 0
+  1065→  }
+  1066→}
+  1067→
+  1068→// ====================================================================
+  1069→// v7.21: syncAllConversationsFromOdoo()
+  1070→// ---------------------------------------------------------------
+  1071→// Called automatically when:
+  1072→//   (a) WhatsApp reconnects (8s delay after 'open')
+  1073→//   (b) Odoo auto-auth succeeds (if WA is already connected)
+  1074→//   (c) Manually via the 'odoo:sync-all-history' socket endpoint
+  1075→//
+  1076→// The Odoo chatter is the "source of truth" for conversation history.
+  1077→// On every reconnect/redeploy, we scan all mail.message records that
+  1078→// were posted by us (body contains "WhatsApp" + our direction marker),
+  1079→// group them by res.partner, and pull each partner's chatter into the
+  1080→// corresponding local conversation (creating the conversation if it
+  1081→// doesn't exist yet).
+  1082→//
+  1083→// This makes the conversation history survive:
+  1084→//   - Render redeployments (process restart)
+  1085→//   - WA disconnect/reconnect (network issue, phone offline)
+  1086→//   - Disk wipe (conversation-state.json missing or stale)
+  1087→// The Odoo chatter remains the durable store.
+  1088→//
+  1089→// Returns: { partnersProcessed, messagesAdded, partnersFailed }
+  1090→// ====================================================================
+  1091→let odooHistorySyncInProgress = false
+  1092→let odooHistorySyncLastRun = null
+  1093→
+  1094→async function syncAllConversationsFromOdoo(io, opts = {}) {
+  1095→  const { silent = false, limit = 1000 } = opts
+  1096→
+  1097→  if (!odooConfig.uid) {
+  1098→    if (!silent) console.log('[OdooSync] SKIP — Odoo not authenticated yet')
+  1099→    return { skipped: true, reason: 'not_authenticated' }
+  1100→  }
+  1101→  if (odooHistorySyncInProgress) {
+  1102→    if (!silent) console.log('[OdooSync] SKIP — another sync is already running')
+  1103→    return { skipped: true, reason: 'already_running' }
+  1104→  }
+  1105→
+  1106→  odooHistorySyncInProgress = true
+  1107→  const startedAt = Date.now()
+  1108→  if (io) {
+  1109→    io.of('/whatsapp').emit('whatsapp:odoo-sync-progress', {
+  1110→      phase: 'starting', total: 0, processed: 0, added: 0, failed: 0,
+  1111→    })
+  1112→  }
+  1113→
+  1114→  try {
+  1115→    // ===== Step 1: Find all mail.message records we posted to res.partner chatter =====
+  1116→    // We search by body containing "WhatsApp" (our marker — every message we post
+  1117→    // includes "<strong> 📱 WhatsApp Enviada:" or "Recebida:"). This avoids
+  1118→    // pulling notes/activities posted by users manually in Odoo.
+  1119→    console.log(`[OdooSync] Scanning mail.message for WhatsApp chatter (limit=${limit})...`)
+  1120→    const domain = [
+  1121→      ['model', '=', 'res.partner'],
+  1122→      ['body', 'ilike', 'WhatsApp'],
+  1123→    ]
+  1124→    const messages = await odooExecuteKw('mail.message', 'search_read', [domain], {
+  1125→      fields: ['id', 'res_id', 'body', 'date', 'create_date'],
+  1126→      order: 'date asc',
+  1127→      limit,
+  1128→    })
+  1129→
+  1130→    if (!messages || messages.length === 0) {
+  1131→      console.log('[OdooSync] No WhatsApp chatter messages found in Odoo')
+  1132→      odooHistorySyncLastRun = { at: new Date().toISOString(), partnersProcessed: 0, messagesAdded: 0, partnersFailed: 0, durationMs: Date.now() - startedAt }
+  1133→      if (io) {
+  1134→        io.of('/whatsapp').emit('whatsapp:odoo-sync-progress', {
+  1135→          phase: 'complete', total: 0, processed: 0, added: 0, failed: 0,
+  1136→        })
+  1137→      }
+  1138→      return { partnersProcessed: 0, messagesAdded: 0, partnersFailed: 0 }
+  1139→    }
+  1140→
+  1141→    // ===== Step 2: Group by partner ID (res_id) =====
+  1142→    const partnerIds = [...new Set(messages.map(m => m.res_id).filter(id => typeof id === 'number' && id > 0))]
+  1143→    console.log(`[OdooSync] Found ${messages.length} chatter messages across ${partnerIds.length} partners`)
+  1144→
+  1145→    if (io) {
+  1146→      io.of('/whatsapp').emit('whatsapp:odoo-sync-progress', {
+  1147→        phase: 'fetching_partners', total: partnerIds.length, processed: 0, added: 0, failed: 0,
+  1148→      })
+  1149→    }
+  1150→
+  1151→    // ===== Step 3: Read partner phone fields =====
+  1152→    // We read whichever phone-like fields exist on res.partner (detected dynamically
+  1153→    // to avoid the Odoo 19.4 "Invalid field res.partner.mobile" error).
+  1154→    const partnerFields = await getAvailableFields('res.partner')
+  1155→    const readFields = ['id', 'name']
+  1156→    if (partnerFields.has('phone')) readFields.push('phone')
+  1157→    if (partnerFields.has('mobile')) readFields.push('mobile')
+  1158→    if (partnerFields.has('whatsapp')) readFields.push('whatsapp')
+  1159→    if (partnerFields.has('whatsapp_number')) readFields.push('whatsapp_number')
+  1160→
+  1161→    const partners = await odooExecuteKw('res.partner', 'read', [partnerIds], { fields: readFields })
+  1162→    const partnerMap = new Map()
+  1163→    for (const p of (partners || [])) partnerMap.set(p.id, p)
+  1164→
+  1165→    // ===== Step 4: For each partner, find/create local conversation + pull chatter =====
+  1166→    let processed = 0
+  1167→    let totalAdded = 0
+  1168→    let failed = 0
+  1169→    for (const partnerId of partnerIds) {
+  1170→      const p = partnerMap.get(partnerId)
+  1171→      if (!p) { failed++; continue }
+  1172→
+  1173→      // Pick the first non-empty phone-like field
+  1174→      const phoneRaw = p.phone || p.mobile || p.whatsapp || p.whatsapp_number || ''
+  1175→      const phoneDigits = String(phoneRaw).replace(/\D/g, '')
+  1176→      if (phoneDigits.length < 7) {
+  1177→        console.log(`[OdooSync] Partner ${partnerId} (${p.name || '?'}) has no valid phone — skipping`)
+  1178→        failed++
+  1179→        continue
+  1180→      }
+  1181→
+  1182→      // Build the WhatsApp JID from the phone digits
+  1183→      const jid = `${phoneDigits}@s.whatsapp.net`
+  1184→      if (!isValidPhoneJid(jid)) {
+  1185→        console.log(`[OdooSync] Partner ${partnerId} phone "${phoneRaw}" → invalid JID — skipping`)
+  1186→        failed++
+  1187→        continue
+  1188→      }
+  1189→
+  1190→      // Find or create the local conversation
+  1191→      let conv = conversations.get(jid)
+  1192→      if (!conv) {
+  1193→        conv = getOrCreateConversation(jid, p.name || null)
+  1194→        if (conv && p.name && !contactNames.has(jid)) {
+  1195→          contactNames.set(jid, p.name)
+  1196→          conv.name = p.name
+  1197→        }
+  1198→      } else if (p.name && !conv.name) {
+  1199→        conv.name = p.name
+  1200→        if (!contactNames.has(jid)) contactNames.set(jid, p.name)
+  1201→      }
+  1202→
+  1203→      if (!conv) { failed++; continue }
+  1204→
+  1205→      // Pull the chatter (this function already dedupes by externalId + content+timestamp)
+  1206→      try {
+  1207→        const added = await pullOdooChatterIntoConversation(jid, 'res.partner', partnerId, 500)
+  1208→        totalAdded += added
+  1209→        processed++
+  1210→        if (added > 0) {
+  1211→          console.log(`[OdooSync] ✓ Partner ${partnerId} (${p.name || phoneDigits}): +${added} messages`)
+  1212→        }
+  1213→      } catch (err) {
+  1214→        console.error(`[OdooSync] Partner ${partnerId} pull failed: ${err.message}`)
+  1215→        failed++
+  1216→      }
+  1217→
+  1218→      // Notify frontend of the link
+  1219→      if (io) {
+  1220→        io.of('/odoo').emit('odoo:conversation:linked', { jid, model: 'res.partner', recordId: partnerId })
+  1221→      }
+  1222→
+  1223→      // Throttle to avoid hammering Odoo (rate-limit safe)
+  1224→      await new Promise(r => setTimeout(r, 50))
+  1225→
+  1226→      // Progress update every 5 partners
+  1227→      if (io && processed % 5 === 0) {
+  1228→        io.of('/whatsapp').emit('whatsapp:odoo-sync-progress', {
+  1229→          phase: 'processing', total: partnerIds.length, processed, added: totalAdded, failed,
+  1230→        })
+  1231→      }
+  1232→    }
+  1233→
+  1234→    // ===== Step 5: Sort all affected conversations + emit final update =====
+  1235→    for (const [, conv] of conversations) {
+  1236→      conv.messages.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime())
+  1237→    }
+  1238→
+  1239→    markConversationsDirty()
+  1240→    if (io) {
+  1241→      io.of('/whatsapp').emit('whatsapp:conversations', getSortedConversations())
+  1242→      io.of('/whatsapp').emit('whatsapp:odoo-sync-progress', {
+  1243→        phase: 'complete', total: partnerIds.length, processed, added: totalAdded, failed,
+  1244→      })
+  1245→    }
+  1246→
+  1247→    const durationMs = Date.now() - startedAt
+  1248→    odooHistorySyncLastRun = { at: new Date().toISOString(), partnersProcessed: processed, messagesAdded: totalAdded, partnersFailed: failed, durationMs }
+  1249→    console.log(`[OdooSync] ✓ DONE in ${durationMs}ms — partners processed: ${processed}, messages added: ${totalAdded}, failed: ${failed}`)
+  1250→    return { partnersProcessed: processed, messagesAdded: totalAdded, partnersFailed: failed }
+  1251→  } catch (err) {
+  1252→    console.error(`[OdooSync] FAILED:`, err.message)
+  1253→    if (io) {
+  1254→      io.of('/whatsapp').emit('whatsapp:odoo-sync-progress', {
+  1255→        phase: 'error', error: err.message,
+  1256→      })
+  1257→    }
+  1258→    return { error: err.message }
+  1259→  } finally {
+  1260→    odooHistorySyncInProgress = false
+  1261→  }
+  1262→}
+  1263→
+  1264→// Load Baileys lazily — only after app.prepare()
+  1265→let baileysModule = null
+  1266→async function loadBaileys() {
+  1267→  if (baileysModule) return baileysModule
+  1268→  baileysModule = await import('@whiskeysockets/baileys')
+  1269→  return baileysModule
+  1270→}
+  1271→
+  1272→async function connectWhatsApp(io) {
+  1273→  const baileys = await loadBaileys()
+  1274→  const {
+  1275→    makeWASocket,
+  1276→    useMultiFileAuthState,
+  1277→    DisconnectReason,
+  1278→    fetchLatestBaileysVersion,
+  1279→    makeCacheableSignalKeyStore,
+  1280→    Browsers,
+  1281→  } = baileys
+  1282→  const { Boom } = await import('@hapi/boom')
+  1283→  const P = (await import('pino')).default
+  1284→  const logger = P({ level: 'silent' })
+  1285→
+  1286→  const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER)
+  1287→  const { version } = await fetchLatestBaileysVersion()
+  1288→
+  1289→  waSocket = makeWASocket({
+  1290→    version,
+  1291→    logger,
+  1292→    auth: {
+  1293→      creds: state.creds,
+  1294→      keys: makeCacheableSignalKeyStore(state.keys, logger),
+  1295→    },
+  1296→    browser: Browsers.ubuntu('Chrome'),
+  1297→    printQRInTerminal: false,
+  1298→    connectTimeoutMs: 90_000,
+  1299→    defaultQueryTimeoutMs: 60_000,
+  1300→    keepAliveIntervalMs: 10_000,
+  1301→    markOnlineOnConnect: true,
+  1302→    syncFullHistory: false,
+  1303→    retryRequestDelayMs: 250,
+  1304→    maxMsgRetryCount: 5,
+  1305→    shouldIgnoreJid: (jid) => jid === 'status@broadcast',
+  1306→  })
+  1307→
+  1308→  waSocket.ev.on('creds.update', saveCreds)
+  1309→
+  1310→  waSocket.ev.on('connection.update', async (update) => {
+  1311→    const { connection, lastDisconnect, qr } = update
+  1312→    connectionState = { connection }
+  1313→    console.log(`[WA] Connection update: ${connection}`)
+  1314→
+  1315→    if (qr) {
+  1316→      lastQrCode = qr
+  1317→      console.log('[WA] QR Code generated, sending to clients')
+  1318→      io.of('/whatsapp').emit('whatsapp:qr', { qr })
+  1319→      hasSavedSession = false
+  1320→    }
+  1321→
+  1322→    if (connection === 'close') {
+  1323→      const statusCode = (lastDisconnect?.error)?.output?.statusCode
+  1324→      const shouldReconnect = statusCode !== DisconnectReason.loggedOut
+  1325→      console.log(`[WA] Connection closed. Status: ${statusCode}, Reconnect: ${shouldReconnect}`)
+  1326→
+  1327→      if (statusCode === DisconnectReason.loggedOut) {
+  1328→        hasSavedSession = false
+  1329→        lastQrCode = null
+  1330→        conversations.clear()
+  1331→        contactNames.clear()
+  1332→        deviceContacts.clear()
+  1333→        lidToPhoneMap.clear()
+  1334→        postedChatterIds.clear()
+  1335→        phoneToActiveLeadCache.clear()
+  1336→        // v7.17: Also clear the persisted state so we don't reload stale data on restart
+  1337→        try { if (fs.existsSync(CONV_STATE_FILE)) fs.unlinkSync(CONV_STATE_FILE) } catch {}
+  1338→        io.of('/whatsapp').emit('whatsapp:conversations', [])
+  1339→      }
+  1340→
+  1341→      io.of('/whatsapp').emit('whatsapp:status', {
+  1342→        connected: false,
+  1343→        reason: statusCode === DisconnectReason.loggedOut ? 'logged_out' : 'reconnecting',
+  1344→        hasSession: hasSavedSession,
+  1345→      })
+  1346→
+  1347→      if (shouldReconnect) {
+  1348→        reconnectAttempts++
+  1349→        const delay = Math.min(2000 * Math.pow(2, reconnectAttempts - 1), 30000)
+  1350→        console.log(`[WA] Reconnecting in ${delay}ms (attempt ${reconnectAttempts})...`)
+  1351→        setTimeout(() => connectWhatsApp(io), delay)
+  1352→      }
+  1353→    }
+  1354→
+  1355→    if (connection === 'open') {
+  1356→      console.log('[WA] Connected successfully!')
+  1357→      hasSavedSession = true
+  1358→      reconnectAttempts = 0
+  1359→      lastQrCode = null
+  1360→      io.of('/whatsapp').emit('whatsapp:status', { connected: true, hasSession: true })
+  1361→
+  1362→      if (watchdogTimer) clearInterval(watchdogTimer)
+  1363→      watchdogTimer = setInterval(() => {
+  1364→        try {
+  1365→          if (!waSocket || connectionState.connection !== 'open') {
+  1366→            console.log('[WA Watchdog] Connection not open, forcing reconnect...')
+  1367→            try { waSocket?.end(undefined) } catch {}
+  1368→            waSocket = null
+  1369→            connectionState = { connection: 'close' }
+  1370→            reconnectAttempts++
+  1371→            const delay = Math.min(2000 * Math.pow(2, reconnectAttempts - 1), 30000)
+  1372→            setTimeout(() => connectWhatsApp(io), delay)
+  1373→            return
+  1374→          }
+  1375→          const state = waSocket.ws?.readyState
+  1376→          if (state === 3 || state === 2) {
+  1377→            console.log('[WA Watchdog] WebSocket dead, forcing reconnect...')
+  1378→            try { waSocket.end(undefined) } catch {}
+  1379→            waSocket = null
+  1380→            connectionState = { connection: 'close' }
+  1381→            reconnectAttempts++
+  1382→            const delay = Math.min(2000 * Math.pow(2, reconnectAttempts - 1), 30000)
+  1383→            setTimeout(() => connectWhatsApp(io), delay)
+  1384→          }
+  1385→        } catch (err) {
+  1386→          console.log('[WA Watchdog] Error:', err.message)
+  1387→        }
+  1388→      }, 60_000)
+  1389→
+  1390→      try {
+  1391→        const meId = waSocket.user?.id
+  1392→        if (meId) {
+  1393→          const profilePicUrl = await waSocket.profilePictureUrl(meId, 'image').catch(() => null)
+  1394→          io.of('/whatsapp').emit('whatsapp:me', { id: meId, name: waSocket.user?.name, profilePicUrl })
+  1395→        }
+  1396→      } catch {}
+  1397→
+  1398→      markConversationsDirty(); io.of('/whatsapp').emit('whatsapp:conversations', getSortedConversations())
+  1399→
+  1400→      // v7.16: Auto-resync app state 3s after connection to restore
+  1401→      // contacts/conversations that were lost from memory after a deploy
+  1402→      // or process restart. Baileys doesn't always fire messaging-history.set
+  1403→      // on reconnect, so we force it. This addresses "sumiu sincronização
+  1404→      // de contato e conversa do aparelho" after deploys.
+  1405→      setTimeout(() => {
+  1406→        try {
+  1407→          if (waSocket && connectionState.connection === 'open' &&
+  1408→              typeof waSocket.resyncAppState === 'function') {
+  1409→            console.log('[WA] Auto-resyncing app state after connection (restore contacts/conversations)')
+  1410→            waSocket.resyncAppState(
+  1411→              ['critical_block', 'critical_unblock_low', 'regular_high', 'regular_low', 'regular'],
+  1412→              false
+  1413→            ).then(() => console.log('[WA] Auto-resync complete')).catch(err =>
+  1414→              console.error('[WA] Auto-resync error:', err.message)
+  1415→            )
+  1416→          }
+  1417→        } catch (err) {
+  1418→          console.error('[WA] Auto-resync trigger failed:', err.message)
+  1419→        }
+  1420→      }, 3000)
+  1421→
+  1422→      // v7.21: 8s after WA connects, pull all conversation history from Odoo
+  1423→      // chatter. This is the "reconnect brings back history" feature — the
+  1424→      // Odoo chatter is our durable conversation database, so every time the
+  1425→      // middleware restarts (deploy, crash, network glitch), we rebuild the
+  1426→      // local conversation state from Odoo. See syncAllConversationsFromOdoo()
+  1427→      // above for details. The 8s delay gives Odoo auto-auth time to complete
+  1428→      // and gives the WA resyncAppState time to start.
+  1429→      setTimeout(() => {
+  1430→        if (waSocket && connectionState.connection === 'open') {
+  1431→          console.log('[WA] Triggering Odoo chatter history sync (reconnect restore)')
+  1432→          syncAllConversationsFromOdoo(io, { silent: false }).catch(err =>
+  1433→            console.error('[WA] Odoo history sync failed:', err.message)
+  1434→          )
+  1435→        }
+  1436→      }, 8000)
+  1437→    }
+  1438→  })
+  1439→
+  1440→  waSocket.ev.on('messaging-history.set', async ({ chats, contacts, messages, isLatest, progress, syncType }) => {
+  1441→    console.log(`[WA] History sync: progress=${progress}%, chats=${chats.length}, contacts=${Object.keys(contacts).length}, messages=${messages.length}`)
+  1442→
+  1443→    syncState.isSyncing = true
+  1444→    syncState.progress = progress || 0
+  1445→    io.of('/whatsapp').emit('whatsapp:sync-progress', {
+  1446→      isSyncing: true, progress: progress || 0, phase: syncType || 'historical',
+  1447→      chatsCount: chats.length, contactsCount: Object.keys(contacts).length,
+  1448→    })
+  1449→
+  1450→    // v7.17: FIRST PASS — Build a LID → phone JID map from messages.
+  1451→    // WhatsApp's new privacy format sends chat IDs as @lid (Linked Identity Device).
+  1452→    // The actual phone JID is in msg.key.senderPn for each message.
+  1453→    // We scan all messages first to build this map, then use it to resolve
+  1454→    // LID chats to phone JIDs so active conversations appear in the Conversas list.
+  1455→    const lidToPhone = new Map()
+  1456→    for (const msg of messages) {
+  1457→      if (!msg.key) continue
+  1458→      const rawJid = msg.key.remoteJid
+  1459→      if (rawJid && rawJid.endsWith('@lid')) {
+  1460→        const phoneCandidate = msg.key.senderPn || msg.key.participant
+  1461→        if (phoneCandidate) {
+  1462→          const normalized = normalizeJid(phoneCandidate)
+  1463→          if (normalized) {
+  1464→            lidToPhone.set(rawJid, normalized)
+  1465→            // v7.17: Also populate the global map for later events
+  1466→            lidToPhoneMap.set(rawJid, normalized)
+  1467→          }
+  1468→        }
+  1469→      }
+  1470→    }
+  1471→    if (lidToPhone.size > 0) {
+  1472→      console.log(`[WA] Built LID→phone map: ${lidToPhone.size} entries`)
+  1473→    }
+  1474→
+  1475→    let validContactsCount = 0
+  1476→    for (const [rawJid, contact] of Object.entries(contacts)) {
+  1477→      // v7.17: Resolve LID contact JIDs to phone JIDs using our map
+  1478→      let jid = normalizeJid(rawJid)
+  1479→      if (!jid && rawJid && rawJid.endsWith('@lid')) {
+  1480→        jid = lidToPhone.get(rawJid) || null
+  1481→      }
+  1482→      if (jid && contact?.name) {
+  1483→        contactNames.set(jid, contact.name)
+  1484→        // Also populate deviceContacts phonebook so phone contacts show up
+  1485→        const phone = extractPhone(jid)
+  1486→        if (phone) {
+  1487→          const existing = deviceContacts.get(jid)
+  1488→          if (existing) existing.name = contact.name
+  1489→          else deviceContacts.set(jid, { jid, phone, name: contact.name, avatarUrl: null })
+  1490→        }
+  1491→        validContactsCount++
+  1492→      }
+  1493→    }
+  1494→    syncState.totalContacts = validContactsCount
+  1495→
+  1496→    let chatsProcessed = 0
+  1497→    let lidChatsResolved = 0
+  1498→    for (const chat of chats) {
+  1499→      // v7.17: Resolve LID chat IDs to phone JIDs
+  1500→      let jid = normalizeJid(chat.id)
+  1501→      if (!jid && chat.id && chat.id.endsWith('@lid')) {
+  1502→        jid = lidToPhone.get(chat.id) || null
+  1503→        if (jid) lidChatsResolved++
+  1504→      }
+  1505→      if (!jid) continue
+  1506→      const contactName = contactNames.get(jid) || null
+  1507→      if (!conversations.has(jid)) {
+  1508→        conversations.set(jid, {
+  1509→          jid, name: contactName, phone: extractPhone(jid),
+  1510→          pushName: null, avatarUrl: null, lastMessage: null,
+  1511→          lastMessageAt: chat.t ? new Date(chat.t * 1000) : null,
+  1512→          unreadCount: chat.unreadCount || 0, messages: [],
+  1513→        })
+  1514→      } else {
+  1515→        const conv = conversations.get(jid)
+  1516→        if (contactName) conv.name = contactName
+  1517→        // Update unreadCount and lastMessageAt from chat metadata if available
+  1518→        if (chat.unreadCount !== undefined) conv.unreadCount = chat.unreadCount
+  1519→        if (chat.t && (!conv.lastMessageAt || new Date(chat.t * 1000) > conv.lastMessageAt)) {
+  1520→          conv.lastMessageAt = new Date(chat.t * 1000)
+  1521→        }
+  1522→      }
+  1523→      chatsProcessed++
+  1524→    }
+  1525→    if (lidChatsResolved > 0) {
+  1526→      console.log(`[WA] Resolved ${lidChatsResolved} LID chats to phone JIDs`)
+  1527→    }
+  1528→    syncState.totalChats = chatsProcessed
+  1529→
+  1530→    let messagesProcessed = 0
+  1531→    for (const msg of messages) {
+  1532→      if (!msg.key) continue
+  1533→      // v7.16: LID recovery for history sync messages
+  1534→      const rawJid = msg.key.remoteJid
+  1535→      let jid = normalizeJid(rawJid)
+  1536→      if (!jid && rawJid && rawJid.endsWith('@lid')) {
+  1537→        // v7.17: Use the lidToPhone map first (already built), then fall back to key fields
+  1538→        jid = lidToPhone.get(rawJid) || null
+  1539→        if (!jid) {
+  1540→          const candidate = msg.key.senderPn || msg.key.participant || msg.key.senderLid
+  1541→          if (candidate) jid = normalizeJid(candidate)
+  1542→        }
+  1543→      }
+  1544→      if (!jid) continue
+  1545→
+  1546→      const fromMe = msg.key.fromMe || false
+  1547→      // Unwrap nested message types (ephemeral, viewOnce)
+  1548→      let m = msg.message
+  1549→      if (m?.ephemeralMessage?.message) m = m.ephemeralMessage.message
+  1550→      else if (m?.viewOnceMessage?.message) m = m.viewOnceMessage.message
+  1551→      else if (m?.viewOnceMessageV2?.message) m = m.viewOnceMessageV2.message
+  1552→      else if (m?.documentWithCaptionMessage?.message) m = m.documentWithCaptionMessage.message
+  1553→      if (!m) continue
+  1554→
+  1555→      const textContent =
+  1556→        m.conversation ||
+  1557→        m.extendedTextMessage?.text ||
+  1558→        m.imageMessage?.caption ||
+  1559→        m.videoMessage?.caption ||
+  1560→        m.documentMessage?.caption || null
+  1561→
+  1562→      let mediaType = null
+  1563→      if (m.imageMessage) mediaType = 'image'
+  1564→      else if (m.videoMessage) mediaType = 'video'
+  1565→      else if (m.audioMessage) mediaType = 'audio'
+  1566→      else if (m.pttMessage) mediaType = 'ptt'
+  1567→      else if (m.documentMessage) mediaType = 'document'
+  1568→      else if (m.stickerMessage) mediaType = 'sticker'
+  1569→
+  1570→      if (!textContent && !mediaType) continue
+  1571→
+  1572→      // v7.17: Create the conversation if it doesn't exist (messages may arrive
+  1573→      // before the chat is processed, especially for LID conversations)
+  1574→      let conv = conversations.get(jid)
+  1575→      if (!conv) {
+  1576→        const contactName = contactNames.get(jid) || null
+  1577→        const phone = extractPhone(jid)
+  1578→        conv = {
+  1579→          jid, name: contactName || pushNameFallback(msg), phone,
+  1580→          pushName: null, avatarUrl: null, lastMessage: null,
+  1581→          lastMessageAt: null, unreadCount: 0, messages: [],
+  1582→        }
+  1583→        conversations.set(jid, conv)
+  1584→      }
+  1585→
+  1586→      const msgId = msg.key.id
+  1587→      if (msgId && conv.messages.some(m => m.whatsappId === msgId)) continue
+  1588→
+  1589→      const messageTimestamp = new Date((msg.messageTimestamp) * 1000 || Date.now())
+  1590→      conv.messages.push({
+  1591→        id: msgId || Math.random().toString(36).substr(2, 9),
+  1592→        whatsappId: msgId || null, fromMe, textContent, mediaType,
+  1593→        timestamp: messageTimestamp, status: fromMe ? 'delivered' : 'received',
+  1594→      })
+  1595→
+  1596→      if (textContent) conv.lastMessage = textContent
+  1597→      else if (mediaType) conv.lastMessage = `[${mediaType}]`
+  1598→
+  1599→      if (!conv.lastMessageAt || messageTimestamp > conv.lastMessageAt) {
+  1600→        conv.lastMessageAt = messageTimestamp
+  1601→      }
+  1602→      messagesProcessed++
+  1603→    }
+  1604→    syncState.totalMessages = messagesProcessed
+  1605→
+  1606→    const baseTime = Date.now()
+  1607→    let offset = 0
+  1608→    for (const conv of conversations.values()) {
+  1609→      if (!conv.lastMessageAt) {
+  1610→        conv.lastMessageAt = new Date(baseTime - offset)
+  1611→        offset += 1000
+  1612→      }
+  1613→    }
+  1614→
+  1615→    if (isLatest || progress >= 100) {
+  1616→      syncState.isSyncing = false
+  1617→      syncState.progress = 100
+  1618→      io.of('/whatsapp').emit('whatsapp:sync-progress', {
+  1619→        isSyncing: false, progress: 100, phase: 'complete',
+  1620→        chatsCount: chatsProcessed, contactsCount: validContactsCount, messagesCount: messagesProcessed,
+  1621→      })
+  1622→    }
+  1623→    markConversationsDirty(); io.of('/whatsapp').emit('whatsapp:conversations', getSortedConversations())
+  1624→  })
+  1625→
+  1626→  waSocket.ev.on('messages.upsert', async ({ messages, type }) => {
+  1627→    // type can be 'notify' (new message) or 'append' (history sync)
+  1628→    console.log(`[WA] >>>>>> messages.upsert EVENT: ${messages?.length || 0} msgs (type=${type || 'n/a'}) <<<<<<`)
+  1629→    logUpsertEvent({
+  1630→      type: type || 'n/a',
+  1631→      count: messages?.length || 0,
+  1632→      ids: (messages || []).slice(0, 5).map(m => m?.key?.id || '?'),
+  1633→      jids: (messages || []).slice(0, 5).map(m => m?.key?.remoteJid || '?'),
+  1634→    })
+  1635→
+  1636→    for (const msg of messages || []) {
+  1637→      // v7.15: Per-message try/catch — one bad message shouldn't break the rest
+  1638→      try {
+  1639→        if (!msg.key) {
+  1640→          console.log('[WA] upsert msg skipped — no key')
+  1641→          continue
+  1642→        }
+  1643→
+  1644→        // *** CRITICAL: Normalize the JID ***
+  1645→        // Baileys may deliver messages with the device suffix (e.g. 5511999888777:7@s.whatsapp.net).
+  1646→        // v7.16: WhatsApp now uses LID (Linked Identity Device) JIDs (e.g. 52824423583895@lid)
+  1647→        // for privacy — the actual phone JID is in `msg.key.senderPn` ("sender phone number").
+  1648→        // Older code only checked `msg.key.participant` which is empty for DMs, causing ALL
+  1649→        // incoming DMs from LID-enabled contacts to be silently dropped.
+  1650→        const rawJid = msg.key.remoteJid
+  1651→        let jid = normalizeJid(rawJid)
+  1652→        if (!jid && rawJid && rawJid.endsWith('@lid')) {
+  1653→          // LID format — try multiple sources for the canonical phone JID,
+  1654→          // in order of reliability:
+  1655→          //   1. msg.key.senderPn  — sender phone number (set in DM LID contexts)
+  1656→          //   2. msg.key.participant — sometimes set for DMs on older Baileys builds
+  1657→          //   3. msg.key.senderLid — another LID (rarely helpful, last resort)
+  1658→          const candidate = msg.key.senderPn || msg.key.participant || msg.key.senderLid
+  1659→          if (candidate) {
+  1660→            jid = normalizeJid(candidate)
+  1661→            if (jid) {
+  1662→              const src = msg.key.senderPn ? 'senderPn' : (msg.key.participant ? 'participant' : 'senderLid')
+  1663→              console.log(`[WA] Recovered JID from ${src}: ${jid} (rawLid=${rawJid})`)
+  1664→              // v7.17: Persist this LID→phone mapping globally so that
+  1665→              // chats.upsert / chats.update / contacts.upsert events (which
+  1666→              // only have the LID) can be resolved later.
+  1667→              lidToPhoneMap.set(rawJid, jid)
+  1668→            }
+  1669→          }
+  1670→        }
+  1671→
+  1672→        const fromMe = msg.key.fromMe || false
+  1673→        const pushName = msg.pushName || null
+  1674→
+  1675→        console.log(`[WA] upsert msg: rawJid=${rawJid} → normalized=${jid} fromMe=${fromMe} id=${msg.key.id} senderPn=${msg.key.senderPn || 'n/a'} participant=${msg.key.participant || 'n/a'} pushName=${pushName || 'n/a'}`)
+  1676→
+  1677→        if (rawJid === 'status@broadcast') {
+  1678→          console.log(`[WA] upsert msg skipped — status broadcast`)
+  1679→          continue
+  1680→        }
+  1681→        // v7.15: Skip group chats too — we only handle DMs in this app
+  1682→        if (rawJid && rawJid.endsWith('@g.us')) {
+  1683→          console.log(`[WA] upsert msg skipped — group chat`)
+  1684→          continue
+  1685→        }
+  1686→        if (!jid) {
+  1687→          console.log(`[WA] upsert msg skipped — invalid JID: ${rawJid}`)
+  1688→          // v7.15: log a sample of the message so we can see what type it is
+  1689→          try {
+  1690→            const sample = JSON.stringify(msg).slice(0, 400)
+  1691→            console.log(`[WA] full msg sample:`, sample)
+  1692→            logUpsertEvent({ type: 'skipped-invalid-jid', rawJid, sample })
+  1693→          } catch {}
+  1694→          continue
+  1695→        }
+  1696→
+  1697→        const conv = getOrCreateConversation(jid, fromMe ? undefined : pushName)
+  1698→        if (!conv) {
+  1699→          console.log(`[WA] upsert msg skipped — could not create conversation for ${jid}`)
+  1700→          continue
+  1701→        }
+  1702→
+  1703→        // *** v7.15: Unwrap MORE nested message types ***
+  1704→        // - ephemeralMessage: disappearing messages
+  1705→        // - viewOnceMessage / viewOnceMessageV2: view-once messages
+  1706→        // - documentWithCaptionMessage: documents with caption
+  1707→        // - deviceSentMessage: messages sent from another linked device (echo)
+  1708→        // - editedMessage: edited messages
+  1709→        let m = msg.message
+  1710→        if (m?.ephemeralMessage?.message) m = m.ephemeralMessage.message
+  1711→        else if (m?.viewOnceMessage?.message) m = m.viewOnceMessage.message
+  1712→        else if (m?.viewOnceMessageV2?.message) m = m.viewOnceMessageV2.message
+  1713→        else if (m?.documentWithCaptionMessage?.message) m = m.documentWithCaptionMessage.message
+  1714→        else if (m?.deviceSentMessage?.message) m = m.deviceSentMessage.message
+  1715→        else if (m?.editedMessage?.message) m = m.editedMessage.message
+  1716→
+  1717→        if (!m) {
+  1718→          console.log(`[WA] upsert msg skipped — no message body (msg.message=${msg.message ? Object.keys(msg.message).join(',') : 'null'})`)
+  1719→          continue
+  1720→        }
+  1721→
+  1722→        // v7.15: Try MORE text sources — Baileys uses different fields for different message types
+  1723→        const textContent =
+  1724→          m.conversation ||
+  1725→          m.extendedTextMessage?.text ||
+  1726→          m.imageMessage?.caption ||
+  1727→          m.videoMessage?.caption ||
+  1728→          m.documentMessage?.caption ||
+  1729→          m.templateMessage?.hydratedFourRowTemplate?.hydratedContentText ||
+  1730→          m.templateMessage?.hydratedTemplate?.hydratedContentText ||
+  1731→          m.buttonsMessage?.contentText ||
+  1732→          m.listMessage?.description ||
+  1733→          m.buttonsResponseMessage?.selectedButtonId ||
+  1734→          m.listResponseMessage?.title ||
+  1735→          m.listResponseMessage?.description ||
+  1736→          m.pollCreationMessage?.name ||
+  1737→          m.pollCreationMessageV3?.name ||
+  1738→          null
+  1739→
+  1740→        let mediaType = null
+  1741→        if (m.imageMessage) mediaType = 'image'
+  1742→        else if (m.videoMessage) mediaType = 'video'
+  1743→        else if (m.audioMessage) mediaType = 'audio'
+  1744→        else if (m.pttMessage) mediaType = 'ptt'
+  1745→        else if (m.documentMessage) mediaType = 'document'
+  1746→        else if (m.stickerMessage) mediaType = 'sticker'
+  1747→
+  1748→        // Skip protocol/reaction messages with no actual content
+  1749→        if (!textContent && !mediaType) {
+  1750→          console.log(`[WA] upsert msg skipped — no text/media (msg keys: ${Object.keys(m).join(',')})`)
+  1751→          // v7.15: Log full msg JSON so we can identify unknown message types
+  1752→          try {
+  1753→            const sample = JSON.stringify(m).slice(0, 500)
+  1754→            console.log(`[WA] unknown msg sample:`, sample)
+  1755→            logUpsertEvent({ type: 'skipped-no-content', jid, keys: Object.keys(m).join(','), sample })
+  1756→          } catch {}
+  1757→          continue
+  1758→        }
+  1759→
+  1760→        const msgId = msg.key.id
+  1761→        // Dedup: skip if we already have this message by whatsappId
+  1762→        if (msgId && conv.messages.some(m => m.whatsappId === msgId || m.id === msgId)) {
+  1763→          console.log(`[WA] Skipping duplicate message ${msgId}`)
+  1764→          continue
+  1765→        }
+  1766→
+  1767→        // Robust timestamp handling — Baileys can give number (seconds) or Long object
+  1768→        let messageTimestamp
+  1769→        try {
+  1770→          const ts = typeof msg.messageTimestamp === 'number'
+  1771→            ? msg.messageTimestamp
+  1772→            : (msg.messageTimestamp?.low || msg.messageTimestamp || Math.floor(Date.now() / 1000))
+  1773→          messageTimestamp = new Date(ts * 1000)
+  1774→          if (isNaN(messageTimestamp.getTime())) messageTimestamp = new Date()
+  1775→        } catch {
+  1776→          messageTimestamp = new Date()
+  1777→        }
+  1778→
+  1779→        const messageData = {
+  1780→          id: msgId || `m-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+  1781→          whatsappId: msgId || null,
+  1782→          fromMe,
+  1783→          textContent,
+  1784→          mediaType,
+  1785→          timestamp: messageTimestamp,
+  1786→          status: fromMe ? 'delivered' : 'received',
+  1787→        }
+  1788→
+  1789→        conv.messages.push(messageData)
+  1790→        conv.lastMessage = textContent || (mediaType ? `[${mediaType}]` : '')
+  1791→        conv.lastMessageAt = new Date()
+  1792→        if (!fromMe) conv.unreadCount++
+  1793→
+  1794→        console.log(`[WA] ✓ New message stored in ${jid} fromMe=${fromMe}: ${textContent ? textContent.slice(0, 40) : `[${mediaType}]`}`)
+  1795→        logUpsertEvent({ type: 'stored', jid, fromMe, msgId, preview: (textContent || '').slice(0, 30) })
+  1796→
+  1797→        // Try to fetch profile picture in background (don't block)
+  1798→        if (!conv.avatarUrl) {
+  1799→          waSocket.profilePictureUrl(jid, 'image').then(picUrl => {
+  1800→            if (picUrl) {
+  1801→              conv.avatarUrl = picUrl
+  1802→              io.of('/whatsapp').emit('whatsapp:conversation:update', serializeConversation(conv))
+  1803→            }
+  1804→          }).catch(() => {})
+  1805→        }
+  1806→
+  1807→        // Emit to all clients — the frontend's currentJidRef will decide if it appends to the active chat
+  1808→        // *** IMPORTANT: Use the normalized JID here so the frontend can match it ***
+  1809→        markConversationsDirty(); io.of('/whatsapp').emit('whatsapp:message', {
+  1810→          conversationJid: jid,
+  1811→          message: {
+  1812→            ...messageData,
+  1813→            // Serialize timestamp to ISO string for socket transport
+  1814→            timestamp: messageTimestamp.toISOString(),
+  1815→          },
+  1816→          conversation: serializeConversation(conv),
+  1817→        })
+  1818→        io.of('/whatsapp').emit('whatsapp:conversation:update', serializeConversation(conv))
+  1819→
+  1820→        // Auto-sync to Odoo in background
+  1821→        const phone = extractPhone(jid)
+  1822→        if (phone) {
+  1823→          autoSyncWhatsAppMessage({
+  1824→            jid, phone, pushName: conv.pushName, textContent, mediaType, fromMe,
+  1825→            timestamp: messageTimestamp.toISOString(),
+  1826→            dedupId: msgId,  // v7.14: dedup key for chatter
+  1827→          }).then(result => {
+  1828→            if (result.partnerId || result.leadId) {
+  1829→              io.of('/whatsapp').emit('whatsapp:odoo-sync', {
+  1830→                jid, phone, partnerId: result.partnerId, leadId: result.leadId,
+  1831→                mailMessageId: result.mailMessageId, activityId: result.activityId,
+  1832→                created: result.created, errors: result.errors,
+  1833→              })
+  1834→            }
+  1835→          }).catch(err => console.error('[AutoSync] Error:', err.message))
+  1836→        }
+  1837→      } catch (msgErr) {
+  1838→        // v7.15: Per-message error isolation — log and continue with next message
+  1839→        console.error(`[WA] upsert msg processing error:`, msgErr.message)
+  1840→        try {
+  1841→          console.error(`[WA] failing msg sample:`, JSON.stringify(msg).slice(0, 500))
+  1842→          logUpsertEvent({ type: 'processing-error', error: msgErr.message, sample: JSON.stringify(msg).slice(0, 300) })
+  1843→        } catch {}
+  1844→      }
+  1845→    }
+  1846→  })
+  1847→
+  1848→  // Handle message status updates (sent → delivered → read)
+  1849→  // v7.14: ALSO used as a fallback to capture incoming messages that might
+  1850→  // come through `messages.update` instead of `messages.upsert` in some
+  1851→  // Baileys edge cases (e.g. when receiving from a new device).
+  1852→  waSocket.ev.on('messages.update', async (updates) => {
+  1853→    try {
+  1854→      for (const update of updates || []) {
+  1855→        if (!update.key || !update.key.id) continue
+  1856→        // v7.16: Same LID recovery logic as messages.upsert — when remoteJid is a
+  1857→        // @lid, the phone JID is in `senderPn` (or `participant` as fallback).
+  1858→        const rawJid = update.key.remoteJid
+  1859→        let jid = normalizeJid(rawJid)
+  1860→        if (!jid && rawJid && rawJid.endsWith('@lid')) {
+  1861→          const candidate = update.key.senderPn || update.key.participant || update.key.senderLid
+  1862→          if (candidate) jid = normalizeJid(candidate)
+  1863→        }
+  1864→        if (!jid) continue
+  1865→        const conv = conversations.get(jid)
+  1866→        if (!conv) continue
+  1867→
+  1868→        const existing = conv.messages.find(m => m.whatsappId === update.key.id || m.id === update.key.id)
+  1869→
+  1870→        // v7.14: If the message doesn't exist locally AND the update has a
+  1871→        // message body, treat this as a new incoming message (fallback path).
+  1872→        // This catches the edge case where `messages.upsert` doesn't fire.
+  1873→        if (!existing && update.message) {
+  1874→          console.log(`[WA] messages.update: found NEW message not in upsert — id=${update.key.id} jid=${jid}`)
+  1875→          // Process it inline (do NOT re-emit to avoid recursion)
+  1876→          try {
+  1877→            const m = update.message
+  1878→            const textContent =
+  1879→              m.conversation ||
+  1880→              m.extendedTextMessage?.text ||
+  1881→              m.imageMessage?.caption ||
+  1882→              m.videoMessage?.caption ||
+  1883→              m.documentMessage?.caption || null
+  1884→            let mediaType = null
+  1885→            if (m.imageMessage) mediaType = 'image'
+  1886→            else if (m.videoMessage) mediaType = 'video'
+  1887→            else if (m.audioMessage) mediaType = 'audio'
+  1888→            else if (m.pttMessage) mediaType = 'ptt'
+  1889→            else if (m.documentMessage) mediaType = 'document'
+  1890→            else if (m.stickerMessage) mediaType = 'sticker'
+  1891→            if (!textContent && !mediaType) continue
+  1892→
+  1893→            const fromMe = update.key.fromMe || false
+  1894→            const msgId = update.key.id
+  1895→            if (conv.messages.some(mm => mm.whatsappId === msgId || mm.id === msgId)) continue
+  1896→
+  1897→            let ts
+  1898→            try {
+  1899→              const tsv = typeof update.messageTimestamp === 'number'
+  1900→                ? update.messageTimestamp
+  1901→                : (update.messageTimestamp?.low || update.messageTimestamp || Math.floor(Date.now() / 1000))
+  1902→              ts = new Date(tsv * 1000)
+  1903→              if (isNaN(ts.getTime())) ts = new Date()
+  1904→            } catch { ts = new Date() }
+  1905→
+  1906→            const messageData = {
+  1907→              id: msgId, whatsappId: msgId, fromMe, textContent, mediaType,
+  1908→              timestamp: ts, status: fromMe ? 'delivered' : 'received',
+  1909→            }
+  1910→            conv.messages.push(messageData)
+  1911→            conv.lastMessage = textContent || (mediaType ? `[${mediaType}]` : '')
+  1912→            conv.lastMessageAt = new Date()
+  1913→            if (!fromMe) conv.unreadCount++
+  1914→            console.log(`[WA] ✓ (via update) New message stored in ${jid} fromMe=${fromMe}`)
+  1915→
+  1916→            markConversationsDirty(); io.of('/whatsapp').emit('whatsapp:message', {
+  1917→              conversationJid: jid,
+  1918→              message: { ...messageData, timestamp: ts.toISOString() },
+  1919→              conversation: serializeConversation(conv),
+  1920→            })
+  1921→            io.of('/whatsapp').emit('whatsapp:conversation:update', serializeConversation(conv))
+  1922→
+  1923→            const phone = extractPhone(jid)
+  1924→            if (phone) {
+  1925→              autoSyncWhatsAppMessage({
+  1926→                jid, phone, pushName: conv.pushName, textContent, mediaType, fromMe,
+  1927→                timestamp: ts.toISOString(), dedupId: msgId,
+  1928→              }).catch(err => console.error('[AutoSync] Error:', err.message))
+  1929→            }
+  1930→          } catch (err) {
+  1931→            console.error('[WA] fallback message processing failed:', err.message)
+  1932→          }
+  1933→          continue
+  1934→        }
+  1935→
+  1936→        if (!existing) continue
+  1937→
+  1938→        let newStatus = existing.status
+  1939→        if (update.status === 'read') newStatus = 'read'
+  1940→        else if (update.status === 'delivered' && existing.status !== 'read') newStatus = 'delivered'
+  1941→        else if (update.status === 'played' && existing.mediaType === 'audio') newStatus = 'read'
+  1942→
+  1943→        if (newStatus !== existing.status) {
+  1944→          existing.status = newStatus
+  1945→          io.of('/whatsapp').emit('whatsapp:message:status', {
+  1946→            conversationJid: jid,
+  1947→            messageId: existing.id,
+  1948→            status: newStatus,
+  1949→          })
+  1950→        }
+  1951→      }
+  1952→    } catch (err) {
+  1953→      console.error('[WA] messages.update error:', err.message)
+  1954→    }
+  1955→  })
+  1956→
+  1957→  waSocket.ev.on('contacts.upsert', async (contacts) => {
+  1958→    console.log(`[WA] contacts.upsert: ${contacts.length} contacts received`)
+  1959→    let updatedCount = 0
+  1960→    for (const contact of contacts) {
+  1961→      if (contact.id && isValidPhoneJid(contact.id) && contact.name) {
+  1962→        updateConversationName(contact.id, contact.name)
+  1963→        updatedCount++
+  1964→      }
+  1965→    }
+  1966→    if (updatedCount > 0) {
+  1967→      console.log(`[WA] Updated ${updatedCount} conversation names from device contacts`)
+  1968→      markConversationsDirty(); io.of('/whatsapp').emit('whatsapp:conversations', getSortedConversations())
+  1969→    }
+  1970→  })
+  1971→
+  1972→  waSocket.ev.on('contacts.update', async (updates) => {
+  1973→    let updatedCount = 0
+  1974→    for (const update of updates) {
+  1975→      if (update.id && isValidPhoneJid(update.id) && update.name) {
+  1976→        updateConversationName(update.id, update.name)
+  1977→        updatedCount++
+  1978→      }
+  1979→    }
+  1980→    if (updatedCount > 0) {
+  1981→      console.log(`[WA] Updated ${updatedCount} conversation names from contact updates`)
+  1982→      markConversationsDirty(); io.of('/whatsapp').emit('whatsapp:conversations', getSortedConversations())
+  1983→    }
+  1984→  })
+  1985→
+  1986→  waSocket.ev.on('chats.upsert', async (chats) => {
+  1987→    for (const chat of chats) {
+  1988→      // v7.17: Try to resolve LID chat IDs using the global lidToPhoneMap
+  1989→      let jid = normalizeJid(chat.id)
+  1990→      if (!jid && chat.id && chat.id.endsWith('@lid')) {
+  1991→        jid = lidToPhoneMap.get(chat.id) || null
+  1992→      }
+  1993→      if (!jid) continue
+  1994→      if (!conversations.has(jid)) {
+  1995→        const contactName = contactNames.get(jid) || null
+  1996→        conversations.set(jid, {
+  1997→          jid, name: contactName, phone: extractPhone(jid),
+  1998→          pushName: null, avatarUrl: null, lastMessage: null,
+  1999→          lastMessageAt: chat.t ? new Date(chat.t * 1000) : null,
+  2000→          unreadCount: chat.unreadCount || 0, messages: [],
+
+[showing lines 1-2000 of 3196; use offset=2001 with limit to continue reading]

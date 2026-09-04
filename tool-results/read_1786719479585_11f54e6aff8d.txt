@@ -1,0 +1,682 @@
+     1→'use client'
+     2→
+     3→import { useState, useMemo } from 'react'
+     4→import Image from 'next/image'
+     5→import { useWhatsApp } from '@/lib/use-whatsapp'
+     6→import { useOdoo } from '@/lib/use-odoo'
+     7→import { QRCodePanel } from '@/components/whatsapp/QRCodePanel'
+     8→import { ConversationList } from '@/components/whatsapp/ConversationList'
+     9→import { ChatView } from '@/components/whatsapp/ChatView'
+    10→import { OdooConfigForm } from '@/components/odoo/OdooConfigForm'
+    11→import { OdooLinkPanel } from '@/components/odoo/OdooLinkPanel'
+    12→import { AutoSyncSettingsPanel } from '@/components/odoo/AutoSyncSettings'
+    13→
+    14→import { cn } from '@/lib/utils'
+    15→import { Button } from '@/components/ui/button'
+    16→import { Badge } from '@/components/ui/badge'
+    17→import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+    18→import { Separator } from '@/components/ui/separator'
+    19→import {
+    20→  MessageCircle,
+    21→  Settings,
+    22→  LayoutDashboard,
+    23→  Smartphone,
+    24→  Link2,
+    25→  Wifi,
+    26→  WifiOff,
+    27→  Server,
+    28→  Users,
+    29→  TrendingUp,
+    30→  ShoppingCart,
+    31→  ClipboardList,
+    32→  PanelRightOpen,
+    33→  PanelRightClose,
+    34→  Zap,
+    35→  Loader2,
+    36→  AlertCircle,
+    37→  CheckCircle2,
+    38→} from 'lucide-react'
+    39→
+    40→type Tab = 'dashboard' | 'whatsapp' | 'conversations' | 'settings'
+    41→
+    42→function DashboardView({
+    43→  waStatus,
+    44→  waMe,
+    45→  waConversations,
+    46→  odooStatus,
+    47→  onNavigate,
+    48→}: {
+    49→  waStatus: { connected: boolean; reason?: string; hasSession?: boolean }
+    50→  waMe: { id: string; name?: string; profilePicUrl?: string } | null
+    51→  waConversations: Array<{ jid: string; unreadCount: number }>
+    52→  odooStatus: { connected: boolean; url?: string; db?: string; username?: string }
+    53→  onNavigate: (tab: Tab) => void
+    54→}) {
+    55→  const totalUnread = waConversations.reduce((s, c) => s + c.unreadCount, 0)
+    56→
+    57→  return (
+    58→    <div className="p-6 space-y-6 max-w-6xl mx-auto">
+    59→      <div>
+    60→        <h1 className="text-2xl font-bold tracking-tight">Dashboard</h1>
+    61→        <p className="text-muted-foreground text-sm mt-1">
+    62→          Visao geral da integracao WhatsApp e Odoo
+    63→        </p>
+    64→      </div>
+    65→
+    66→      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
+    67→        <Card className="relative overflow-hidden">
+    68→          <div className={cn("absolute top-0 left-0 w-1 h-full", waStatus.connected ? "bg-emerald-500" : waStatus.hasSession ? "bg-amber-400" : "bg-red-400")} />
+    69→          <CardHeader className="pb-2 pl-5">
+    70→            <div className="flex items-center justify-between">
+    71→              <CardTitle className="text-sm font-medium text-muted-foreground">WhatsApp</CardTitle>
+    72→              {waStatus.connected ? <Wifi className="size-4 text-emerald-500" /> : waStatus.hasSession ? <Loader2 className="size-4 text-amber-400 animate-spin" /> : <WifiOff className="size-4 text-red-400" />}
+    73→            </div>
+    74→          </CardHeader>
+    75→          <CardContent className="pl-5">
+    76→            <div className="text-2xl font-bold">{waStatus.connected ? 'Conectado' : waStatus.hasSession ? 'Reconectando...' : 'Desconectado'}</div>
+    77→            <p className="text-xs text-muted-foreground mt-1">
+    78→              {waStatus.connected ? (waMe?.name || waMe?.id?.split('@')[0] || 'Sessao ativa') : waStatus.hasSession ? 'Restaurando sessao salva' : 'Escaneie o QR Code para conectar'}
+    79→            </p>
+    80→          </CardContent>
+    81→        </Card>
+    82→
+    83→        <Card className="relative overflow-hidden">
+    84→          <div className={cn("absolute top-0 left-0 w-1 h-full", odooStatus.connected ? "bg-emerald-500" : "bg-amber-400")} />
+    85→          <CardHeader className="pb-2 pl-5">
+    86→            <div className="flex items-center justify-between">
+    87→              <CardTitle className="text-sm font-medium text-muted-foreground">Odoo</CardTitle>
+    88→              <Server className={cn("size-4", odooStatus.connected ? "text-emerald-500" : "text-amber-400")} />
+    89→            </div>
+    90→          </CardHeader>
+    91→          <CardContent className="pl-5">
+    92→            <div className="text-2xl font-bold">{odooStatus.connected ? 'Conectado' : 'Desconectado'}</div>
+    93→            <p className="text-xs text-muted-foreground mt-1">
+    94→              {odooStatus.connected ? odooStatus.url : 'Configure as credenciais do Odoo'}
+    95→            </p>
+    96→          </CardContent>
+    97→        </Card>
+    98→
+    99→        <Card className="relative overflow-hidden">
+   100→          <div className="absolute top-0 left-0 w-1 h-full bg-primary" />
+   101→          <CardHeader className="pb-2 pl-5">
+   102→            <div className="flex items-center justify-between">
+   103→              <CardTitle className="text-sm font-medium text-muted-foreground">Conversas</CardTitle>
+   104→              <MessageCircle className="size-4 text-primary" />
+   105→            </div>
+   106→          </CardHeader>
+   107→          <CardContent className="pl-5">
+   108→            <div className="text-2xl font-bold">{waConversations.length}</div>
+   109→            <p className="text-xs text-muted-foreground mt-1">{totalUnread} nao lidas</p>
+   110→          </CardContent>
+   111→        </Card>
+   112→
+   113→        <Card className="relative overflow-hidden">
+   114→          <div className={cn("absolute top-0 left-0 w-1 h-full", waStatus.connected && odooStatus.connected ? "bg-emerald-500" : "bg-muted")} />
+   115→          <CardHeader className="pb-2 pl-5">
+   116→            <div className="flex items-center justify-between">
+   117→              <CardTitle className="text-sm font-medium text-muted-foreground">Integracao</CardTitle>
+   118→              <Link2 className="size-4 text-muted-foreground" />
+   119→            </div>
+   120→          </CardHeader>
+   121→          <CardContent className="pl-5">
+   122→            <div className="text-2xl font-bold">{waStatus.connected && odooStatus.connected ? 'Ativa' : 'Inativa'}</div>
+   123→            <p className="text-xs text-muted-foreground mt-1">
+   124→              {waStatus.connected && odooStatus.connected ? 'WhatsApp e Odoo conectados' : 'Conecte ambos para ativar'}
+   125→            </p>
+   126→          </CardContent>
+   127→        </Card>
+   128→      </div>
+   129→
+   130→      <Card>
+   131→        <CardHeader>
+   132→          <CardTitle className="text-base">Acoes Rapidas</CardTitle>
+   133→        </CardHeader>
+   134→        <CardContent>
+   135→          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+   136→            {!waStatus.connected && !waStatus.hasSession && (
+   137→              <Button variant="outline" className="justify-start gap-2 h-auto py-3" onClick={() => onNavigate('whatsapp')}>
+   138→                <Smartphone className="size-4 text-emerald-500" />
+   139→                <div className="text-left">
+   140→                  <div className="text-sm font-medium">Conectar WhatsApp</div>
+   141→                  <div className="text-xs text-muted-foreground">Escanear QR Code</div>
+   142→                </div>
+   143→              </Button>
+   144→            )}
+   145→            {!odooStatus.connected && (
+   146→              <Button variant="outline" className="justify-start gap-2 h-auto py-3" onClick={() => onNavigate('settings')}>
+   147→                <Server className="size-4 text-amber-500" />
+   148→                <div className="text-left">
+   149→                  <div className="text-sm font-medium">Configurar Odoo</div>
+   150→                  <div className="text-xs text-muted-foreground">Conectar ao servidor</div>
+   151→                </div>
+   152→              </Button>
+   153→            )}
+   154→            {waStatus.connected && (
+   155→              <Button variant="outline" className="justify-start gap-2 h-auto py-3" onClick={() => onNavigate('conversations')}>
+   156→                <MessageCircle className="size-4 text-primary" />
+   157→                <div className="text-left">
+   158→                  <div className="text-sm font-medium">Ver Conversas</div>
+   159→                  <div className="text-xs text-muted-foreground">{waConversations.length} conversas ativas</div>
+   160→                </div>
+   161→              </Button>
+   162→            )}
+   163→            {waStatus.connected && odooStatus.connected && (
+   164→              <Button variant="outline" className="justify-start gap-2 h-auto py-3" onClick={() => onNavigate('conversations')}>
+   165→                <Zap className="size-4 text-yellow-500" />
+   166→                <div className="text-left">
+   167→                  <div className="text-sm font-medium">Criar Lead</div>
+   168→                  <div className="text-xs text-muted-foreground">A partir de conversa</div>
+   169→                </div>
+   170→              </Button>
+   171→            )}
+   172→          </div>
+   173→        </CardContent>
+   174→      </Card>
+   175→
+   176→      <Card>
+   177→        <CardHeader>
+   178→          <CardTitle className="text-base">Como Funciona</CardTitle>
+   179→        </CardHeader>
+   180→        <CardContent>
+   181→          <div className="grid gap-4 sm:grid-cols-3">
+   182→            <div className="flex gap-3">
+   183→              <div className="flex size-8 shrink-0 items-center justify-center rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300 text-sm font-bold">1</div>
+   184→              <div>
+   185→                <p className="text-sm font-medium">Conecte WhatsApp</p>
+   186→                <p className="text-xs text-muted-foreground mt-0.5">Escaneie o QR Code com o WhatsApp Business no celular para vincular sua conta. A sessao fica salva automaticamente!</p>
+   187→              </div>
+   188→            </div>
+   189→            <div className="flex gap-3">
+   190→              <div className="flex size-8 shrink-0 items-center justify-center rounded-full bg-amber-100 text-amber-700 dark:bg-amber-950 dark:text-amber-300 text-sm font-bold">2</div>
+   191→              <div>
+   192→                <p className="text-sm font-medium">Configure Odoo</p>
+   193→                <p className="text-xs text-muted-foreground mt-0.5">Insira as credenciais do seu Odoo SaaS (URL, banco, usuario e senha)</p>
+   194→              </div>
+   195→            </div>
+   196→            <div className="flex gap-3">
+   197→              <div className="flex size-8 shrink-0 items-center justify-center rounded-full bg-primary/10 text-primary text-sm font-bold">3</div>
+   198→              <div>
+   199→                <p className="text-sm font-medium">Integre Conversas</p>
+   200→                <p className="text-xs text-muted-foreground mt-0.5">Vincule conversas a Contatos, Leads, Vendas e Projetos do Odoo diretamente</p>
+   201→              </div>
+   202→            </div>
+   203→          </div>
+   204→        </CardContent>
+   205→      </Card>
+   206→    </div>
+   207→  )
+   208→}
+   209→
+   210→function ConversationsView({
+   211→  conversations,
+   212→  selectedJid,
+   213→  selectedConversation,
+   214→  currentMessages,
+   215→  showOdooPanel,
+   216→  odooStatus,
+   217→  onSelectConversation,
+   218→  onSendMessage,
+   219→  onMarkRead,
+   220→  onToggleOdooPanel,
+   221→  onLinkConversation,
+   222→  onSearchContacts,
+   223→  onSearchLeads,
+   224→  onSearchSales,
+   225→  onSearchTasks,
+   226→  onCreateLead,
+   227→  onCreateContact,
+   228→  onCreateTask,
+   229→  onLogMessage,
+   230→  isSyncing,
+   231→  syncProgress,
+   232→  onGetContacts,
+   233→  onStartConversation,
+   234→  onFetchOdooHistory,
+   235→  onInjectHistory,
+   236→  linkedOdooRecords,
+   237→  onCreateOdooContact,
+   238→  onDeleteConversation,
+   239→  onRefreshData,
+   240→  onRefreshMessages,
+   241→}: {
+   242→  conversations: any[]
+   243→  selectedJid: string | null
+   244→  selectedConversation: any
+   245→  currentMessages: any[]
+   246→  showOdooPanel: boolean
+   247→  odooStatus: { connected: boolean }
+   248→  onSelectConversation: (jid: string) => void
+   249→  onSendMessage: (jid: string, text: string) => Promise<boolean>
+   250→  onMarkRead: (jid: string) => void
+   251→  onToggleOdooPanel: (show: boolean) => void
+   252→  onLinkConversation: any
+   253→  onSearchContacts: any
+   254→  onSearchLeads: any
+   255→  onSearchSales: any
+   256→  onSearchTasks: any
+   257→  onCreateLead: any
+   258→  onCreateContact: any
+   259→  onCreateTask: any
+   260→  onLogMessage: any
+   261→  isSyncing?: boolean
+   262→  syncProgress?: number
+   263→  onGetContacts?: (query?: string) => Promise<{ success: boolean; data?: any[]; error?: string }>
+   264→  onStartConversation?: (phone: string, name?: string) => Promise<{ success: boolean; jid?: string; error?: string }>
+   265→  onFetchOdooHistory?: (model: string, recordId: number) => Promise<{ success: boolean; data?: any[]; error?: string }>
+   266→  onInjectHistory?: (jid: string, messages: any[]) => Promise<{ success: boolean; added?: number; skipped?: number; error?: string }>
+   267→  linkedOdooRecords?: Array<{ model: string; recordId: number; recordName?: string }>
+   268→  onCreateOdooContact?: (data: { name: string; phone?: string; mobile?: string; whatsapp?: string; email?: string }) => Promise<{ success: boolean; id?: number; error?: string }>
+   269→  onDeleteConversation?: (jid: string) => Promise<{ success: boolean; error?: string }>
+   270→  onRefreshData?: () => Promise<{ success: boolean; chatsFetched?: number; contactsFetched?: number; error?: string }>
+   271→  onRefreshMessages?: (jid: string) => Promise<{ success: boolean; count?: number; serverFetchAttempted?: boolean; serverFetchMethods?: string[]; error?: string }>
+   272→}) {
+   273→  // Build conversation history payload (for Odoo lead creation)
+   274→  const conversationHistory = useMemo(() => {
+   275→    return currentMessages.map(m => ({
+   276→      fromMe: m.fromMe,
+   277→      textContent: m.textContent,
+   278→      mediaType: m.mediaType,
+   279→      timestamp: m.timestamp,
+   280→    }))
+   281→  }, [currentMessages])
+   282→
+   283→  return (
+   284→    <div className="flex h-full min-h-0 overflow-hidden">
+   285→      {/* Conversation list — always visible, takes full width when no conversation is selected */}
+   286→      <div className={cn(
+   287→        "border-r bg-background transition-all duration-200 h-full shrink-0",
+   288→        selectedJid ? "w-72 lg:w-80 xl:w-96" : "w-full max-w-lg mx-auto"
+   289→      )}>
+   290→        <ConversationList
+   291→          conversations={conversations}
+   292→          selectedJid={selectedJid}
+   293→          onSelect={onSelectConversation}
+   294→          isSyncing={isSyncing}
+   295→          syncProgress={syncProgress}
+   296→          onGetContacts={onGetContacts}
+   297→          odooConnected={odooStatus.connected}
+   298→          onSearchOdooContacts={onSearchContacts}
+   299→          onStartConversation={onStartConversation}
+   300→          onCreateOdooContact={onCreateOdooContact}
+   301→          onDeleteConversation={onDeleteConversation}
+   302→          onRefreshData={onRefreshData}
+   303→        />
+   304→      </div>
+   305→
+   306→      {selectedJid && (
+   307→        <div className="flex-1 flex min-w-0">
+   308→          {/* Chat view — shrinks (but never hides) to make room for Odoo panel */}
+   309→          <div className="flex-1 min-w-0 transition-all duration-200">
+   310→            <ChatView
+   311→              conversation={selectedConversation}
+   312→              messages={currentMessages}
+   313→              onSendMessage={onSendMessage}
+   314→              onMarkRead={onMarkRead}
+   315→              odooConnected={odooStatus.connected}
+   316→              odooLinkedRecords={linkedOdooRecords}
+   317→              onFetchOdooHistory={onFetchOdooHistory}
+   318→              onInjectHistory={onInjectHistory}
+   319→              onRefreshMessages={onRefreshMessages}
+   320→              onDeleteConversation={onDeleteConversation ? (jid) => {
+   321→                // The actual delete is handled by the parent (wa.deleteConversation),
+   322→                // here we just trigger the same confirmation flow as the list.
+   323→                onDeleteConversation(jid)
+   324→              } : undefined}
+   325→            />
+   326→          </div>
+   327→
+   328→          {/* Right side: collapsible Odoo panel — when open, it takes its own column, never overlapping the chat */}
+   329→          {showOdooPanel ? (
+   330→            <div className="w-72 lg:w-80 xl:w-96 border-l bg-background flex flex-col shrink-0">
+   331→              <div className="flex items-center justify-between px-3 py-2 border-b shrink-0">
+   332→                <div className="flex items-center gap-2 min-w-0">
+   333→                  <Link2 className="size-4 text-primary shrink-0" />
+   334→                  <span className="text-sm font-medium truncate">Odoo</span>
+   335→                  {odooStatus.connected && (
+   336→                    <Badge variant="outline" className="text-[10px] bg-emerald-50 text-emerald-700 border-emerald-200 shrink-0">Conectado</Badge>
+   337→                  )}
+   338→                </div>
+   339→                <Button variant="ghost" size="icon" className="size-8 shrink-0" onClick={() => onToggleOdooPanel(false)} title="Recolher painel Odoo">
+   340→                  <PanelRightClose className="size-4" />
+   341→                </Button>
+   342→              </div>
+   343→              <div className="flex-1 min-h-0 overflow-hidden">
+   344→                <OdooLinkPanel
+   345→                  conversationJid={selectedJid}
+   346→                  conversationPhone={selectedConversation?.phone || null}
+   347→                  onLinkConversation={onLinkConversation}
+   348→                  onSearchContacts={onSearchContacts}
+   349→                  onSearchLeads={onSearchLeads}
+   350→                  onSearchSales={onSearchSales}
+   351→                  onSearchTasks={onSearchTasks}
+   352→                  onCreateLead={onCreateLead}
+   353→                  onCreateContact={onCreateContact}
+   354→                  onCreateTask={onCreateTask}
+   355→                  onLogMessage={onLogMessage}
+   356→                  odooConnected={odooStatus.connected}
+   357→                  conversationHistory={conversationHistory}
+   358→                />
+   359→              </div>
+   360→            </div>
+   361→          ) : (
+   362→            /* Collapsed state — a slim vertical strip with an "open" button */
+   363→            <div className="border-l bg-muted/30 flex flex-col items-center pt-3 px-1 shrink-0 w-12">
+   364→              <Button variant="ghost" size="icon" className="size-8" onClick={() => onToggleOdooPanel(true)} title="Abrir painel Odoo">
+   365→                <PanelRightOpen className="size-4" />
+   366→              </Button>
+   367→              <Separator className="my-2 w-4" />
+   368→              <div className="flex flex-col gap-1 py-2">
+   369→                <div className="flex size-7 items-center justify-center"><Users className="size-3.5 text-muted-foreground" /></div>
+   370→                <div className="flex size-7 items-center justify-center"><TrendingUp className="size-3.5 text-muted-foreground" /></div>
+   371→                <div className="flex size-7 items-center justify-center"><ShoppingCart className="size-3.5 text-muted-foreground" /></div>
+   372→                <div className="flex size-7 items-center justify-center"><ClipboardList className="size-3.5 text-muted-foreground" /></div>
+   373→              </div>
+   374→            </div>
+   375→          )}
+   376→        </div>
+   377→      )}
+   378→    </div>
+   379→  )
+   380→}
+   381→
+   382→function NavItem({ icon, label, active, onClick, badge, collapsed }: {
+   383→  icon: React.ReactNode
+   384→  label: string
+   385→  active: boolean
+   386→  onClick: () => void
+   387→  badge?: string
+   388→  collapsed?: boolean
+   389→}) {
+   390→  return (
+   391→    <button
+   392→      onClick={onClick}
+   393→      className={cn(
+   394→        'w-full flex items-center gap-3 px-2 py-2 rounded-lg text-sm transition-colors',
+   395→        'hover:bg-muted/80 focus-visible:outline-none focus-visible:bg-muted/80',
+   396→        active ? 'bg-primary/10 text-primary font-medium' : 'text-muted-foreground',
+   397→      )}
+   398→      title={collapsed ? label : undefined}
+   399→    >
+   400→      <span className="shrink-0 mx-auto lg:mx-0">{icon}</span>
+   401→      {!collapsed && <span className="hidden lg:block flex-1 text-left truncate">{label}</span>}
+   402→      {badge && !collapsed && (
+   403→        <Badge className="size-5 p-0 flex items-center justify-center text-[10px] bg-emerald-500 text-white border-0">
+   404→          {badge === 'online' ? '\u25CF' : badge}
+   405→        </Badge>
+   406→      )}
+   407→      {badge && collapsed && (
+   408→        <Badge className="hidden lg:flex absolute top-0 right-0 size-2 p-0 bg-emerald-500 border-0" />
+   409→      )}
+   410→    </button>
+   411→  )
+   412→}
+   413→
+   414→function StatusIndicator({ label, connected, collapsed }: { label: string; connected: boolean; collapsed?: boolean }) {
+   415→  return (
+   416→    <div className="flex items-center gap-2 px-2 py-1.5 text-xs" title={collapsed ? `${label}: ${connected ? 'ON' : 'OFF'}` : undefined}>
+   417→      <span className={cn('size-2 rounded-full shrink-0 mx-auto lg:mx-0', connected ? 'bg-emerald-500' : 'bg-muted-foreground/30')} />
+   418→      {!collapsed && <span className="hidden lg:block text-muted-foreground truncate">{label}</span>}
+   419→      {!collapsed && <span className="hidden lg:block ml-auto font-medium text-[10px]">{connected ? 'ON' : 'OFF'}</span>}
+   420→    </div>
+   421→  )
+   422→}
+   423→
+   424→export default function HomePage() {
+   425→  const wa = useWhatsApp()
+   426→  const odoo = useOdoo()
+   427→
+   428→  const [activeTab, setActiveTab] = useState<Tab>('dashboard')
+   429→  const [selectedJid, setSelectedJid] = useState<string | null>(null)
+   430→  const [showOdooPanel, setShowOdooPanel] = useState(false)
+   431→
+   432→  const selectedConversation = useMemo(() => {
+   433→    if (!selectedJid) return null
+   434→    return wa.conversations.find(c => c.jid === selectedJid) || null
+   435→  }, [selectedJid, wa.conversations])
+   436→
+   437→  // Derive linked Odoo records for the currently selected conversation
+   438→  // Used by the ChatView's "Pull from Odoo" button
+   439→  const linkedOdooRecords = useMemo(() => {
+   440→    if (!selectedJid) return undefined
+   441→    const links = odoo.conversationLinks.get(selectedJid)
+   442→    if (!links || links.length === 0) return undefined
+   443→    return links
+   444→  }, [selectedJid, odoo.conversationLinks])
+   445→
+   446→  const handleSelectConversation = (jid: string) => {
+   447→    setSelectedJid(jid)
+   448→    wa.loadMessages(jid)
+   449→    wa.markRead(jid)
+   450→    setActiveTab('conversations')
+   451→  }
+   452→
+   453→  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+   454→
+   455→  return (
+   456→    <div className="flex h-screen overflow-hidden">
+   457→      <nav className={cn(
+   458→        "border-r bg-muted/30 flex flex-col shrink-0 max-h-screen transition-all duration-200",
+   459→        sidebarCollapsed ? "w-14" : "w-14 lg:w-56"
+   460→      )}>
+   461→        <div className="h-14 flex items-center px-3 lg:px-4 border-b">
+   462→          <div className="flex items-center gap-2">
+   463→            <Image
+   464→              src="/logo.png"
+   465→              alt="Whats-Odoo"
+   466→              width={32}
+   467→              height={32}
+   468→              className="size-8 rounded-lg object-cover shrink-0"
+   469→              priority
+   470→            />
+   471→            {!sidebarCollapsed && (
+   472→              <div className="hidden lg:block min-w-0">
+   473→                <p className="text-sm font-bold leading-tight truncate">Whats-Odoo</p>
+   474→                <p className="text-[10px] text-muted-foreground">v7.21 Middleware</p>
+   475→              </div>
+   476→            )}
+   477→          </div>
+   478→          <Button
+   479→            variant="ghost"
+   480→            size="icon"
+   481→            className="size-7 ml-auto hidden lg:flex shrink-0"
+   482→            onClick={() => setSidebarCollapsed(c => !c)}
+   483→            title={sidebarCollapsed ? 'Expandir menu' : 'Recolher menu'}
+   484→          >
+   485→            {sidebarCollapsed ? <PanelRightOpen className="size-4" /> : <PanelRightClose className="size-4" />}
+   486→          </Button>
+   487→        </div>
+   488→
+   489→        <div className="flex-1 py-2 space-y-1 px-2">
+   490→          <NavItem icon={<LayoutDashboard className="size-4" />} label="Dashboard" active={activeTab === 'dashboard'} onClick={() => setActiveTab('dashboard')} collapsed={sidebarCollapsed} />
+   491→          <NavItem icon={<Smartphone className="size-4" />} label="WhatsApp" active={activeTab === 'whatsapp'} onClick={() => setActiveTab('whatsapp')} badge={wa.status.connected ? 'online' : undefined} collapsed={sidebarCollapsed} />
+   492→          <NavItem
+   493→            icon={<MessageCircle className="size-4" />} label="Conversas" active={activeTab === 'conversations'} onClick={() => setActiveTab('conversations')}
+   494→            badge={wa.conversations.reduce((s, c) => s + c.unreadCount, 0) > 0 ? String(wa.conversations.reduce((s, c) => s + c.unreadCount, 0)) : undefined}
+   495→            collapsed={sidebarCollapsed}
+   496→          />
+   497→          <NavItem icon={<Settings className="size-4" />} label="Configuracoes" active={activeTab === 'settings'} onClick={() => setActiveTab('settings')} collapsed={sidebarCollapsed} />
+   498→        </div>
+   499→
+   500→        <div className="p-2 border-t space-y-1">
+   501→          <StatusIndicator label="WhatsApp" connected={wa.status.connected} collapsed={sidebarCollapsed} />
+   502→          <StatusIndicator label="Odoo" connected={odoo.status.connected} collapsed={sidebarCollapsed} />
+   503→        </div>
+   504→      </nav>
+   505→
+   506→      <main className="flex-1 flex flex-col min-h-0 max-h-screen relative">
+   507→        {/* v7.21: Floating banner showing Odoo chatter history sync progress */}
+   508→        {wa.odooHistorySync && (
+   509→          <div className="absolute top-3 right-3 z-50 max-w-sm animate-in fade-in slide-in-from-top-2">
+   510→            <div className={`rounded-lg border shadow-lg p-3 text-xs ${
+   511→              wa.odooHistorySync.phase === 'error'
+   512→                ? 'bg-destructive/95 text-destructive-foreground border-destructive'
+   513→                : wa.odooHistorySync.phase === 'complete'
+   514→                ? 'bg-emerald-600/95 text-white border-emerald-700'
+   515→                : 'bg-sky-600/95 text-white border-sky-700'
+   516→            }`}>
+   517→              <div className="flex items-start gap-2">
+   518→                {wa.odooHistorySync.phase === 'error' ? (
+   519→                  <AlertCircle className="size-4 shrink-0 mt-0.5" />
+   520→                ) : wa.odooHistorySync.phase === 'complete' ? (
+   521→                  <CheckCircle2 className="size-4 shrink-0 mt-0.5" />
+   522→                ) : (
+   523→                  <Loader2 className="size-4 shrink-0 mt-0.5 animate-spin" />
+   524→                )}
+   525→                <div className="flex-1 min-w-0">
+   526→                  <p className="font-semibold">
+   527→                    {wa.odooHistorySync.phase === 'error'
+   528→                      ? 'Erro ao sincronizar conversas'
+   529→                      : wa.odooHistorySync.phase === 'complete'
+   530→                      ? 'Conversas restauradas do Odoo'
+   531→                      : 'Trazendo conversas do Odoo...'}
+   532→                  </p>
+   533→                  {wa.odooHistorySync.phase === 'error' && wa.odooHistorySync.error && (
+   534→                    <p className="mt-0.5 opacity-90 break-words">{wa.odooHistorySync.error}</p>
+   535→                  )}
+   536→                  {wa.odooHistorySync.phase === 'complete' && (
+   537→                    <p className="mt-0.5 opacity-90">
+   538→                      {wa.odooHistorySync.processed || 0} contatos • {(wa.odooHistorySync.added || 0)} mensagens
+   539→                      {(wa.odooHistorySync.failed || 0) > 0 && ` • ${wa.odooHistorySync.failed} falhas`}
+   540→                    </p>
+   541→                  )}
+   542→                  {(wa.odooHistorySync.phase === 'starting' ||
+   543→                    wa.odooHistorySync.phase === 'fetching_partners' ||
+   544→                    wa.odooHistorySync.phase === 'processing') && (
+   545→                    <p className="mt-0.5 opacity-90">
+   546→                      {wa.odooHistorySync.phase === 'fetching_partners'
+   547→                        ? 'Buscando contatos no Odoo...'
+   548→                        : wa.odooHistorySync.phase === 'processing'
+   549→                        ? `Processando ${wa.odooHistorySync.processed || 0}/${wa.odooHistorySync.total || 0} • ${wa.odooHistorySync.added || 0} msgs`
+   550→                        : 'Iniciando...'}
+   551→                    </p>
+   552→                  )}
+   553→                </div>
+   554→              </div>
+   555→            </div>
+   556→          </div>
+   557→        )}
+   558→
+   559→        {activeTab === 'dashboard' && (
+   560→          <div className="flex-1 overflow-y-auto">
+   561→            <DashboardView
+   562→              waStatus={wa.status}
+   563→              waMe={wa.me}
+   564→              waConversations={wa.conversations}
+   565→              odooStatus={odoo.status}
+   566→              onNavigate={setActiveTab}
+   567→            />
+   568→          </div>
+   569→        )}
+   570→
+   571→        {activeTab === 'whatsapp' && (
+   572→          <div className="flex-1 overflow-y-auto p-6 flex items-start justify-center">
+   573→            <QRCodePanel
+   574→              qrCode={wa.qrCode}
+   575→              status={wa.status}
+   576→              me={wa.me}
+   577→              onRequestQR={wa.requestQR}
+   578→              onDisconnect={wa.disconnect}
+   579→              isConnected={wa.status.connected}
+   580→            />
+   581→          </div>
+   582→        )}
+   583→
+   584→        {activeTab === 'conversations' && (
+   585→          <div className="flex-1 min-h-0 overflow-hidden">
+   586→            <ConversationsView
+   587→            conversations={wa.conversations}
+   588→            selectedJid={selectedJid}
+   589→            selectedConversation={selectedConversation}
+   590→            currentMessages={wa.currentMessages}
+   591→            showOdooPanel={showOdooPanel}
+   592→            odooStatus={odoo.status}
+   593→            onSelectConversation={handleSelectConversation}
+   594→            onSendMessage={wa.sendMessage}
+   595→            onMarkRead={wa.markRead}
+   596→            onToggleOdooPanel={setShowOdooPanel}
+   597→            onLinkConversation={odoo.linkConversation}
+   598→            onSearchContacts={odoo.searchContacts}
+   599→            onSearchLeads={odoo.searchLeads}
+   600→            onSearchSales={odoo.searchSales}
+   601→            onSearchTasks={odoo.searchTasks}
+   602→            onCreateLead={odoo.createLead}
+   603→            onCreateContact={odoo.createContact}
+   604→            onCreateTask={odoo.createTask}
+   605→            onLogMessage={odoo.logMessage}
+   606→            isSyncing={wa.syncProgress?.isSyncing}
+   607→            syncProgress={wa.syncProgress?.progress}
+   608→            onGetContacts={wa.getContacts}
+   609→            onStartConversation={wa.startConversation}
+   610→            onFetchOdooHistory={(model, recordId) => odoo.fetchHistory({ model, recordId })}
+   611→            onInjectHistory={wa.injectHistory}
+   612→            linkedOdooRecords={linkedOdooRecords}
+   613→            onCreateOdooContact={odoo.createContact}
+   614→            onDeleteConversation={wa.deleteConversation}
+   615→            onRefreshData={wa.refreshData}
+   616→            onRefreshMessages={wa.refreshMessages}
+   617→          />
+   618→          </div>
+   619→        )}
+   620→
+   621→        {activeTab === 'settings' && (
+   622→          <div className="flex-1 overflow-y-auto p-6 max-w-2xl mx-auto space-y-6">
+   623→            <div>
+   624→              <h1 className="text-2xl font-bold tracking-tight">Configuracoes</h1>
+   625→              <p className="text-muted-foreground text-sm mt-1">Configure as conexoes e a sincronizacao automatica do middleware</p>
+   626→            </div>
+   627→            <OdooConfigForm
+   628→              status={odoo.status}
+   629→              onAuthenticate={odoo.authenticate}
+   630→              onDisconnect={odoo.disconnect}
+   631→              isConnected={odoo.status.connected}
+   632→            />
+   633→            <AutoSyncSettingsPanel
+   634→              odooConnected={odoo.status.connected}
+   635→              settings={odoo.autoSyncSettings}
+   636→              onUpdateSettings={odoo.updateAutoSyncSettings}
+   637→              onSyncAllHistory={odoo.syncAllHistory}
+   638→            />
+   639→            <Card>
+   640→              <CardHeader>
+   641→                <div className="flex items-center gap-2">
+   642→                  <Smartphone className="size-4 text-emerald-500" />
+   643→                  <CardTitle className="text-base">Status WhatsApp</CardTitle>
+   644→                </div>
+   645→              </CardHeader>
+   646→              <CardContent className="space-y-3">
+   647→                <div className="flex items-center justify-between text-sm">
+   648→                  <span className="text-muted-foreground">Conexao</span>
+   649→                  <Badge variant={wa.status.connected ? 'default' : 'outline'} className={wa.status.connected ? 'bg-emerald-100 text-emerald-800 border-emerald-200' : ''}>
+   650→                    {wa.status.connected ? 'Conectado' : wa.status.hasSession ? 'Reconectando...' : 'Desconectado'}
+   651→                  </Badge>
+   652→                </div>
+   653→                {wa.status.hasSession && (
+   654→                  <div className="flex items-center justify-between text-sm">
+   655→                    <span className="text-muted-foreground">Sessao salva</span>
+   656→                    <span className="text-emerald-600 dark:text-emerald-400 font-medium text-xs">Sim - reconexao automatica</span>
+   657→                  </div>
+   658→                )}
+   659→                {wa.me && (
+   660→                  <>
+   661→                    <div className="flex items-center justify-between text-sm">
+   662→                      <span className="text-muted-foreground">Numero</span>
+   663→                      <span className="font-mono text-xs">{wa.me.id?.split('@')[0]}</span>
+   664→                    </div>
+   665→                    <div className="flex items-center justify-between text-sm">
+   666→                      <span className="text-muted-foreground">Nome</span>
+   667→                      <span>{wa.me.name || 'N/A'}</span>
+   668→                    </div>
+   669→                  </>
+   670→                )}
+   671→                <Button variant={wa.status.connected ? 'destructive' : 'default'} className="w-full" onClick={() => setActiveTab('whatsapp')}>
+   672→                  {wa.status.connected ? 'Desconectar WhatsApp' : 'Conectar WhatsApp'}
+   673→                </Button>
+   674→              </CardContent>
+   675→            </Card>
+   676→          </div>
+   677→        )}
+   678→      </main>
+   679→    </div>
+   680→  )
+   681→}
+   682→

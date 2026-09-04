@@ -1,0 +1,526 @@
+     1→[panfletos] [firestore.cliqueProduto.count] mercadoId=SIaVvGJEHpNwdxT63NHm total=29
+     2→[whats-odoo] [WA] Connection update: undefined
+     3→[whats-odoo] [WA] QR Code generated, sending to clients
+     4→[panfletos] [cron limpar-expirados] concluído em 4962ms — 0 encarte(s) excluído(s), 0 produto(s) removido(s), 0 PDF(s) do Storage
+     5→[whats-odoo] [Odoo] Background re-auth attempt...
+     6→[whats-odoo] [Odoo] Background re-auth still failing: Authentication failed - invalid credentials
+     7→[whats-odoo] [WA] Connection update: undefined
+     8→[whats-odoo] [WA] QR Code generated, sending to clients
+     9→[whats-odoo] [WA] Connection update: undefined
+    10→[whats-odoo] [WA] QR Code generated, sending to clients
+    11→[whats-odoo] [WA] Connection update: close
+    12→[whats-odoo] [WA] Connection closed. Status: 408, Reconnect: true
+    13→[whats-odoo] [WA] Reconnecting in 30000ms (attempt 6)...
+    14→[whats-odoo] [Odoo] Background re-auth attempt...
+    15→[whats-odoo] [Odoo] Background re-auth still failing: Authentication failed - invalid credentials
+    16→[whats-odoo] [WA] Connection update: connecting
+    17→[whats-odoo] [WA] Connection update: undefined
+    18→[whats-odoo] [WA] QR Code generated, sending to clients
+    19→[whats-odoo] [Odoo] Background re-auth attempt...
+    20→[whats-odoo] [Odoo] Background re-auth still failing: Authentication failed - invalid credentials
+    21→[whats-odoo] [WA] Connection update: undefined
+    22→[whats-odoo] [WA] QR Code generated, sending to clients
+    23→[whats-odoo] [WA] Connection update: undefined
+    24→[whats-odoo] [WA] QR Code generated, sending to clients
+    25→[whats-odoo] [Odoo] Background re-auth attempt...
+    26→[whats-odoo] [Odoo] Background re-auth still failing: Authentication failed - invalid credentials
+    27→[whats-odoo] [WA] Connection update: undefined
+    28→[whats-odoo] [WA] QR Code generated, sending to clients
+    29→[whats-odoo] [WA] Connection update: undefined
+    30→[whats-odoo] [WA] QR Code generated, sending to clients
+    31→[whats-odoo] [WA] Connection update: undefined
+    32→[whats-odoo] [WA] QR Code generated, sending to clients
+    33→[whats-odoo] [Odoo] Background re-auth attempt...
+    34→[whats-odoo] [Odoo] Background re-auth still failing: Authentication failed - invalid credentials
+    35→[whats-odoo] [WA] Connection update: close
+    36→[whats-odoo] [WA] Connection closed. Status: 408, Reconnect: true
+    37→[whats-odoo] [WA] Reconnecting in 30000ms (attempt 7)...
+    38→==> Deploying...
+    39→==> Setting WEB_CONCURRENCY=1 by default, based on available CPUs in the instance
+    40→[whats-odoo] [WA] Connection update: connecting
+    41→[whats-odoo] [WA] Connection update: undefined
+    42→[whats-odoo] [WA] QR Code generated, sending to clients
+    43→==> Running 'npm start'
+    44→> panfletosbrasil@2.0.0 start
+    45→> bash start.sh
+    46→==============================================
+    47→  encartebrasil — START (Panfletos + Whats-Odoo + Proxy)
+    48→==============================================
+    49→[start] Environment check:
+    50→  PORT=10000 (Render-facing)
+    51→  PANFLETOS_PORT=3000 (internal)
+    52→  WHATS_ODOO_PORT=3001 (internal)
+    53→  ODOO_URL=https://ppa-law.odoo.com
+    54→  ODOO_DB=ppa-law
+    55→  ODOO_USERNAME=marcus@3nytro.com.br
+    56→  ODOO_PASSWORD=<set>
+    57→  DATA_DIR=/opt/render/project/src/data
+    58→  WHATS_ODOO_HOSTNAMES=
+    59→[1/2] Pushing Whats-Odoo DB schema...
+    60→Prisma schema loaded from prisma/schema.prisma
+    61→Datasource "db": SQLite database "whats-odoo.db" at "file:/opt/render/project/src/data/whats-odoo/whats-odoo/whats-odoo.db"
+    62→SQLite database whats-odoo.db created at file:/opt/render/project/src/data/whats-odoo/whats-odoo/whats-odoo.db
+    63→🚀  Your database is now in sync with your Prisma schema. Done in 212ms
+    64→Running generate... (Use --skip-generate to skip the generators)
+    65→Running generate... - Prisma Client
+    66→✔ Generated Prisma Client (v6.19.2) to ./node_modules/@prisma/client in 445ms
+    67→[2/2] Launching services...
+    68→  - proxy      :10000  (Render-facing)
+    69→  - panfletos  :3000  (internal)
+    70→  - whats-odoo :3001  (internal)
+    71→[proxy] ==============================================
+    72→[proxy]   proxy listening on :10000
+    73→[proxy]   panfletos  → http://127.0.0.1:3000  (default)
+    74→[proxy]   whats-odoo → http://127.0.0.1:3001  (host: none | path: /whats-odoo/*)
+    75→[proxy]   NOTE: /whats-odoo prefix is FORWARDED AS-IS (not stripped)
+    76→[proxy] ==============================================
+    77→[whats-odoo] [Server] Data dir: /opt/render/project/src/data/whats-odoo
+    78→[whats-odoo] [Server] Auth folder: /opt/render/project/src/data/whats-odoo/auth_store
+    79→[whats-odoo] [Server] ✓ Data dir is writable: /opt/render/project/src/data/whats-odoo
+    80→[whats-odoo] [Server] Auth folder: 0 files, creds.json=MISSING
+    81→[whats-odoo] [Server] ⚠ No WhatsApp session — will need new QR code scan
+    82→[whats-odoo] [Server] No saved conversation state — starting fresh
+    83→[proxy] (node:181) [DEP0060] DeprecationWarning: The `util._extend` API is deprecated. Please use Object.assign() instead.
+    84→[proxy] (Use `node --trace-deprecation ...` to show where the warning was created)
+    85→[proxy] [proxy] error for app.panfletosbrasil.top/: connect ECONNREFUSED 127.0.0.1:3000
+    86→[panfletos] ▲ Next.js 16.1.3
+    87→[panfletos] - Local:         http://localhost:3000
+    88→[panfletos] - Network:       http://10.30.92.109:3000
+    89→[panfletos] 
+    90→[panfletos] ✓ Starting...
+    91→[panfletos] ✓ Ready in 1210ms
+    92→[panfletos] [db] Modo produção — usando Firestore.
+    93→[panfletos] [Firebase] Inicializado com sucesso. Project: encarte-brasil
+    94→[whats-odoo] ⚠ Warning: Next.js inferred your workspace root, but it may not be correct.
+    95→[whats-odoo]  We detected multiple lockfiles and selected the directory of /opt/render/project/src/package-lock.json as the root directory.
+    96→[whats-odoo]  To silence this warning, set `turbopack.root` in your Next.js config, or consider removing one of the lockfiles if it's not needed.
+    97→[whats-odoo]    See https://nextjs.org/docs/app/api-reference/config/next-config-js/turbopack#root-directory for more information.
+    98→[whats-odoo]  Detected additional lockfiles: 
+    99→[whats-odoo]    * /opt/render/project/src/whats-odoo/package-lock.json
+   100→[whats-odoo] 
+   101→[whats-odoo] [Server] Starting WhatsApp connection...
+   102→[whats-odoo] [Odoo] Auto-authenticating with env vars: https://ppa-law.odoo.com / ppa-law / marcus@3nytro.com.br
+   103→[whats-odoo] [Server] > Ready on http://0.0.0.0:3001
+   104→[whats-odoo] [Server] WhatsApp namespace: /whatsapp
+   105→[whats-odoo] [Server] Odoo namespace: /odoo
+   106→[whats-odoo] [WA] Connection update: connecting
+   107→[whats-odoo] (node:185) [DEP0169] DeprecationWarning: `url.parse()` behavior is not standardized and prone to errors that have security implications. Use the WHATWG URL API instead. CVEs are not issued for `url.parse()` vulnerabilities.
+   108→[whats-odoo] (Use `node --trace-deprecation ...` to show where the warning was created)
+   109→[whats-odoo] [Odoo] Auto-auth attempt 1/3 failed: Authentication failed - invalid credentials
+   110→[whats-odoo] [Odoo] Retrying in 5s...
+   111→[whats-odoo] [WA] Connection update: undefined
+   112→[whats-odoo] [WA] QR Code generated, sending to clients
+   113→[whats-odoo] [Odoo] Background re-auth attempt...
+   114→[whats-odoo] [Odoo] Background re-auth still failing: Authentication failed - invalid credentials
+   115→==> Your service is live 🎉
+   116→==> 
+   117→==> ///////////////////////////////////////////////////////////
+   118→==> 
+   119→==> Available at your primary URL https://app.panfletosbrasil.top + 1 more domain
+   120→==> 
+   121→==> ///////////////////////////////////////////////////////////
+   122→[whats-odoo] [Odoo] Auto-auth attempt 2/3 failed: Authentication failed - invalid credentials
+   123→[whats-odoo] [Odoo] Retrying in 5s...
+   124→[whats-odoo] [Odoo] Auto-auth attempt 3/3 failed: Authentication failed - invalid credentials
+   125→[whats-odoo] [Odoo] All auto-auth attempts failed. Lead creation and chatter sync will NOT work until manual auth via UI.
+   126→[whats-odoo] [WA] Connection update: undefined
+   127→[whats-odoo] [WA] QR Code generated, sending to clients
+   128→[whats-odoo] [WA] Connection update: undefined
+   129→[whats-odoo] [WA] QR Code generated, sending to clients
+   130→[whats-odoo] [WA] Connection update: undefined
+   131→[whats-odoo] [WA] QR Code generated, sending to clients
+   132→[whats-odoo] [Odoo] Background re-auth attempt...
+   133→[whats-odoo] [Odoo] Background re-auth attempt...
+   134→[whats-odoo] [Odoo] Background re-auth still failing: Authentication failed - invalid credentials
+   135→[whats-odoo] [WA] Connection update: undefined
+   136→[whats-odoo] [WA] QR Code generated, sending to clients
+   137→[whats-odoo] [WA] Connection update: undefined
+   138→[whats-odoo] [WA] QR Code generated, sending to clients
+   139→[whats-odoo] [WA] Connection update: undefined
+   140→[whats-odoo] [WA] QR Code generated, sending to clients
+   141→[whats-odoo] [Odoo] Background re-auth attempt...
+   142→[whats-odoo] [Odoo] Background re-auth still failing: Authentication failed - invalid credentials
+   143→[whats-odoo] [WA] Connection update: undefined
+   144→[whats-odoo] [WA] QR Code generated, sending to clients
+   145→[whats-odoo] [WA] Connection update: close
+   146→[whats-odoo] [WA] Connection closed. Status: 408, Reconnect: true
+   147→[whats-odoo] [WA] Reconnecting in 2000ms (attempt 1)...
+   148→[whats-odoo] [WA] Connection update: connecting
+   149→[whats-odoo] [WA] Connection update: undefined
+   150→[whats-odoo] [WA] QR Code generated, sending to clients
+   151→[whats-odoo] [Odoo] Background re-auth attempt...
+   152→[whats-odoo] [Odoo] Background re-auth still failing: Authentication failed - invalid credentials
+   153→[whats-odoo] [WA] Connection update: undefined
+   154→[whats-odoo] [WA] QR Code generated, sending to clients
+   155→[whats-odoo] [WA] Connection update: undefined
+   156→[whats-odoo] [WA] QR Code generated, sending to clients
+   157→[whats-odoo] [Odoo] Background re-auth attempt...
+   158→[whats-odoo] [Odoo] Background re-auth still failing: Authentication failed - invalid credentials
+   159→[whats-odoo] [WA] Connection update: undefined
+   160→[whats-odoo] [WA] QR Code generated, sending to clients
+   161→[whats-odoo] [WA] Connection update: undefined
+   162→[whats-odoo] [WA] QR Code generated, sending to clients
+   163→[whats-odoo] [WA] Connection update: undefined
+   164→[whats-odoo] [WA] QR Code generated, sending to clients
+   165→==> Detected service running on port 10000 with additional ports HTTP:3000, HTTP:3001
+   166→==> Docs on specifying a port: https://render.com/docs/web-services#port-binding
+   167→[whats-odoo] [Odoo] Background re-auth attempt...
+   168→[whats-odoo] [Odoo] Background re-auth still failing: Authentication failed - invalid credentials
+   169→[whats-odoo] [WA] Connection update: close
+   170→[whats-odoo] [WA] Connection closed. Status: 408, Reconnect: true
+   171→[whats-odoo] [WA] Reconnecting in 4000ms (attempt 2)...
+   172→[whats-odoo] [WA] Connection update: connecting
+   173→[whats-odoo] [WA] Connection update: undefined
+   174→[whats-odoo] [WA] QR Code generated, sending to clients
+   175→[whats-odoo] [Odoo] Background re-auth attempt...
+   176→[whats-odoo] [Odoo] Background re-auth still failing: Authentication failed - invalid credentials
+   177→[whats-odoo] [WA] Connection update: undefined
+   178→[whats-odoo] [WA] QR Code generated, sending to clients
+   179→[whats-odoo] [WA] Connection update: undefined
+   180→[whats-odoo] [WA] QR Code generated, sending to clients
+   181→[whats-odoo] [WA] Connection update: undefined
+   182→[whats-odoo] [WA] QR Code generated, sending to clients
+   183→[whats-odoo] [Odoo] Background re-auth attempt...
+   184→[whats-odoo] [Odoo] Background re-auth still failing: Authentication failed - invalid credentials
+   185→[whats-odoo] [WA] Connection update: undefined
+   186→[whats-odoo] [WA] QR Code generated, sending to clients
+   187→[whats-odoo] [WA] Connection update: undefined
+   188→[whats-odoo] [WA] QR Code generated, sending to clients
+   189→[whats-odoo] [WA] Connection update: close
+   190→[whats-odoo] [WA] Connection closed. Status: 408, Reconnect: true
+   191→[whats-odoo] [WA] Reconnecting in 8000ms (attempt 3)...
+   192→[whats-odoo] [Odoo] Background re-auth attempt...
+   193→[whats-odoo] [Odoo] Background re-auth still failing: Authentication failed - invalid credentials
+   194→[whats-odoo] [WA] Connection update: connecting
+   195→[whats-odoo] [WA] Connection update: undefined
+   196→[whats-odoo] [WA] QR Code generated, sending to clients
+   197→[whats-odoo] [Odoo] Background re-auth attempt...
+   198→[whats-odoo] [Odoo] Background re-auth still failing: Authentication failed - invalid credentials
+   199→[whats-odoo] [WA] Connection update: undefined
+   200→[whats-odoo] [WA] QR Code generated, sending to clients
+   201→[whats-odoo] [WA] Connection update: undefined
+   202→[whats-odoo] [WA] QR Code generated, sending to clients
+   203→[whats-odoo] [WA] Connection update: undefined
+   204→[whats-odoo] [WA] QR Code generated, sending to clients
+   205→[whats-odoo] [Odoo] Background re-auth attempt...
+   206→[whats-odoo] [Odoo] Background re-auth still failing: Authentication failed - invalid credentials
+   207→[whats-odoo] [WA] Connection update: undefined
+   208→[whats-odoo] [WA] QR Code generated, sending to clients
+   209→[whats-odoo] [WA] Connection update: undefined
+   210→[whats-odoo] [WA] QR Code generated, sending to clients
+   211→[whats-odoo] [WA] Connection update: close
+   212→[whats-odoo] [WA] Connection closed. Status: 408, Reconnect: true
+   213→[whats-odoo] [WA] Reconnecting in 16000ms (attempt 4)...
+   214→[whats-odoo] [Odoo] Background re-auth attempt...
+   215→[whats-odoo] [WA] Connection update: connecting
+   216→[whats-odoo] [Odoo] Background re-auth still failing: Authentication failed - invalid credentials
+   217→[whats-odoo] [WA] Connection update: undefined
+   218→[whats-odoo] [WA] QR Code generated, sending to clients
+   219→[whats-odoo] [Odoo] Background re-auth attempt...
+   220→[whats-odoo] [Odoo] Background re-auth still failing: Authentication failed - invalid credentials
+   221→[whats-odoo] [WA] Connection update: undefined
+   222→[whats-odoo] [WA] QR Code generated, sending to clients
+   223→[whats-odoo] [WA] Connection update: undefined
+   224→[whats-odoo] [WA] QR Code generated, sending to clients
+   225→[whats-odoo] [WA] Connection update: undefined
+   226→[whats-odoo] [WA] QR Code generated, sending to clients
+   227→[whats-odoo] [Odoo] Background re-auth attempt...
+   228→[whats-odoo] [Odoo] Background re-auth still failing: Authentication failed - invalid credentials
+   229→[whats-odoo] [WA] Connection update: undefined
+   230→[whats-odoo] [WA] QR Code generated, sending to clients
+   231→[whats-odoo] [WA] Connection update: undefined
+   232→[whats-odoo] [WA] QR Code generated, sending to clients
+   233→[whats-odoo] [WA] Connection update: close
+   234→[whats-odoo] [WA] Connection closed. Status: 408, Reconnect: true
+   235→[whats-odoo] [WA] Reconnecting in 30000ms (attempt 5)...
+   236→[whats-odoo] [Odoo] Background re-auth attempt...
+   237→[whats-odoo] [Odoo] Background re-auth still failing: Authentication failed - invalid credentials
+   238→[whats-odoo] [WA] Connection update: connecting
+   239→[whats-odoo] [WA] Connection update: undefined
+   240→[whats-odoo] [WA] QR Code generated, sending to clients
+   241→[whats-odoo] [Odoo] Background re-auth attempt...
+   242→[whats-odoo] [Odoo] Background re-auth still failing: Authentication failed - invalid credentials
+   243→[whats-odoo] [WA] Connection update: undefined
+   244→[whats-odoo] [WA] QR Code generated, sending to clients
+   245→==> Deploying...
+   246→==> Setting WEB_CONCURRENCY=1 by default, based on available CPUs in the instance
+   247→[whats-odoo] [WA] Connection update: undefined
+   248→[whats-odoo] [WA] QR Code generated, sending to clients
+   249→[whats-odoo] [WA] Connection update: undefined
+   250→[whats-odoo] [WA] QR Code generated, sending to clients
+   251→[whats-odoo] [Odoo] Background re-auth attempt...
+   252→[whats-odoo] [Odoo] Background re-auth still failing: Authentication failed - invalid credentials
+   253→==> Running 'npm start'
+   254→> panfletosbrasil@2.0.0 start
+   255→> bash start.sh
+   256→==============================================
+   257→  encartebrasil — START (Panfletos + Whats-Odoo + Proxy)
+   258→==============================================
+   259→[start] Environment check:
+   260→  PORT=10000 (Render-facing)
+   261→  PANFLETOS_PORT=3000 (internal)
+   262→  WHATS_ODOO_PORT=3001 (internal)
+   263→  ODOO_URL=https://ppa-law.odoo.com
+   264→  ODOO_DB=ppa-law
+   265→  ODOO_USERNAME=marcus@3nytro.com.br
+   266→  ODOO_PASSWORD=<set>
+   267→  DATA_DIR=/opt/render/project/src/data
+   268→  WHATS_ODOO_HOSTNAMES=
+   269→[1/2] Pushing Whats-Odoo DB schema...
+   270→Prisma schema loaded from prisma/schema.prisma
+   271→Datasource "db": SQLite database "whats-odoo.db" at "file:/opt/render/project/src/data/whats-odoo/whats-odoo/whats-odoo.db"
+   272→SQLite database whats-odoo.db created at file:/opt/render/project/src/data/whats-odoo/whats-odoo/whats-odoo.db
+   273→🚀  Your database is now in sync with your Prisma schema. Done in 293ms
+   274→Running generate... (Use --skip-generate to skip the generators)
+   275→Running generate... - Prisma Client
+   276→[whats-odoo] [WA] Connection update: undefined
+   277→[whats-odoo] [WA] QR Code generated, sending to clients
+   278→✔ Generated Prisma Client (v6.19.2) to ./node_modules/@prisma/client in 522ms
+   279→[2/2] Launching services...
+   280→  - proxy      :10000  (Render-facing)
+   281→  - panfletos  :3000  (internal)
+   282→  - whats-odoo :3001  (internal)
+   283→[proxy] ==============================================
+   284→[proxy]   proxy listening on :10000
+   285→[proxy]   panfletos  → http://127.0.0.1:3000  (default)
+   286→[proxy]   whats-odoo → http://127.0.0.1:3001  (host: none | path: /whats-odoo/*)
+   287→[proxy]   NOTE: /whats-odoo prefix is FORWARDED AS-IS (not stripped)
+   288→[proxy] ==============================================
+   289→[proxy] (node:180) [DEP0060] DeprecationWarning: The `util._extend` API is deprecated. Please use Object.assign() instead.
+   290→[proxy] (Use `node --trace-deprecation ...` to show where the warning was created)
+   291→[proxy] [proxy] error for app.panfletosbrasil.top/: connect ECONNREFUSED 127.0.0.1:3000
+   292→[whats-odoo] [Server] Data dir: /opt/render/project/src/data/whats-odoo
+   293→[whats-odoo] [Server] Auth folder: /opt/render/project/src/data/whats-odoo/auth_store
+   294→[whats-odoo] [Server] ✓ Data dir is writable: /opt/render/project/src/data/whats-odoo
+   295→[whats-odoo] [Server] Auth folder: 0 files, creds.json=MISSING
+   296→[whats-odoo] [Server] ⚠ No WhatsApp session — will need new QR code scan
+   297→[whats-odoo] [Server] No saved conversation state — starting fresh
+   298→[panfletos] ▲ Next.js 16.1.3
+   299→[panfletos] - Local:         http://localhost:3000
+   300→[panfletos] - Network:       http://10.24.57.217:3000
+   301→[panfletos] 
+   302→[panfletos] ✓ Starting...
+   303→[panfletos] ✓ Ready in 1289ms
+   304→[panfletos] [db] Modo produção — usando Firestore.
+   305→[panfletos] [Firebase] Inicializado com sucesso. Project: encarte-brasil
+   306→[whats-odoo] ⚠ Warning: Next.js inferred your workspace root, but it may not be correct.
+   307→[whats-odoo]  We detected multiple lockfiles and selected the directory of /opt/render/project/src/package-lock.json as the root directory.
+   308→[whats-odoo]  To silence this warning, set `turbopack.root` in your Next.js config, or consider removing one of the lockfiles if it's not needed.
+   309→[whats-odoo]    See https://nextjs.org/docs/app/api-reference/config/next-config-js/turbopack#root-directory for more information.
+   310→[whats-odoo]  Detected additional lockfiles: 
+   311→[whats-odoo]    * /opt/render/project/src/whats-odoo/package-lock.json
+   312→[whats-odoo] 
+   313→[whats-odoo] [Server] Starting WhatsApp connection...
+   314→[whats-odoo] [Odoo] Auto-authenticating with env vars: https://ppa-law.odoo.com / ppa-law / marcus@3nytro.com.br
+   315→[whats-odoo] [Server] > Ready on http://0.0.0.0:3001
+   316→[whats-odoo] [Server] WhatsApp namespace: /whatsapp
+   317→[whats-odoo] [Server] Odoo namespace: /odoo
+   318→[whats-odoo] (node:184) [DEP0169] DeprecationWarning: `url.parse()` behavior is not standardized and prone to errors that have security implications. Use the WHATWG URL API instead. CVEs are not issued for `url.parse()` vulnerabilities.
+   319→[whats-odoo] (Use `node --trace-deprecation ...` to show where the warning was created)
+   320→[whats-odoo] [WA] Connection update: connecting
+   321→[whats-odoo] [Odoo] Auto-auth attempt 1/3 failed: Authentication failed - invalid credentials
+   322→[whats-odoo] [Odoo] Retrying in 5s...
+   323→[whats-odoo] [WA] Connection update: undefined
+   324→[whats-odoo] [WA] QR Code generated, sending to clients
+   325→==> Your service is live 🎉
+   326→[whats-odoo] [Odoo] Auto-auth attempt 2/3 failed: Authentication failed - invalid credentials
+   327→[whats-odoo] [Odoo] Retrying in 5s...
+   328→[whats-odoo] [Odoo] Auto-auth attempt 3/3 failed: Authentication failed - invalid credentials
+   329→[whats-odoo] [Odoo] All auto-auth attempts failed. Lead creation and chatter sync will NOT work until manual auth via UI.
+   330→[whats-odoo] [WA] Connection update: undefined
+   331→[whats-odoo] [WA] QR Code generated, sending to clients
+   332→[whats-odoo] ⨯ The requested resource isn't a valid image for /logo.png received null
+   333→[whats-odoo] [WA] Connection update: close
+   334→[whats-odoo] [WA] Connection closed. Status: 408, Reconnect: true
+   335→[whats-odoo] [WA] Reconnecting in 30000ms (attempt 6)...
+   336→[whats-odoo] [Odoo] Background re-auth attempt...
+   337→[whats-odoo] [Odoo] Background re-auth still failing: Authentication failed - invalid credentials
+   338→[whats-odoo] [WA] Connection update: undefined
+   339→[whats-odoo] [WA] QR Code generated, sending to clients
+   340→[whats-odoo] [Odoo] Background re-auth attempt...
+   341→[whats-odoo] [Odoo] Background re-auth still failing: Authentication failed - invalid credentials
+   342→[whats-odoo] [WA] Connection update: undefined
+   343→[whats-odoo] [WA] QR Code generated, sending to clients
+   344→[whats-odoo] [WA] Connection update: undefined
+   345→[whats-odoo] [WA] QR Code generated, sending to clients
+   346→[whats-odoo] [WA] Connection update: undefined
+   347→[whats-odoo] [WA] QR Code generated, sending to clients
+   348→[whats-odoo] [Odoo] Background re-auth attempt...
+   349→[whats-odoo] [Odoo] Background re-auth still failing: Authentication failed - invalid credentials
+   350→[whats-odoo] [WA] Connection update: undefined
+   351→[whats-odoo] [WA] QR Code generated, sending to clients
+   352→[whats-odoo] [WA] Connection update: close
+   353→[whats-odoo] [WA] Connection closed. Status: 408, Reconnect: true
+   354→[whats-odoo] [WA] Reconnecting in 2000ms (attempt 1)...
+   355→[whats-odoo] [WA] Connection update: connecting
+   356→[whats-odoo] [WA] Connection update: undefined
+   357→[whats-odoo] [WA] QR Code generated, sending to clients
+   358→[whats-odoo] [Odoo] Background re-auth attempt...
+   359→[whats-odoo] [Odoo] Background re-auth still failing: Authentication failed - invalid credentials
+   360→[whats-odoo] [WA] Connection update: undefined
+   361→[whats-odoo] [WA] QR Code generated, sending to clients
+   362→[whats-odoo] [WA] Connection update: undefined
+   363→[whats-odoo] [WA] QR Code generated, sending to clients
+   364→[whats-odoo] [Odoo] Background re-auth attempt...
+   365→[whats-odoo] [Odoo] Background re-auth still failing: Authentication failed - invalid credentials
+   366→[whats-odoo] [WA] Connection update: undefined
+   367→[whats-odoo] [WA] QR Code generated, sending to clients
+   368→[whats-odoo] [WA] Connection update: undefined
+   369→[whats-odoo] [WA] QR Code generated, sending to clients
+   370→[whats-odoo] [WA] Connection update: undefined
+   371→[whats-odoo] [WA] QR Code generated, sending to clients
+   372→[whats-odoo] [Odoo] Background re-auth attempt...
+   373→==> Detected service running on port 10000 with additional ports HTTP:3000, HTTP:3001
+   374→==> Docs on specifying a port: https://render.com/docs/web-services#port-binding
+   375→[whats-odoo] [Odoo] Background re-auth still failing: Authentication failed - invalid credentials
+   376→[whats-odoo] [WA] Connection update: close
+   377→[whats-odoo] [WA] Connection closed. Status: 408, Reconnect: true
+   378→[whats-odoo] [WA] Reconnecting in 4000ms (attempt 2)...
+   379→[whats-odoo] [WA] Connection update: connecting
+   380→[whats-odoo] [WA] Connection update: undefined
+   381→[whats-odoo] [WA] QR Code generated, sending to clients
+   382→[whats-odoo] [Odoo] Background re-auth attempt...
+   383→[whats-odoo] [Odoo] Background re-auth still failing: Authentication failed - invalid credentials
+   384→[whats-odoo] [WA] Connection update: undefined
+   385→[whats-odoo] [WA] QR Code generated, sending to clients
+   386→[whats-odoo] [WA] Connection update: undefined
+   387→[whats-odoo] [WA] QR Code generated, sending to clients
+   388→[whats-odoo] [WA] Connection update: undefined
+   389→[whats-odoo] [WA] QR Code generated, sending to clients
+   390→[whats-odoo] [Odoo] Background re-auth attempt...
+   391→[whats-odoo] [Odoo] Background re-auth still failing: Authentication failed - invalid credentials
+   392→[whats-odoo] [WA] Connection update: undefined
+   393→[whats-odoo] [WA] QR Code generated, sending to clients
+   394→==> Deploying...
+   395→==> Setting WEB_CONCURRENCY=1 by default, based on available CPUs in the instance
+   396→[whats-odoo] [WA] Connection update: undefined
+   397→[whats-odoo] [WA] QR Code generated, sending to clients
+   398→[whats-odoo] [WA] Connection update: close
+   399→[whats-odoo] [WA] Connection closed. Status: 408, Reconnect: true
+   400→[whats-odoo] [WA] Reconnecting in 8000ms (attempt 3)...
+   401→[whats-odoo] [Odoo] Background re-auth attempt...
+   402→[whats-odoo] [Odoo] Background re-auth still failing: Authentication failed - invalid credentials
+   403→==> Running 'npm start'
+   404→> panfletosbrasil@2.0.0 start
+   405→> bash start.sh
+   406→==============================================
+   407→  encartebrasil — START (Panfletos + Whats-Odoo + Proxy)
+   408→==============================================
+   409→[start] Environment check:
+   410→  PORT=10000 (Render-facing)
+   411→  PANFLETOS_PORT=3000 (internal)
+   412→  WHATS_ODOO_PORT=3001 (internal)
+   413→  ODOO_URL=https://ppa-law.odoo.com
+   414→  ODOO_DB=ppa-law
+   415→  ODOO_USERNAME=marcus@3nytro.com.br
+   416→  ODOO_PASSWORD=<set>
+   417→  DATA_DIR=/opt/render/project/src/data
+   418→  WHATS_ODOO_HOSTNAMES=
+   419→[1/2] Pushing Whats-Odoo DB schema...
+   420→[whats-odoo] [WA] Connection update: connecting
+   421→[whats-odoo] [WA] Connection update: undefined
+   422→[whats-odoo] [WA] QR Code generated, sending to clients
+   423→Prisma schema loaded from prisma/schema.prisma
+   424→Datasource "db": SQLite database "whats-odoo.db" at "file:/opt/render/project/src/data/whats-odoo/whats-odoo/whats-odoo.db"
+   425→SQLite database whats-odoo.db created at file:/opt/render/project/src/data/whats-odoo/whats-odoo/whats-odoo.db
+   426→🚀  Your database is now in sync with your Prisma schema. Done in 280ms
+   427→Running generate... (Use --skip-generate to skip the generators)
+   428→Running generate... - Prisma Client
+   429→✔ Generated Prisma Client (v6.19.2) to ./node_modules/@prisma/client in 434ms
+   430→[2/2] Launching services...
+   431→  - proxy      :10000  (Render-facing)
+   432→  - panfletos  :3000  (internal)
+   433→  - whats-odoo :3001  (internal)
+   434→[proxy] ==============================================
+   435→[proxy]   proxy listening on :10000
+   436→[proxy]   panfletos  → http://127.0.0.1:3000  (default)
+   437→[proxy]   whats-odoo → http://127.0.0.1:3001  (host-based routing)
+   438→[proxy]   whats-odoo hostnames: (NONE - set WHATS_ODOO_HOSTNAMES env var!)
+   439→[proxy] ==============================================
+   440→[whats-odoo] [Server] Data dir: /opt/render/project/src/data/whats-odoo
+   441→[whats-odoo] [Server] Auth folder: /opt/render/project/src/data/whats-odoo/auth_store
+   442→[whats-odoo] [Server] ✓ Data dir is writable: /opt/render/project/src/data/whats-odoo
+   443→[whats-odoo] [Server] Auth folder: 0 files, creds.json=MISSING
+   444→[whats-odoo] [Server] ⚠ No WhatsApp session — will need new QR code scan
+   445→[whats-odoo] [Server] No saved conversation state — starting fresh
+   446→[proxy] (node:182) [DEP0060] DeprecationWarning: The `util._extend` API is deprecated. Please use Object.assign() instead.
+   447→[proxy] (Use `node --trace-deprecation ...` to show where the warning was created)
+   448→[proxy] [proxy] error for app.panfletosbrasil.top/: connect ECONNREFUSED 127.0.0.1:3000
+   449→[panfletos] ▲ Next.js 16.1.3
+   450→[panfletos] - Local:         http://localhost:3000
+   451→[panfletos] - Network:       http://10.29.155.39:3000
+   452→[panfletos] 
+   453→[panfletos] ✓ Starting...
+   454→[panfletos] ✓ Ready in 1289ms
+   455→[panfletos] [db] Modo produção — usando Firestore.
+   456→[panfletos] [Firebase] Inicializado com sucesso. Project: encarte-brasil
+   457→[whats-odoo] ⚠ Warning: Next.js inferred your workspace root, but it may not be correct.
+   458→[whats-odoo]  We detected multiple lockfiles and selected the directory of /opt/render/project/src/package-lock.json as the root directory.
+   459→[whats-odoo]  To silence this warning, set `turbopack.root` in your Next.js config, or consider removing one of the lockfiles if it's not needed.
+   460→[whats-odoo]    See https://nextjs.org/docs/app/api-reference/config/next-config-js/turbopack#root-directory for more information.
+   461→[whats-odoo]  Detected additional lockfiles: 
+   462→[whats-odoo]    * /opt/render/project/src/whats-odoo/package-lock.json
+   463→[whats-odoo] 
+   464→[whats-odoo] [Server] Starting WhatsApp connection...
+   465→[whats-odoo] [Odoo] Auto-authenticating with env vars: https://ppa-law.odoo.com / ppa-law / marcus@3nytro.com.br
+   466→[whats-odoo] [Server] > Ready on http://0.0.0.0:3001
+   467→[whats-odoo] [Server] WhatsApp namespace: /whatsapp
+   468→[whats-odoo] [Server] Odoo namespace: /odoo
+   469→[whats-odoo] [WA] Connection update: connecting
+   470→[whats-odoo] (node:186) [DEP0169] DeprecationWarning: `url.parse()` behavior is not standardized and prone to errors that have security implications. Use the WHATWG URL API instead. CVEs are not issued for `url.parse()` vulnerabilities.
+   471→[whats-odoo] (Use `node --trace-deprecation ...` to show where the warning was created)
+   472→[whats-odoo] [WA] Connection update: undefined
+   473→[whats-odoo] [WA] QR Code generated, sending to clients
+   474→[whats-odoo] [Odoo] Auto-auth attempt 1/3 failed: Authentication failed - invalid credentials
+   475→[whats-odoo] [Odoo] Retrying in 5s...
+   476→==> Your service is live 🎉
+   477→==> 
+   478→==> ///////////////////////////////////////////////////////////
+   479→==> 
+   480→==> Available at your primary URL https://app.panfletosbrasil.top + 1 more domain
+   481→==> 
+   482→==> ///////////////////////////////////////////////////////////
+   483→[whats-odoo] [Odoo] Auto-auth attempt 3/3 failed: Authentication failed - invalid credentials
+   484→[whats-odoo] [Odoo] All auto-auth attempts failed. Lead creation and chatter sync will NOT work until manual auth via UI.
+   485→[whats-odoo] [Odoo] Background re-auth attempt...
+   486→[whats-odoo] [Odoo] Background re-auth still failing: Authentication failed - invalid credentials
+   487→[whats-odoo] [WA] Connection update: undefined
+   488→[whats-odoo] [WA] QR Code generated, sending to clients
+   489→[whats-odoo] [WA] Connection update: undefined
+   490→[whats-odoo] [WA] QR Code generated, sending to clients
+   491→[whats-odoo] [Odoo] Background re-auth attempt...
+   492→[whats-odoo] [Odoo] Background re-auth still failing: Authentication failed - invalid credentials
+   493→[whats-odoo] [WA] Connection update: undefined
+   494→[whats-odoo] [WA] QR Code generated, sending to clients
+   495→[panfletos] [auth/me] cookie encontrado, tipo=admin
+   496→[panfletos] [auth/me] sessao valida: tipo=admin id=DRaCuAOOPzMJkHkAsIiy email=marcusvds83@gmail.com
+   497→[panfletos] [cron limpar-expirados] iniciado em 2026-08-14T13:29:28.600Z
+   498→[panfletos] [firebase-admin] initAdmin() chamado — iniciando diagnóstico
+   499→[panfletos] [firebase-admin] hasServiceAccount: true | hasSeparateVars: false
+   500→[panfletos] [firebase-admin] módulos carregados:
+   501→[panfletos] [firebase-admin]   admin keys: initializeApp, getApp, getApps, deleteApp, applicationDefault, cert, refreshToken, FirebaseError, FirebaseAppError, AppErrorCode, SDK_VERSION
+   502→[panfletos] [firebase-admin]   admin.cert type: function
+   503→[panfletos] [firebase-admin]   admin.applicationDefault type: function
+   504→[panfletos] [firebase-admin]   admin.initializeApp type: function
+   505→[panfletos] [firebase-admin]   admin.getApps type: function
+   506→[panfletos] [firebase-admin]   storage keys: Storage, FirebaseStorageError, StorageErrorCode, getStorage, getDownloadURL
+   507→[panfletos] [firebase-admin]   storage.getStorage type: function
+   508→[panfletos] [firebase-admin]   firestore keys: AggregateField, AggregateQuery, AggregateQuerySnapshot, BulkWriter, BundleBuilder, CollectionGroup, CollectionReference, DocumentReference, DocumentSnapshot, FieldPath, FieldValue, Filter, Firestore, GeoPoint, GrpcStatus, Query, QueryDocumentSnapshot, QueryPartition, QuerySnapshot, Timestamp, Transaction, WriteBatch, WriteResult, v1, setLogFunction, FirestoreErrorCode, FirebaseFirestoreError, getFirestore, initializeFirestore
+   509→[panfletos] [firebase-admin]   firestore.getFirestore type: function
+   510→[panfletos] [firebase-admin] apps já inicializados: 0
+   511→[panfletos] [firebase-admin] Chamando admin.cert() (v14+ API)
+   512→[panfletos] [firebase-admin] ✅ cert criado com sucesso
+   513→[panfletos] [firebase-admin] ✅ initializeApp concluído
+   514→[panfletos] [firebase-admin] ✅ storage.bucket() obtido
+   515→[panfletos] [firebase-admin] ✅ firestore() obtido
+   516→[panfletos] [firebase-admin] Inicializado com service account. Project: encarte-brasil | Bucket: encarte-brasil.firebasestorage.app
+   517→[panfletos] [auth/me] cookie encontrado, tipo=admin
+   518→[panfletos] [auth/me] sessao valida: tipo=admin id=DRaCuAOOPzMJkHkAsIiy email=marcusvds83@gmail.com
+   519→[panfletos] [firestore.cliqueProduto.count] mercadoId=P2j0sQMVp5T4Wrp0kbRd total=0
+   520→[panfletos] [firestore.cliqueProduto.count] mercadoId=1kAQQYC38qacJskqySGi total=71
+   521→[panfletos] [firestore.cliqueProduto.count] mercadoId=SIaVvGJEHpNwdxT63NHm total=29
+   522→[panfletos] [cron limpar-expirados] concluído em 4870ms — 0 encarte(s) excluído(s), 0 produto(s) removido(s), 0 PDF(s) do Storage
+   523→[whats-odoo] [WA] Connection update: undefined
+   524→[whats-odoo] [WA] QR Code generated, sending to clients
+   525→[whats-odoo] [WA] Connection update: undefined
+   526→[whats-odoo] [WA] QR Code generated, sending to clients
